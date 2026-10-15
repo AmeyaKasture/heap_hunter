@@ -79,3 +79,16 @@ Please include:
 
 By contributing, you agree that your contributions will be licensed under the
 [GNU Affero General Public License v3.0](LICENSE).
+
+### Contributor License Agreement (CLA)
+
+Before your first contribution is merged, you must accept the
+[Individual Contributor License Agreement](CLA.md). The CLA lets the project
+owner relicense your contribution under additional terms (for example, a
+future commercial offering) while your own copyright in the contribution
+remains with you. The Project itself stays AGPL v3.0 for everyone who
+receives it under the open-source terms.
+
+To accept, add a `Signed-off-by: Your Name <email>` line referencing this
+CLA to your commit messages and include a short comment on your first
+pull request that says "I have read and accept CLA.md".
