@@ -1,0 +1,16 @@
+.{
+    .name = .heaphunter,
+    .version = "0.1.0",
+    .fingerprint = 0x3c72b5d1bf53faff,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+    },
+}

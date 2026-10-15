@@ -1,0 +1,36 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+.zig-cache-*/
+
+# Compiled executables and object files
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Debug files
+*.pdb
+*.ilk
+
+# Editor / IDE
+.vscode/
+.idea/
+.opencode/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Build outputs and test artifacts
+*.log
+hunt-output/
+index-*/
+
+# HPROF test dumps (large, not for version control)
+test_hprofs/
+*.hprof
