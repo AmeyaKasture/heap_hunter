@@ -89,6 +89,24 @@ future commercial offering) while your own copyright in the contribution
 remains with you. The Project itself stays AGPL v3.0 for everyone who
 receives it under the open-source terms.
 
-To accept, add a `Signed-off-by: Your Name <email>` line referencing this
-CLA to your commit messages and include a short comment on your first
-pull request that says "I have read and accept CLA.md".
+#### Signing the CLA
+
+The [CLA Assistant GitHub Action](.github/workflows/cla.yml) enforces this
+automatically on every pull request:
+
+1. Open a pull request. The bot will check whether every contributor on the
+   PR has previously signed the CLA.
+2. If a contributor has not signed, the bot posts a comment asking them
+   to. Sign by posting the following line as a PR comment (case-sensitive):
+
+   ```
+   I have read the CLA Document and I hereby sign the CLA
+   ```
+3. The bot records your signature in
+   [`signatures/version1/cla.json`](signatures/version1/cla.json) and the
+   PR status check turns green. You only need to sign once per contributor
+   account.
+4. If the check is stale, comment `recheck` on the PR to rerun it.
+
+The repository owner (`AmeyaKasture`) and all GitHub bot accounts are on
+the allowlist and do not need to sign.
