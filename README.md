@@ -140,6 +140,10 @@ install -m 0755 zig-out/bin/hunt /usr/local/bin/hunt
 The typical workflow is two phases: build a persistent index, then
 query it.
 
+If you have not copied `zig-out/bin/hunt` onto your `$PATH`, replace
+`hunt` below with `./zig-out/bin/hunt` (or with `./hunt` if the binary
+is in the current directory).
+
 ```bash
 # Phase 1: build a persistent index from a heap dump.
 hunt index path/to/heap.hprof --index-dir ./idx
