@@ -43,13 +43,6 @@ pub fn runCli(
 
     log.debug("runCli: {d} args", .{args.len});
 
-    // Respect common terminal color environment variables.
-    Cli.setColorsEnabled(true);
-    if (environ_map) |map| {
-        if (map.contains("NO_COLOR")) Cli.setColorsEnabled(false);
-        if (map.contains("FORCE_COLOR")) Cli.setColorsEnabled(true);
-    }
-
     var config_path: ?[]const u8 = null;
     var command_index: usize = 1;
     if (args.len >= 3 and std.mem.eql(u8, args[1], "--config")) {

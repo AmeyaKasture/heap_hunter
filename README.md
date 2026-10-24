@@ -114,13 +114,15 @@ the time the dump was taken and what call sites they were executing.
   against the output are predictable.
 - **Paging support** via `--offset` and `--limit` on the list commands,
   with a `next_offset` field returned in JSON.
-- **No required environment**: the binary is self-contained and links
-  only against the standard C library.
+- **No required environment**: the binary is self-contained and has no
+  JVM, GUI, or daemon dependencies.
 
 ## Installation
 
 Heap Hunter targets Zig 0.16.0 or later. The only build-time dependency
-is a Zig toolchain.
+is a Zig toolchain. Builds are supported on Linux, macOS, and Windows.
+
+### Linux / macOS
 
 ```bash
 git clone https://github.com/AmeyaKasture/heap_hunter.git
@@ -133,6 +135,24 @@ it onto `$PATH`:
 
 ```bash
 install -m 0755 zig-out/bin/hunt /usr/local/bin/hunt
+```
+
+### Windows
+
+```powershell
+git clone https://github.com/AmeyaKasture/heap_hunter.git
+cd heap_hunter
+zig build -Doptimize=ReleaseFast
+```
+
+The resulting binary is written to `zig-out\bin\hunt.exe`. Either add
+`zig-out\bin` to your `PATH` or copy `hunt.exe` to a directory already on
+your `PATH`.
+
+You can also cross-compile from another OS:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu
 ```
 
 ## Quick start
@@ -336,11 +356,19 @@ java.lang.String,892103,178420600
 
 ## Configuration
 
-Heap Hunter reads an optional JSON config file, resolved in this order:
+Heap Hunter reads an optional JSON config file. The search order is
+platform-specific:
+
+### Linux / macOS
 
 1. `$XDG_CONFIG_HOME/hunt/config.json`
 2. `$HOME/.config/hunt/config.json`
 3. `$HOME/.hunt/config.json`
+
+### Windows
+
+1. `%APPDATA%\hunt\config.json`
+2. `%USERPROFILE%\.hunt\config.json`
 
 ```json
 {

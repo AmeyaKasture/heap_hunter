@@ -159,7 +159,7 @@ pub const Progress = struct {
 pub fn create(stderr: *Io.Writer, io: Io, total_steps: usize, disabled: bool) Progress {
     return Progress.start(stderr, io, .{
         .total_steps = total_steps,
-        .is_tty = Cli.isStderrTty(),
+        .is_tty = Cli.isStderrTty(io),
         .colors = Cli.colorsEnabled(),
         .disabled = disabled,
     });

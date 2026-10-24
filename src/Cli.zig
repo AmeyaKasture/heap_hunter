@@ -2,7 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-pub const Style = struct {
+const Style = struct {
     pub const reset = "\x1b[0m";
     pub const bold = "\x1b[1m";
     pub const dim = "\x1b[2m";
@@ -28,25 +28,17 @@ pub const Style = struct {
     pub const bright_white = "\x1b[97m";
 };
 
-var colors_enabled_state: bool = true;
-
-pub fn setColorsEnabled(enabled: bool) void {
-    colors_enabled_state = enabled;
-}
-
-pub fn colorsEnabled() bool {
-    return colors_enabled_state;
-}
-
 /// Returns true if stderr is connected to a terminal. Used to decide whether
-/// to render animated progress indicators or plain text.
-pub fn isStderrTty() bool {
-    const std_err = std.posix.STDERR_FILENO;
-    var termios: std.posix.termios = undefined;
-    // Use the raw system call directly so that ENOTTY (returned for
-    // non-terminals such as files or pipes) does not trigger Zig's
-    // unexpectedErrno stack trace in tests and redirected output.
-    return std.posix.system.tcgetattr(std_err, &termios) == 0;
+/// to render the animated progress bar or plain checkpoint lines.
+pub fn isStderrTty(io: Io) bool {
+    const file = Io.File.stderr();
+    return file.isTty(io) catch false;
+}
+
+/// Returns whether colored output is enabled. Colors are kept disabled for
+/// agent-friendly plain-text output.
+pub fn colorsEnabled() bool {
+    return false;
 }
 
 /// Returns true for errors that are caused by user input or environment
@@ -69,16 +61,14 @@ pub fn isUserError(err: anyerror) bool {
         err == error.CacheFingerprintMismatch;
 }
 
-pub fn writeStyled(writer: *Io.Writer, comptime color: []const u8, text: []const u8) !void {
-    if (colors_enabled_state) try writer.writeAll(color);
+fn writeStyled(writer: *Io.Writer, comptime color: []const u8, text: []const u8) !void {
+    _ = color;
     try writer.writeAll(text);
-    if (colors_enabled_state) try writer.writeAll(Style.reset);
 }
 
-pub fn printStyled(writer: *Io.Writer, comptime color: []const u8, comptime fmt: []const u8, args: anytype) !void {
-    if (colors_enabled_state) try writer.writeAll(color);
+fn printStyled(writer: *Io.Writer, comptime color: []const u8, comptime fmt: []const u8, args: anytype) !void {
+    _ = color;
     try writer.print(fmt, args);
-    if (colors_enabled_state) try writer.writeAll(Style.reset);
 }
 
 pub fn printMissingConfig(writer: *Io.Writer, candidates: []const []const u8, explicit_path: ?[]const u8) !void {
@@ -597,18 +587,8 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Configuration:\n");
-    try writer.writeAll("  Config is read from $XDG_CONFIG_HOME/hunt/config.json, then\n");
-    try writer.writeAll("  $HOME/.config/hunt/config.json, then $HOME/.hunt/config.json.\n");
+    try writer.writeAll("  Config is read from the platform-specific default location.\n");
     try writer.writeAll("  Use --config <file> to override.\n");
-
-    try writer.writeAll("\n");
-    try writeStyled(writer, Style.bold, "Environment:\n");
-    try writer.writeAll("  ");
-    try writeStyled(writer, Style.yellow, "NO_COLOR=1");
-    try writer.writeAll("     Disable colored output\n");
-    try writer.writeAll("  ");
-    try writeStyled(writer, Style.yellow, "FORCE_COLOR=1");
-    try writer.writeAll("  Force colored output even when not a TTY\n");
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.dim, "Run '");

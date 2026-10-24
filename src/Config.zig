@@ -1,6 +1,28 @@
 //! Heap Hunter user configuration loaded from a JSON config file.
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
+
+pub const Candidate = struct {
+    env_var: []const u8,
+    dir_components: []const []const u8,
+    file_name: []const u8,
+};
+
+/// Default platform-specific config file search order.
+pub fn defaultConfigCandidates(os_tag: std.Target.Os.Tag) []const Candidate {
+    if (os_tag == .windows) {
+        return &.{
+            .{ .env_var = "APPDATA", .dir_components = &[_][]const u8{"hunt"}, .file_name = "config.json" },
+            .{ .env_var = "USERPROFILE", .dir_components = &[_][]const u8{".hunt"}, .file_name = "config.json" },
+        };
+    }
+    return &.{
+        .{ .env_var = "XDG_CONFIG_HOME", .dir_components = &[_][]const u8{"hunt"}, .file_name = "config.json" },
+        .{ .env_var = "HOME", .dir_components = &[_][]const u8{ ".config", "hunt" }, .file_name = "config.json" },
+        .{ .env_var = "HOME", .dir_components = &[_][]const u8{".hunt"}, .file_name = "config.json" },
+    };
+}
 
 pub const Config = struct {
     /// Default base directory for indexes. For commands that take a heapdump
@@ -178,32 +200,32 @@ pub const Config = struct {
         io: Io,
         environ_map: ?*std.process.Environ.Map,
     ) !Candidates {
+        return resolveConfigPathCandidatesForOs(allocator, io, environ_map, builtin.os.tag);
+    }
+
+    pub fn resolveConfigPathCandidatesForOs(
+        allocator: std.mem.Allocator,
+        io: Io,
+        environ_map: ?*std.process.Environ.Map,
+        os_tag: std.Target.Os.Tag,
+    ) !Candidates {
         var paths: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (paths.items) |p| allocator.free(p);
             paths.deinit(allocator);
         }
 
-        if (environ_map) |map| {
-            if (map.get("XDG_CONFIG_HOME")) |xdg| {
-                const path = try std.fs.path.join(allocator, &.{ xdg, "hunt", "config.json" });
-                try paths.append(allocator, path);
-                if (try fileExists(io, path)) {
-                    return .{ .checked = try paths.toOwnedSlice(allocator), .found = path };
-                }
-            }
-            if (map.get("HOME")) |home| {
-                const xdg_path = try std.fs.path.join(allocator, &.{ home, ".config", "hunt", "config.json" });
-                try paths.append(allocator, xdg_path);
-                if (try fileExists(io, xdg_path)) {
-                    return .{ .checked = try paths.toOwnedSlice(allocator), .found = xdg_path };
-                }
+        const map = environ_map orelse return .{ .checked = try paths.toOwnedSlice(allocator), .found = null };
 
-                const legacy_path = try std.fs.path.join(allocator, &.{ home, ".hunt", "config.json" });
-                try paths.append(allocator, legacy_path);
-                if (try fileExists(io, legacy_path)) {
-                    return .{ .checked = try paths.toOwnedSlice(allocator), .found = legacy_path };
-                }
+        const candidates = defaultConfigCandidates(os_tag);
+        for (candidates) |candidate| {
+            const base = map.get(candidate.env_var) orelse continue;
+            const dir = try std.fs.path.join(allocator, candidate.dir_components);
+            defer allocator.free(dir);
+            const path = try std.fs.path.join(allocator, &.{ base, dir, candidate.file_name });
+            try paths.append(allocator, path);
+            if (try fileExists(io, path)) {
+                return .{ .checked = try paths.toOwnedSlice(allocator), .found = path };
             }
         }
         return .{ .checked = try paths.toOwnedSlice(allocator), .found = null };
@@ -237,14 +259,18 @@ test "deriveIndexDir strips .hprof and appends .idx" {
     const allocator = std.testing.allocator;
     const result = try Config.deriveIndexDir(allocator, "temp", "/dumps/production-heap.hprof");
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("temp/production-heap.idx", result);
+    const expected = try std.fs.path.join(allocator, &.{ "temp", "production-heap.idx" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result);
 }
 
 test "deriveIndexDir appends .idx for non-.hprof basenames" {
     const allocator = std.testing.allocator;
     const result = try Config.deriveIndexDir(allocator, "temp", "/dumps/my-dump");
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("temp/my-dump.idx", result);
+    const expected = try std.fs.path.join(allocator, &.{ "temp", "my-dump.idx" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, result);
 }
 
 test "Config defaults" {
@@ -383,4 +409,36 @@ test "resolveConfigPath falls back to HOME/.config" {
     try std.testing.expect(resolved != null);
     defer allocator.free(resolved.?);
     try std.testing.expectEqualStrings(config_path, resolved.?);
+}
+
+test "resolveConfigPathCandidatesForOs uses APPDATA on Windows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    const hunt_dir = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "hunt" });
+    defer allocator.free(hunt_dir);
+    try tmp_dir.dir.createDir(io, "hunt", .default_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ hunt_dir, "config.json" });
+    defer allocator.free(config_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "{\"index-dir\": \"appdata\"}" });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("APPDATA", tmp_path_z[0..tmp_path_z.len]);
+
+    const candidates = try Config.resolveConfigPathCandidatesForOs(allocator, io, &env, .windows);
+    defer {
+        for (candidates.checked) |c| allocator.free(c);
+        allocator.free(candidates.checked);
+    }
+
+    try std.testing.expect(candidates.found != null);
+    try std.testing.expectEqualStrings(config_path, candidates.found.?);
 }
