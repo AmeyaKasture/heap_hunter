@@ -122,6 +122,39 @@ the time the dump was taken and what call sites they were executing.
 Heap Hunter targets Zig 0.16.0 or later. The only build-time dependency
 is a Zig toolchain. Builds are supported on Linux, macOS, and Windows.
 
+### Installer script
+
+The repository ships an installer script that handles the download, the
+`$PATH` wiring and the config file in one step:
+
+```bash
+# Download the latest release binary for your platform
+./install.sh
+
+# Build from this source tree instead (requires Zig 0.16.0+)
+./install.sh -l
+
+# Remove the binary, the $PATH entry and the config file
+./install.sh -u
+```
+
+Without `-l`, the script resolves the latest GitHub release, downloads the
+matching asset (`heap_hunter-<os>-<arch>.tar.gz` or `.zip`), verifies its
+SHA-256 digest against the one published with the release, and installs the
+binary into `~/.local/bin`.
+
+With `-l`, the script checks that the installed Zig toolchain satisfies
+`.minimum_zig_version` from `build.zig.zon`, verifies the Zig dependency
+tree with `zig build --fetch`, runs a `ReleaseFast` production build and
+installs the resulting binary.
+
+Both modes add the install directory to `$PATH` through
+`~/.heap_hunter_env`, sourced from your shell startup file, and create a
+config file with `"index-dir": "index"` at the first location the tool
+searches (`$XDG_CONFIG_HOME/hunt/config.json`, then
+`$HOME/.config/hunt/config.json`). Run `source ~/.zshrc` (or your
+equivalent) to pick up the new `$PATH` entry in the current shell.
+
 ### Linux / macOS
 
 ```bash
@@ -460,6 +493,7 @@ src/
     integration.zig
 test_hprofs/            (gitignored) sample HPROFs used by the test suite
 agent-skills/           Project-local agent skills (git-commit, pr-review)
+install.sh              Installer script (download, local build, uninstall)
 .github/                CLA bot workflow
 ```
 
