@@ -122,6 +122,60 @@ the time the dump was taken and what call sites they were executing.
 Heap Hunter targets Zig 0.16.0 or later. The only build-time dependency
 is a Zig toolchain. Builds are supported on Linux, macOS, and Windows.
 
+### Installer script
+
+**Important:** Always review the installer script before running it. For safety, read `install.sh` (Unix-like) or `install.ps1` (Windows) to understand what it does.
+
+#### Linux / macOS (bash)
+The repository ships `install.sh` that handles the download, `$PATH` wiring and the config file in one step:
+
+```bash
+# Download the latest release binary for your platform
+./install.sh
+
+# Build from this source tree instead (requires Zig 0.16.0+)
+./install.sh -l
+
+# Remove the binary, the $PATH entry and the config file
+./install.sh -u
+```
+
+Without `-l`, the script resolves the latest GitHub release, downloads the
+matching asset (`heap_hunter-<os>-<arch>.tar.gz`), verifies its
+SHA-256 digest against the one published with the release, and installs the
+binary into `~/.local/bin` (configurable via `HEAP_HUNTER_INSTALL_DIR`).
+
+With `-l`, the script checks that the installed Zig toolchain satisfies
+`.minimum_zig_version` from `build.zig.zon`, verifies the Zig dependency
+tree with `zig build --fetch`, runs a `ReleaseFast` production build and
+installs the resulting binary.
+
+The script adds the install directory to `$PATH` through
+`~/.heap_hunter_env`, sourced from your shell startup file, and creates a
+config file with `"index-dir": "index"` at the first location the tool
+searches (`$XDG_CONFIG_HOME/hunt/config.json`, then
+`$HOME/.config/hunt/config.json`). Run `source ~/.zshrc` (or your
+equivalent) to pick up the new `$PATH` entry in the current shell.
+
+#### Windows 10+ (PowerShell)
+Windows 10+ has `curl.exe` and native PowerShell support. Use `install.ps1` from Command Prompt or PowerShell. 
+
+**From Command Prompt (recommended):**
+```cmd
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Local
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
+```
+
+**From PowerShell:**
+```powershell
+.\install.ps1
+.\install.ps1 -Local
+.\install.ps1 -Uninstall
+```
+
+The Windows installer downloads the `.zip` release asset, verifies its SHA-256 digest, extracts `hunt.exe` to `%LOCALAPPDATA%\Programs\heap-hunter\bin`, adds it to your user PATH, and creates the config at `%APPDATA%\hunt\config.json`. Open a new terminal for PATH changes to take effect.
+
 ### Linux / macOS
 
 ```bash
@@ -139,6 +193,14 @@ install -m 0755 zig-out/bin/hunt /usr/local/bin/hunt
 
 ### Windows
 
+**Option 1: Installer (easiest)**
+Read `install.ps1` before running it. From Command Prompt (Windows 10+):
+```cmd
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+Or build from source: `powershell -ExecutionPolicy Bypass -File .\install.ps1 -Local` (requires Zig 0.16.0+). To uninstall: `powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall`.
+
+**Option 2: Manual build**
 ```powershell
 git clone https://github.com/AmeyaKasture/heap_hunter.git
 cd heap_hunter
@@ -460,6 +522,7 @@ src/
     integration.zig
 test_hprofs/            (gitignored) sample HPROFs used by the test suite
 agent-skills/           Project-local agent skills (git-commit, pr-review)
+install.sh              Installer script (download, local build, uninstall)
 .github/                CLA bot workflow
 ```
 
