@@ -34,7 +34,10 @@ pub fn main(init: std.process.Init) !void {
     log.debug("hunt startup: {d} args, command={s}", .{ args.len, command });
 
     log.debug("dispatching to runCli", .{});
-    const result = heaphunter.runCli(tracked, init.io, args, stdout_writer, stderr_writer, init.environ_map);
+    const result = if (std.mem.eql(u8, command, "mcp"))
+        heaphunter.runMcp(tracked, init.io, args, init.environ_map)
+    else
+        heaphunter.runCli(tracked, init.io, args, stdout_writer, stderr_writer, init.environ_map);
     stderr_writer.flush() catch {};
     if (result) |_| {
         log.debug("runCli completed successfully", .{});

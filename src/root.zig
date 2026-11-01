@@ -28,6 +28,7 @@ const Overview = @import("Overview.zig");
 const Config = @import("Config.zig").Config;
 const Progress = @import("Progress.zig");
 pub const Cli = @import("Cli.zig");
+const Mcp = @import("Mcp.zig");
 
 pub fn runCli(
     allocator: std.mem.Allocator,
@@ -87,12 +88,17 @@ pub fn runCli(
 
     if (std.mem.eql(u8, command, "index")) {
         log.debug("dispatching to runIndexCommand", .{});
-        return runIndexCommand(allocator, io, shifted, stdout, stderr, config_load);
+        return runIndexCommand(allocator, io, shifted, stdout, stderr, config_load, null, null);
     }
 
     if (std.mem.eql(u8, command, "overview")) {
         log.debug("dispatching to runOverviewCommand", .{});
-        return runOverviewCommand(allocator, io, shifted, stdout, stderr, config_load);
+        return runOverviewCommand(allocator, io, shifted, stdout, stderr, config_load, null, null);
+    }
+
+    if (std.mem.eql(u8, command, "mcp")) {
+        log.debug("dispatching to runMcp", .{});
+        return runMcp(allocator, io, shifted, environ_map);
     }
 
     if (std.mem.eql(u8, command, "objects") or
@@ -325,13 +331,15 @@ fn deleteOldStagingDirs(
     }
 }
 
-fn runIndexCommand(
+pub fn runIndexCommand(
     allocator: std.mem.Allocator,
     io: Io,
     args: []const [:0]const u8,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     config_load: Config.LoadResult,
+    on_progress: ?Progress.Callback,
+    on_progress_ctx: ?*anyopaque,
 ) anyerror!void {
     errdefer |err| {
         log.traceError(err);
@@ -413,7 +421,7 @@ fn runIndexCommand(
     try jsonEscapeString(&escaped_index_dir_buf.writer, index_dir);
     const escaped_index_dir = escaped_index_dir_buf.writer.buffer[0..escaped_index_dir_buf.writer.end];
 
-    var progress = Progress.create(stderr, io, 9, no_progress);
+    var progress = Progress.createEx(stderr, io, 9, no_progress, on_progress, on_progress_ctx);
     defer progress.stop(null);
 
     switch (preflight_result) {
@@ -607,13 +615,15 @@ fn runIndexCommand(
     }
 }
 
-fn runOverviewCommand(
+pub fn runOverviewCommand(
     allocator: std.mem.Allocator,
     io: Io,
     args: []const [:0]const u8,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     config_load: Config.LoadResult,
+    on_progress: ?Progress.Callback,
+    on_progress_ctx: ?*anyopaque,
 ) anyerror!void {
     errdefer |err| {
         log.traceError(err);
@@ -733,7 +743,7 @@ fn runOverviewCommand(
         }
     }
 
-    var progress = Progress.create(stderr, io, 3, no_progress);
+    var progress = Progress.createEx(stderr, io, 3, no_progress, on_progress, on_progress_ctx);
     defer progress.stop(null);
 
     progress.nextStep("reading index");
@@ -755,6 +765,26 @@ fn runOverviewCommand(
     const escaped_index_dir = escaped_index_dir_buf.writer.buffer[0..escaped_index_dir_buf.writer.end];
 
     try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"cache\":\"overview.bin\"}}\n", .{escaped_index_dir});
+}
+
+pub fn runMcp(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+    environ_map: ?*std.process.Environ.Map,
+) anyerror!void {
+    log.debug("runMcp starting", .{});
+
+    var config_path: ?[]const u8 = null;
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--config")) {
+        config_path = args[2];
+    }
+
+    var config_load = try Config.loadWithResult(allocator, io, config_path, environ_map);
+    defer config_load.deinit(allocator);
+
+    var server = Mcp.Server.init(allocator, io, &config_load);
+    try server.run();
 }
 
 const StageTimings = struct {

@@ -4,9 +4,28 @@
 //! a checkpoint label (e.g., "[=====>                         ] [1/9] scanning
 //! heap dump"). On non-TTY output it prints plain checkpoint lines instead, so
 //! progress can be captured in logs.
+//!
+//! An optional event callback can be supplied to receive the same progress
+//! events that drive the TTY bar. This is used by the MCP server to emit
+//! `notifications/progress` messages while still allowing the existing
+//! command code to render progress for CLI users.
 const std = @import("std");
 const Io = std.Io;
 const Cli = @import("Cli.zig");
+
+/// A single progress event emitted whenever the current step, label, or
+/// finished state changes.
+pub const Event = struct {
+    current_step: usize,
+    total_steps: usize,
+    label: []const u8,
+    finished: bool,
+    message: ?[]const u8,
+};
+
+/// Optional callback that receives progress events. `ctx` is the opaque
+/// pointer supplied when the reporter was created.
+pub const Callback = *const fn (ctx: ?*anyopaque, event: Event) void;
 
 pub const Progress = struct {
     stderr: *Io.Writer,
@@ -18,6 +37,8 @@ pub const Progress = struct {
     label: []const u8,
     disabled: bool,
     finished: bool,
+    on_event: ?Callback,
+    on_event_ctx: ?*anyopaque,
 
     const bar_width = 30;
     const fill_char = "=";
@@ -29,6 +50,8 @@ pub const Progress = struct {
         is_tty: bool,
         colors: bool,
         disabled: bool = false,
+        on_event: ?Callback = null,
+        on_event_ctx: ?*anyopaque = null,
     };
 
     /// Start progress reporting. The initial label is "starting...".
@@ -43,9 +66,12 @@ pub const Progress = struct {
             .label = "starting...",
             .disabled = options.disabled,
             .finished = false,
+            .on_event = options.on_event,
+            .on_event_ctx = options.on_event_ctx,
         };
         if (!options.disabled) {
             progress.render();
+            progress.emitEvent();
         }
         return progress;
     }
@@ -56,6 +82,7 @@ pub const Progress = struct {
         self.current_step += 1;
         self.label = label;
         self.render();
+        self.emitEvent();
     }
 
     /// Update the label of the current step without advancing.
@@ -63,6 +90,7 @@ pub const Progress = struct {
         if (self.disabled or self.finished) return;
         self.label = label;
         self.render();
+        self.emitEvent();
     }
 
     /// Refresh the display. This is a no-op for the bar-based progress
@@ -72,6 +100,7 @@ pub const Progress = struct {
         // Re-render so the line stays visible on slow terminals, but the bar
         // only advances when nextStep is called.
         self.render();
+        self.emitEvent();
     }
 
     /// Stop progress reporting and optionally print a final message.
@@ -86,6 +115,31 @@ pub const Progress = struct {
             }
         } else if (message) |m| {
             self.stderr.print("{s}\n", .{m}) catch {};
+        }
+        self.emitEventFinal(message);
+    }
+
+    fn emitEvent(self: *Progress) void {
+        if (self.on_event) |cb| {
+            cb(self.on_event_ctx, .{
+                .current_step = self.current_step,
+                .total_steps = self.total_steps,
+                .label = self.label,
+                .finished = self.finished,
+                .message = null,
+            });
+        }
+    }
+
+    fn emitEventFinal(self: *Progress, message: ?[]const u8) void {
+        if (self.on_event) |cb| {
+            cb(self.on_event_ctx, .{
+                .current_step = self.current_step,
+                .total_steps = self.total_steps,
+                .label = self.label,
+                .finished = self.finished,
+                .message = message,
+            });
         }
     }
 
@@ -157,10 +211,26 @@ pub const Progress = struct {
 /// Create a progress reporter for a command with the given number of steps.
 /// If `disabled` is true, progress is suppressed entirely.
 pub fn create(stderr: *Io.Writer, io: Io, total_steps: usize, disabled: bool) Progress {
+    return createEx(stderr, io, total_steps, disabled, null, null);
+}
+
+/// Like `create`, but also receives an optional callback that is invoked on
+/// every progress event. The callback can be used by non-CLI consumers (e.g.
+/// the MCP server) to forward progress to another channel.
+pub fn createEx(
+    stderr: *Io.Writer,
+    io: Io,
+    total_steps: usize,
+    disabled: bool,
+    on_event: ?Callback,
+    on_event_ctx: ?*anyopaque,
+) Progress {
     return Progress.start(stderr, io, .{
         .total_steps = total_steps,
         .is_tty = Cli.isStderrTty(io),
         .colors = Cli.colorsEnabled(),
         .disabled = disabled,
+        .on_event = on_event,
+        .on_event_ctx = on_event_ctx,
     });
 }

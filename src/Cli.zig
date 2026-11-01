@@ -37,8 +37,14 @@ pub fn isStderrTty(io: Io) bool {
 
 /// Returns whether colored output is enabled. Colors are kept disabled for
 /// agent-friendly plain-text output.
+var colors_enabled_state: bool = false;
+
+pub fn setColorsEnabled(enabled: bool) void {
+    colors_enabled_state = enabled;
+}
+
 pub fn colorsEnabled() bool {
-    return false;
+    return colors_enabled_state;
 }
 
 /// Returns true for errors that are caused by user input or environment
@@ -196,6 +202,25 @@ pub const Command = struct {
 };
 
 pub const commands = [_]Command{
+    .{
+        .name = "mcp",
+        .description = "Run hunt as an MCP server over stdio.",
+        .long_description =
+            "Starts a Model Context Protocol (MCP) server that exposes hunt " ++
+            "commands as tools. The server communicates over stdin/stdout using " ++
+            "newline-delimited JSON-RPC 2.0 messages. Progress notifications are " ++
+            "sent for long-running operations such as analyze_heap_dump.",
+        .usage = "hunt mcp",
+        .options = &.{},
+        .examples = &.{
+            "hunt mcp",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Server shut down cleanly." },
+            .{ .code = 1, .description = "Invalid argument or server error." },
+        },
+        .see_also = &.{"index", "overview"},
+    },
     .{
         .name = "index",
         .description = "Build a persistent heap-graph index from an HPROF dump.",
@@ -568,6 +593,10 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Index commands:\n");
     try printCommandGroup(writer, &.{"index"});
+
+    try writer.writeAll("\n");
+    try writeStyled(writer, Style.bold, "MCP commands:\n");
+    try printCommandGroup(writer, &.{"mcp"});
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Query commands:\n");
