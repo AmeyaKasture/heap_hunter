@@ -263,28 +263,6 @@ fn analyzeHeapDump(
     const force = getOptionalBool(arguments, "force");
     const no_progress = getOptionalBool(arguments, "no_progress");
 
-    var args = std.ArrayList([:0]const u8).empty;
-    defer {
-        for (args.items) |arg| allocator.free(arg);
-        args.deinit(allocator);
-    }
-
-    try args.append(allocator, "hunt");
-    try args.append(allocator, "index");
-    try args.append(allocator, try allocator.dupeZ(u8, hprof_path));
-    if (index_dir) |d| {
-        try args.append(allocator, "--index-dir");
-        try args.append(allocator, try allocator.dupeZ(u8, d));
-    }
-    if (sorting_budget_mb) |mb| {
-        try args.append(allocator, "--sorting-budget-mb");
-        var mb_buf: [32]u8 = undefined;
-        const mb_str = try std.fmt.bufPrintZ(&mb_buf, "{d}", .{mb});
-        try args.append(allocator, mb_str);
-    }
-    if (force) |f| if (f) try args.append(allocator, "--force");
-    if (no_progress) |p| if (p) try args.append(allocator, "--no-progress");
-
     const stderr_file = Io.File.stderr();
     var stderr_buf: [1024]u8 = undefined;
     var stderr_writer: Io.File.Writer = .init(stderr_file, io, &stderr_buf);
@@ -297,7 +275,13 @@ fn analyzeHeapDump(
     Commands.runIndexCommand(
         allocator,
         io,
-        args.items,
+        .{
+            .hprof_path = hprof_path,
+            .index_dir = index_dir,
+            .sorting_budget_mb = sorting_budget_mb,
+            .force = force orelse false,
+            .no_progress = no_progress orelse false,
+        },
         &index_output.writer,
         stderr,
         config_load.*,
@@ -308,28 +292,18 @@ fn analyzeHeapDump(
     };
 
     // Always rebuild the overview cache so analyze_heap_dump is idempotent.
-    var overview_args = std.ArrayList([:0]const u8).empty;
-    defer {
-        for (overview_args.items) |arg| allocator.free(arg);
-        overview_args.deinit(allocator);
-    }
-    try overview_args.append(allocator, "hunt");
-    try overview_args.append(allocator, "overview");
-    try overview_args.append(allocator, try allocator.dupeZ(u8, hprof_path));
-    if (index_dir) |d| {
-        try overview_args.append(allocator, "--index-dir");
-        try overview_args.append(allocator, try allocator.dupeZ(u8, d));
-    }
-    try overview_args.append(allocator, "--force");
-    if (no_progress) |p| if (p) try overview_args.append(allocator, "--no-progress");
-
     var overview_output = Io.Writer.Allocating.init(allocator);
     defer overview_output.deinit();
 
     Commands.runOverviewCommand(
         allocator,
         io,
-        overview_args.items,
+        .{
+            .hprof_path = hprof_path,
+            .index_dir = index_dir,
+            .force = true,
+            .no_progress = no_progress orelse false,
+        },
         &overview_output.writer,
         stderr,
         config_load.*,

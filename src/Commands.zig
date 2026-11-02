@@ -20,10 +20,25 @@ const Publish = @import("index/Publish.zig");
 const Manifest = @import("index/Manifest.zig");
 const Overview = @import("Overview.zig");
 
+pub const IndexOptions = struct {
+    hprof_path: []const u8,
+    index_dir: ?[]const u8 = null,
+    sorting_budget_mb: ?u32 = null,
+    force: bool = false,
+    no_progress: bool = false,
+};
+
+pub const OverviewOptions = struct {
+    hprof_path: []const u8,
+    index_dir: ?[]const u8 = null,
+    force: bool = false,
+    no_progress: bool = false,
+};
+
 pub fn runIndexCommand(
     allocator: std.mem.Allocator,
     io: Io,
-    args: []const [:0]const u8,
+    options: IndexOptions,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     config_load: Config.LoadResult,
@@ -37,53 +52,14 @@ pub fn runIndexCommand(
     const config = config_load.config;
     defer stderr.flush() catch {};
 
-    const usage = "hunt index <file.hprof> [options]";
-    const command = "index";
+    const path = options.hprof_path;
+    const index_dir_opt = options.index_dir;
+    const sorting_budget_mb = options.sorting_budget_mb orelse config.sortingBudgetMb();
+    const force = options.force;
+    const no_progress = options.no_progress;
 
     log.debug("runIndexCommand starting", .{});
-
-    var path_opt: ?[]const u8 = null;
-    var index_dir_opt: ?[]const u8 = null;
-    var sorting_budget_mb: u32 = config.sortingBudgetMb();
-    var force = false;
-    var no_progress = false;
-
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (Cli.isHelpFlag(arg)) {
-            try Cli.printCommandHelp(stdout, command);
-            return;
-        } else if (std.mem.eql(u8, arg, "--index-dir")) {
-            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
-            i += 1;
-            index_dir_opt = value;
-        } else if (std.mem.eql(u8, arg, "--sorting-budget-mb")) {
-            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
-            i += 1;
-            sorting_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
-        } else if (std.mem.eql(u8, arg, "--force")) {
-            force = true;
-        } else if (std.mem.eql(u8, arg, "--no-progress")) {
-            no_progress = true;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            try Cli.printUnknownOption(stderr, command, usage, arg);
-            return error.InvalidArgument;
-        } else {
-            if (path_opt != null) {
-                try Cli.printError(stderr, "multiple file arguments specified", .{});
-                return error.InvalidArgument;
-            }
-            path_opt = arg;
-        }
-    }
-
-    const path = path_opt orelse {
-        try Cli.printMissingArgument(stderr, command, usage, "missing required argument <file.hprof>", .{});
-        return error.InvalidArgument;
-    };
-
-    log.debug("index args parsed: path={s}, index_dir={?s}, sorting_budget_mb={d}, force={}", .{ path, index_dir_opt, sorting_budget_mb, force });
+    log.debug("index options: path={s}, index_dir={?s}, sorting_budget_mb={d}, force={}", .{ path, index_dir_opt, sorting_budget_mb, force });
 
     var index_dir_owned = false;
     const index_dir = (try resolveIndexDir(allocator, config_load, index_dir_opt, path, &index_dir_owned)) orelse {
@@ -307,7 +283,7 @@ pub fn runIndexCommand(
 pub fn runOverviewCommand(
     allocator: std.mem.Allocator,
     io: Io,
-    args: []const [:0]const u8,
+    options: OverviewOptions,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
     config_load: Config.LoadResult,
@@ -318,48 +294,14 @@ pub fn runOverviewCommand(
         log.traceError(err);
     }
 
-    const usage = "hunt overview <file.hprof> [options]";
-    const command = "overview";
-
     log.debug("runOverviewCommand starting", .{});
 
-    var path_opt: ?[]const u8 = null;
-    var index_dir_opt: ?[]const u8 = null;
-    var force = false;
-    var no_progress = false;
+    const path = options.hprof_path;
+    const index_dir_opt = options.index_dir;
+    const force = options.force;
+    const no_progress = options.no_progress;
 
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (Cli.isHelpFlag(arg)) {
-            try Cli.printCommandHelp(stdout, command);
-            return;
-        } else if (std.mem.eql(u8, arg, "--index-dir")) {
-            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
-            i += 1;
-            index_dir_opt = value;
-        } else if (std.mem.eql(u8, arg, "--force")) {
-            force = true;
-        } else if (std.mem.eql(u8, arg, "--no-progress")) {
-            no_progress = true;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            try Cli.printUnknownOption(stderr, command, usage, arg);
-            return error.InvalidArgument;
-        } else {
-            if (path_opt != null) {
-                try Cli.printError(stderr, "multiple file arguments specified", .{});
-                return error.InvalidArgument;
-            }
-            path_opt = arg;
-        }
-    }
-
-    const path = path_opt orelse {
-        try Cli.printMissingArgument(stderr, command, usage, "missing required argument <file.hprof>", .{});
-        return error.InvalidArgument;
-    };
-
-    log.debug("overview args parsed: path={s}, index_dir={?s}, force={}", .{ path, index_dir_opt, force });
+    log.debug("overview options: path={s}, index_dir={?s}, force={}", .{ path, index_dir_opt, force });
 
     var index_dir_owned = false;
     const index_dir = (try resolveIndexDir(allocator, config_load, index_dir_opt, path, &index_dir_owned)) orelse {
@@ -454,6 +396,120 @@ pub fn runOverviewCommand(
     const escaped_index_dir = escaped_index_dir_buf.writer.buffer[0..escaped_index_dir_buf.writer.end];
 
     try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"cache\":\"overview.bin\"}}\n", .{escaped_index_dir});
+}
+
+/// Parse CLI argv into IndexOptions. `args` must include the program name at
+/// index 0 and the command at index 1 (i.e. the shifted form produced by runCli).
+pub fn parseIndexArgs(
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) anyerror!IndexOptions {
+    const usage = "hunt index <file.hprof> [options]";
+    const command = "index";
+
+    var path_opt: ?[]const u8 = null;
+    var index_dir_opt: ?[]const u8 = null;
+    var sorting_budget_mb: ?u32 = null;
+    var force = false;
+    var no_progress = false;
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (Cli.isHelpFlag(arg)) {
+            try Cli.printCommandHelp(stdout, command);
+            return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--index-dir")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            index_dir_opt = value;
+        } else if (std.mem.eql(u8, arg, "--sorting-budget-mb")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            sorting_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, arg, "--no-progress")) {
+            no_progress = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try Cli.printUnknownOption(stderr, command, usage, arg);
+            return error.InvalidArgument;
+        } else {
+            if (path_opt != null) {
+                try Cli.printError(stderr, "multiple file arguments specified", .{});
+                return error.InvalidArgument;
+            }
+            path_opt = arg;
+        }
+    }
+
+    const path = path_opt orelse {
+        try Cli.printMissingArgument(stderr, command, usage, "missing required argument <file.hprof>", .{});
+        return error.InvalidArgument;
+    };
+
+    return .{
+        .hprof_path = path,
+        .index_dir = index_dir_opt,
+        .sorting_budget_mb = sorting_budget_mb,
+        .force = force,
+        .no_progress = no_progress,
+    };
+}
+
+/// Parse CLI argv into OverviewOptions. `args` must include the program name at
+/// index 0 and the command at index 1 (i.e. the shifted form produced by runCli).
+pub fn parseOverviewArgs(
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) anyerror!OverviewOptions {
+    const usage = "hunt overview <file.hprof> [options]";
+    const command = "overview";
+
+    var path_opt: ?[]const u8 = null;
+    var index_dir_opt: ?[]const u8 = null;
+    var force = false;
+    var no_progress = false;
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (Cli.isHelpFlag(arg)) {
+            try Cli.printCommandHelp(stdout, command);
+            return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--index-dir")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            index_dir_opt = value;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, arg, "--no-progress")) {
+            no_progress = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try Cli.printUnknownOption(stderr, command, usage, arg);
+            return error.InvalidArgument;
+        } else {
+            if (path_opt != null) {
+                try Cli.printError(stderr, "multiple file arguments specified", .{});
+                return error.InvalidArgument;
+            }
+            path_opt = arg;
+        }
+    }
+
+    const path = path_opt orelse {
+        try Cli.printMissingArgument(stderr, command, usage, "missing required argument <file.hprof>", .{});
+        return error.InvalidArgument;
+    };
+
+    return .{
+        .hprof_path = path,
+        .index_dir = index_dir_opt,
+        .force = force,
+        .no_progress = no_progress,
+    };
 }
 
 /// Resolve the index directory for a command. Precedence:

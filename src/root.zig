@@ -80,12 +80,14 @@ pub fn runCli(
 
     if (std.mem.eql(u8, command, "index")) {
         log.debug("dispatching to runIndexCommand", .{});
-        return Commands.runIndexCommand(allocator, io, shifted, stdout, stderr, config_load, null, null);
+        const options = try Commands.parseIndexArgs(shifted, stdout, stderr);
+        return Commands.runIndexCommand(allocator, io, options, stdout, stderr, config_load, null, null);
     }
 
     if (std.mem.eql(u8, command, "overview")) {
         log.debug("dispatching to runOverviewCommand", .{});
-        return Commands.runOverviewCommand(allocator, io, shifted, stdout, stderr, config_load, null, null);
+        const options = try Commands.parseOverviewArgs(shifted, stdout, stderr);
+        return Commands.runOverviewCommand(allocator, io, options, stdout, stderr, config_load, null, null);
     }
 
     if (std.mem.eql(u8, command, "mcp")) {
