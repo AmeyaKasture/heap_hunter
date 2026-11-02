@@ -1,14 +1,14 @@
 //! MCP tool definitions and dispatch for hunt.
 //!
 //! Each tool maps to an existing hunt command. Tool handlers either invoke the
-//! public command functions in `root.zig` or use the lower-level query engine
-//! directly. All output is captured as a JSON string and returned to the MCP
-//! server, which wraps it in MCP `text` content.
+//! public command functions in `Commands.zig` or use the lower-level query
+//! engine directly. All output is captured as a JSON string and returned to the
+//! MCP server, which wraps it in MCP `text` content.
 const std = @import("std");
 const Io = std.Io;
 
 const Config = @import("Config.zig").Config;
-const root = @import("root.zig");
+const Commands = @import("Commands.zig");
 const Overview = @import("Overview.zig");
 const Manifest = @import("index/Manifest.zig");
 const IndexReader = @import("index/IndexReader.zig");
@@ -294,7 +294,7 @@ fn analyzeHeapDump(
     var index_output = Io.Writer.Allocating.init(allocator);
     defer index_output.deinit();
 
-    root.runIndexCommand(
+    Commands.runIndexCommand(
         allocator,
         io,
         args.items,
@@ -326,7 +326,7 @@ fn analyzeHeapDump(
     var overview_output = Io.Writer.Allocating.init(allocator);
     defer overview_output.deinit();
 
-    root.runOverviewCommand(
+    Commands.runOverviewCommand(
         allocator,
         io,
         overview_args.items,
