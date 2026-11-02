@@ -59,7 +59,10 @@ pub const Server = struct {
     }
 
     fn handleMessage(self: *Server, line: []const u8, stdout: *Io.Writer) !void {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch {
+            try sendError(stdout, null, -32700, "Parse error");
+            return;
+        };
         defer parsed.deinit();
 
         const root = parsed.value;
@@ -460,6 +463,135 @@ test "handleMessage rejects non-string jsonrpc" {
     const output = buf.writer.buffer[0..buf.writer.end];
     try std.testing.expect(std.mem.indexOf(u8, output, "\"error\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"code\":-32600") != null);
+}
+
+test "handleMessage initialize returns server info" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}");
+    defer response.deinit();
+
+    const root = response.value.object;
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expectEqual(@as(i64, 1), root.get("id").?.integer);
+
+    const result = root.get("result").?.object;
+    try std.testing.expectEqualStrings("2024-11-05", result.get("protocolVersion").?.string);
+
+    const server_info = result.get("serverInfo").?.object;
+    try std.testing.expectEqualStrings("hunt", server_info.get("name").?.string);
+    try std.testing.expectEqualStrings("0.1.0", server_info.get("version").?.string);
+
+    const capabilities = result.get("capabilities").?.object;
+    try std.testing.expect(capabilities.get("tools").?.object.get("listChanged").?.bool == false);
+}
+
+test "handleMessage tools/list returns all tools" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/list\"}");
+    defer response.deinit();
+
+    const root = response.value.object;
+    try std.testing.expectEqualStrings("2.0", root.get("jsonrpc").?.string);
+    try std.testing.expectEqual(@as(i64, 42), root.get("id").?.integer);
+
+    const tools = root.get("result").?.object.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 11), tools.items.len);
+
+    const expected_names = [_][]const u8{
+        "analyze_heap_dump",
+        "heap_info",
+        "heap_histogram",
+        "heap_classes",
+        "find_objects",
+        "sample_objects",
+        "get_object",
+        "refs_from",
+        "refs_to",
+        "find_roots",
+        "reference_tree",
+    };
+    for (expected_names, tools.items) |expected, tool| {
+        try std.testing.expectEqualStrings(expected, tool.object.get("name").?.string);
+    }
+}
+
+test "handleMessage unknown method returns -32601" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"unknown/method\"}");
+    defer response.deinit();
+
+    const err = response.value.object.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32601), err.get("code").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), response.value.object.get("id").?.integer);
+}
+
+test "handleMessage missing method returns -32600" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":8}");
+    defer response.deinit();
+
+    const err = response.value.object.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32600), err.get("code").?.integer);
+}
+
+test "handleMessage malformed json returns -32700" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server, "{not json}");
+    defer response.deinit();
+
+    const err = response.value.object.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32700), err.get("code").?.integer);
+}
+
+test "handleMessage tools/call missing arguments returns -32602" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"heap_info\"}}");
+    defer response.deinit();
+
+    const err = response.value.object.get("error").?.object;
+    try std.testing.expectEqual(@as(i64, -32602), err.get("code").?.integer);
+}
+
+test "handleMessage tools/call unknown tool returns isError true" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    const response = try callServer(allocator, &server,
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}");
+    defer response.deinit();
+
+    const result = response.value.object.get("result").?.object;
+    try std.testing.expect(result.get("isError").?.bool == true);
+    try std.testing.expectEqualStrings("text", result.get("content").?.array.items[0].object.get("type").?.string);
+}
+
+fn callServer(
+    allocator: std.mem.Allocator,
+    server: *Server,
+    request: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+    try server.handleMessage(request, &buf.writer);
+    const output = buf.writer.buffer[0..buf.writer.end];
+    return try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
 }
 
 const log = std.log.scoped(.mcp);

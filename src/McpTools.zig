@@ -744,6 +744,73 @@ test "getOptionalU64 rejects float" {
     try std.testing.expectEqual(@as(?u64, null), getOptionalU64(parsed.value, "bytes"));
 }
 
+test "dispatch unknown tool returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "no_such_tool", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("UnknownTool", result.failure.error_type);
+}
+
+test "dispatch analyze_heap_dump missing hprof_path returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "analyze_heap_dump", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch analyze_heap_dump missing file returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        "{\"hprof_path\":\"/nonexistent/hunt/test/file.hprof\",\"index_dir\":\"/tmp/hunt-mcp-test-missing-file.idx\"}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "analyze_heap_dump", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("FileNotFound", result.failure.error_type);
+}
+
+test "dispatch heap_info missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "heap_info", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch heap_histogram missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "heap_histogram", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch heap_classes missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "heap_classes", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
 fn mapError(err: anyerror, context: []const u8) Result {
     return Result{
         .failure = .{
