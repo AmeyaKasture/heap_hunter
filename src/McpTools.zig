@@ -678,8 +678,8 @@ fn getOptionalU32(arguments: std.json.Value, name: []const u8) ?u32 {
     if (arguments != .object) return null;
     const val = arguments.object.get(name) orelse return null;
     switch (val) {
-        .integer => |i| if (i >= 0) return @intCast(i),
-        .float => |f| if (f >= 0) return @intFromFloat(f),
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) return @intCast(i),
+        .float => |f| if (f >= 0 and f <= std.math.maxInt(u32)) return @intFromFloat(f),
         else => {},
     }
     return null;
@@ -690,7 +690,6 @@ fn getOptionalU64(arguments: std.json.Value, name: []const u8) ?u64 {
     const val = arguments.object.get(name) orelse return null;
     switch (val) {
         .integer => |i| if (i >= 0) return @intCast(i),
-        .float => |f| if (f >= 0) return @intFromFloat(f),
         else => {},
     }
     return null;
@@ -701,6 +700,48 @@ fn getOptionalBool(arguments: std.json.Value, name: []const u8) ?bool {
     const val = arguments.object.get(name) orelse return null;
     if (val != .bool) return null;
     return val.bool;
+}
+
+test "getOptionalU32 accepts valid integer" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"limit\":100}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, 100), getOptionalU32(parsed.value, "limit"));
+}
+
+test "getOptionalU32 rejects negative integer" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"limit\":-1}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), getOptionalU32(parsed.value, "limit"));
+}
+
+test "getOptionalU32 rejects out-of-range integer" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"limit\":4294967296}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), getOptionalU32(parsed.value, "limit"));
+}
+
+test "getOptionalU32 rejects out-of-range float" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"limit\":1e20}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), getOptionalU32(parsed.value, "limit"));
+}
+
+test "getOptionalU64 accepts valid integer" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"bytes\":1000}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 1000), getOptionalU64(parsed.value, "bytes"));
+}
+
+test "getOptionalU64 rejects float" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"bytes\":1e10}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, null), getOptionalU64(parsed.value, "bytes"));
 }
 
 fn mapError(err: anyerror, context: []const u8) Result {

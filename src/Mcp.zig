@@ -70,8 +70,8 @@ pub const Server = struct {
 
         const obj = root.object;
         const jsonrpc = obj.get("jsonrpc");
-        if (jsonrpc == null or !std.mem.eql(u8, jsonrpc.?.string, "2.0")) {
-            try sendError(stdout, obj.get("id"), -32600, "Invalid Request: jsonrpc must be 2.0");
+        if (jsonrpc == null or jsonrpc.? != .string or !std.mem.eql(u8, jsonrpc.?.string, "2.0")) {
+            try sendError(stdout, obj.get("id"), -32600, "Invalid Request: jsonrpc must be a 2.0 string");
             return;
         }
 
@@ -352,7 +352,7 @@ fn sendError(stdout: *Io.Writer, id: ?std.json.Value, code: i64, message: []cons
     const response = .{
         .jsonrpc = "2.0",
         .id = id,
-        .failure = .{
+        .@"error" = .{
             .code = code,
             .message = message,
         },
@@ -435,6 +435,31 @@ fn errorMessage(err: anyerror) []const u8 {
         error.CacheFingerprintMismatch => "Overview cache is stale. Re-run analyze_heap_dump.",
         else => @errorName(err),
     };
+}
+
+test "sendError emits JSON-RPC error object" {
+    const allocator = std.testing.allocator;
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+    try sendError(&buf.writer, null, -32600, "Invalid Request");
+    const output = buf.writer.buffer[0..buf.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"failure\":") == null);
+}
+
+test "handleMessage rejects non-string jsonrpc" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    var server = Server.init(allocator, std.testing.io, &config_load);
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+    try server.handleMessage(
+        "{\"jsonrpc\":2.0,\"id\":1,\"method\":\"tools/list\"}",
+        &buf.writer,
+    );
+    const output = buf.writer.buffer[0..buf.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"error\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"code\":-32600") != null);
 }
 
 const log = std.log.scoped(.mcp);
