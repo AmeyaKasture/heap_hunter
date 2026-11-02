@@ -75,8 +75,9 @@ the size of the source dump.
   a class-name regex, with shallow size and kind (instance, object
   array, primitive array).
 - **Object decoding** (`object`): full JSON view of a single object,
-  including its fields (typed primitives, object references, or array
-  contents) and shallow byte size.
+  including its fields (typed primitives with `"type"` + `"value"`, object
+  references, or array contents), shallow byte size, decoded
+  `java.lang.String` text, and text previews for `char[]` / `byte[]` arrays.
 - **Sample decoding** (`sample`): N random or ordered sample objects per
   class, fully decoded — useful for inspecting a representative slice
   of a large class without paying the cost of decoding every instance.
@@ -275,7 +276,7 @@ The config file's `index-dir` is used as the default base directory when
 | `heap_classes` | Loaded class metadata with names, superclasses, and instance sizes. |
 | `find_objects` | Object IDs whose class name matches a regex. |
 | `sample_objects` | Decoded sample objects matching a class regex. |
-| `get_object` | Full decode of a single object, including field values. |
+| `get_object` | Full decode of a single object, including typed field values, decoded `java.lang.String` text, and `char[]` / `byte[]` previews. |
 | `refs_from` | Outgoing references of an object. |
 | `refs_to` | Incoming references of an object. |
 | `find_roots` | Shortest path from an object to a GC root. |
@@ -430,13 +431,15 @@ java.lang.String,892103,178420600
   "class": "com.example.Order",
   "shallow_bytes": 96,
   "fields": [
-    { "name": "id",      "declared_by": "java.lang.Long",   "value": 7842193 },
+    { "name": "id",      "declared_by": "java.lang.Long",   "type": "long",  "value": 7842193 },
     { "name": "status",  "declared_by": "java.lang.String", "ref": "0x4a10", "ordinal": 7129, "class": "java.lang.String" },
     { "name": "items",   "declared_by": "com.example.Order", "ref": "0x3008", "ordinal": 4220, "class": "java.util.ArrayList" },
     { "name": "created", "declared_by": "java.time.Instant", "ref": "0x2f88", "ordinal": 4192, "class": "java.time.Instant" }
   ]
 }
 ```
+
+`java.lang.String` instances also include a `"string"` field with the decoded text, and `char[]` / `byte[]` primitive arrays include a `"preview"` field.
 
 ### `hunt sample 'java.util.HashMap\$Node' --limit 2` (JSON, abbreviated)
 

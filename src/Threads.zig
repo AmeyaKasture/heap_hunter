@@ -2,6 +2,7 @@
 const std = @import("std");
 const hprof = @import("hprof.zig");
 const IndexTypes = @import("IndexTypes.zig");
+const Decoder = @import("Decoder.zig");
 
 pub const Thread = struct {
     object_id: hprof.Id,
@@ -350,12 +351,12 @@ pub const ThreadIndex = struct {
         const info = self.string_values.get(string_object_id) orelse return self.allocator.dupe(u8, "<unresolved>");
         const arr = self.prim_arrays.get(info.array_id) orelse return self.allocator.dupe(u8, "<unresolved>");
         switch (arr.element_type) {
-            .char => return decodeUtf16(self.allocator, arr.bytes, .big),
+            .char => return Decoder.decodeUtf16(self.allocator, arr.bytes, .big),
             .byte => {
                 if (info.coder == 1) {
-                    return decodeUtf16(self.allocator, arr.bytes, .little);
+                    return Decoder.decodeUtf16(self.allocator, arr.bytes, .little);
                 }
-                return decodeLatin1(self.allocator, arr.bytes);
+                return Decoder.decodeLatin1(self.allocator, arr.bytes);
             },
             else => return self.allocator.dupe(u8, "<unsupported string>"),
         }
@@ -429,45 +430,4 @@ fn replaceSlashes(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator
         if (c == '/') result[i] = '.';
     }
     return result;
-}
-
-fn decodeLatin1(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error![]const u8 {
-    var result = try std.ArrayList(u8).initCapacity(allocator, bytes.len);
-    errdefer result.deinit(allocator);
-    for (bytes) |b| {
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(b, &buf) catch {
-            try result.appendSlice(allocator, "?");
-            continue;
-        };
-        try result.appendSlice(allocator, buf[0..len]);
-    }
-    return result.toOwnedSlice(allocator);
-}
-
-fn decodeUtf16(allocator: std.mem.Allocator, bytes: []const u8, endian: std.builtin.Endian) std.mem.Allocator.Error![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-    var i: usize = 0;
-    while (i + 1 < bytes.len) {
-        const cu = std.mem.readInt(u16, bytes[i .. i + 2][0..2], endian);
-        i += 2;
-        var codepoint: u21 = cu;
-        if (cu >= 0xD800 and cu <= 0xDBFF) {
-            if (i + 1 >= bytes.len) break;
-            const low = std.mem.readInt(u16, bytes[i .. i + 2][0..2], endian);
-            i += 2;
-            if (low < 0xDC00 or low > 0xDFFF) continue;
-            codepoint = 0x10000 + ((@as(u21, cu & 0x3FF) << 10) | @as(u21, low & 0x3FF));
-        } else if (cu >= 0xDC00 and cu <= 0xDFFF) {
-            continue;
-        }
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(codepoint, &buf) catch {
-            try result.appendSlice(allocator, "?");
-            continue;
-        };
-        try result.appendSlice(allocator, buf[0..len]);
-    }
-    return result.toOwnedSlice(allocator);
 }

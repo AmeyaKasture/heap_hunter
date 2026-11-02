@@ -7,6 +7,7 @@ const Scanner = @import("Scanner.zig");
 const CatalogSorter = @import("CatalogSorter.zig");
 const Csr = @import("Csr.zig");
 const Regex = @import("../Regex.zig");
+const Decoder = @import("../Decoder.zig");
 const log = @import("log");
 
 pub const Error = error{
@@ -88,14 +89,22 @@ pub const ObjectView = struct {
     class_name: []const u8,
     shallow_size: u32,
     kind: Scanner.CatalogKind,
+    /// Decoded text when the object is a `java.lang.String`; owned by the view.
+    string: ?[]const u8 = null,
+    /// True when the backing array exceeded the string decode cap.
+    string_truncated: bool = false,
     /// Union discriminated by `kind`.
     payload: Payload,
 
     pub fn deinit(self: ObjectView, allocator: std.mem.Allocator) void {
+        if (self.string) |s| allocator.free(s);
         switch (self.payload) {
             .instance => |fields| allocator.free(fields),
             .object_array => |arr| allocator.free(arr.elements),
-            .primitive_array => |arr| allocator.free(arr.values),
+            .primitive_array => |arr| {
+                allocator.free(arr.values);
+                if (arr.preview) |p| allocator.free(p);
+            },
             .class => |cv| allocator.free(cv.static_fields),
         }
     }
@@ -145,6 +154,8 @@ pub const PrimitiveArrayView = struct {
     element_count: u32,
     values: []const FieldPrimitive,
     truncated: bool,
+    /// Text preview of the first elements for `char[]`/`byte[]`; owned by the view.
+    preview: ?[]const u8 = null,
 };
 
 pub const ClassView = struct {
@@ -563,6 +574,14 @@ pub const Reader = struct {
                 if (rec != .gc_instance_dump) return error.InvalidSourceOffset;
                 const inst = rec.gc_instance_dump;
                 const fields = try self.decodeInstanceFields(inst.class_id, inst.bytes);
+                var string: ?[]const u8 = null;
+                var string_truncated = false;
+                if (std.mem.eql(u8, class_name, "java/lang/String")) {
+                    if (try self.maybeDecodeStringInstance(fields)) |s| {
+                        string = s.text;
+                        string_truncated = s.truncated;
+                    }
+                }
                 return .{
                     .raw_id = row.raw_id,
                     .ordinal = ordinal,
@@ -570,6 +589,8 @@ pub const Reader = struct {
                     .class_name = class_name,
                     .shallow_size = row.shallow_size,
                     .kind = .instance,
+                    .string = string,
+                    .string_truncated = string_truncated,
                     .payload = .{ .instance = fields },
                 };
             },
@@ -661,6 +682,52 @@ pub const Reader = struct {
         return result;
     }
 
+    const MaybeString = struct {
+        text: []const u8,
+        truncated: bool,
+    };
+
+    /// Decode the text of a `java.lang.String` from its already-decoded
+    /// fields. Returns `null` (never errors) whenever the backing array
+    /// reference cannot be resolved or the shape is unexpected.
+    fn maybeDecodeStringInstance(self: *const Reader, fields: []const FieldValue) !?MaybeString {
+        const string_max_units: usize = 512;
+
+        var value_id: hprof.Id = 0;
+        var coder: ?u8 = null;
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, "value")) {
+                if (f.ref) |r| value_id = r.raw_id;
+            } else if (std.mem.eql(u8, f.name, "coder")) {
+                if (f.primitive) |p| {
+                    if (p == .byte) coder = @as(u8, @bitCast(p.byte));
+                }
+            }
+        }
+        if (value_id == 0) return null;
+
+        const array_ord = self.ordinalForRawId(value_id) orelse return null;
+        const array_row = self.catalogRow(array_ord);
+        if (array_row.kind != .primitive_array) return null;
+        const rec = self.decodeRecordAt(array_row.source_offset) catch return null;
+        if (rec != .gc_prim_array_dump) return null;
+        const arr = rec.gc_prim_array_dump;
+
+        const unit_size: usize = arr.element_type.size(self.id_size);
+        const capped = @min(@as(usize, arr.element_count), string_max_units);
+        if (capped == 0) return .{ .text = &.{}, .truncated = false };
+        const used = @min(arr.bytes.len, capped * unit_size);
+
+        const text = (try Decoder.decodeStringBacking(
+            self.allocator,
+            arr.bytes[0..used],
+            arr.element_type,
+            coder,
+        )) orelse return null;
+
+        return .{ .text = text, .truncated = arr.element_count > string_max_units };
+    }
+
     fn decodeObjectArray(self: *const Reader, arr: hprof.ObjectArrayDump) !ObjectArrayView {
         const max_elements = 256;
         const count = arr.element_count;
@@ -692,11 +759,22 @@ pub const Reader = struct {
             const offset = i * arr.element_type.size(self.id_size);
             values[i] = self.readPrimitiveAt(arr.bytes, offset, arr.element_type);
         }
+
+        var preview: ?[]const u8 = null;
+        if (out_count > 0) {
+            switch (arr.element_type) {
+                .char => preview = Decoder.decodeUtf16(self.allocator, arr.bytes[0..@min(arr.bytes.len, @as(usize, out_count) * 2)], .big) catch null,
+                .byte => preview = Decoder.decodeLatin1(self.allocator, arr.bytes[0..@min(arr.bytes.len, @as(usize, out_count))]) catch null,
+                else => {},
+            }
+        }
+
         return .{
             .element_type = arr.element_type,
             .element_count = count,
             .values = values,
             .truncated = count > max_elements,
+            .preview = preview,
         };
     }
 
@@ -846,6 +924,22 @@ fn writeFieldPrimitive(writer: *Io.Writer, p: FieldPrimitive) !void {
     }
 }
 
+/// Emit `"type"` plus `"value"` (and the printable form for `char`) so the
+/// consumer never has to guess the Java type of a scalar.
+fn writeFieldPrimitiveTyped(writer: *Io.Writer, p: FieldPrimitive) !void {
+    try writer.writeAll(",\"type\":");
+    try writeJsonString(writer, @tagName(p));
+    try writer.writeAll(",\"value\":");
+    try writeFieldPrimitive(writer, p);
+    if (p == .char) {
+        if (Decoder.isPrintableChar(p.char)) {
+            var buf: [4]u8 = undefined;
+            try writer.writeAll(",\"char\":");
+            try writeJsonString(writer, Decoder.encodeCharUtf8(p.char, &buf));
+        }
+    }
+}
+
 fn writeFieldRef(writer: *Io.Writer, ref: ?FieldRef) !void {
     if (ref) |r| {
         try writer.writeAll("{\"id\":");
@@ -878,6 +972,14 @@ fn writeObjectViewContent(writer: *Io.Writer, view: ObjectView) !void {
     try writeJsonString(writer, view.class_name);
     try writer.print(",\"shallow_bytes\":{d}", .{view.shallow_size});
 
+    if (view.string) |s| {
+        try writer.writeAll(",\"string\":");
+        try writeJsonString(writer, s);
+        if (view.string_truncated) {
+            try writer.writeAll(",\"string_truncated\":true");
+        }
+    }
+
     switch (view.payload) {
         .instance => |fields| {
             try writer.writeAll(",\"fields\":[");
@@ -899,8 +1001,7 @@ fn writeObjectViewContent(writer: *Io.Writer, view: ObjectView) !void {
                     try writer.writeAll(",\"class\":");
                     try writeJsonString(writer, r.class_name);
                 } else if (field.primitive) |p| {
-                    try writer.writeAll(",\"value\":");
-                    try writeFieldPrimitive(writer, p);
+                    try writeFieldPrimitiveTyped(writer, p);
                 }
                 try writer.writeAll("}");
             }
@@ -930,6 +1031,10 @@ fn writeObjectViewContent(writer: *Io.Writer, view: ObjectView) !void {
             try writer.writeAll("]");
             if (arr.truncated) {
                 try writer.writeAll(",\"truncated\":true");
+            }
+            if (arr.preview) |pv| {
+                try writer.writeAll(",\"preview\":");
+                try writeJsonString(writer, pv);
             }
         },
         .class => |cv| {

@@ -136,7 +136,7 @@ pub const tool_definitions = .{
     },
     .{
         .name = "get_object",
-        .description = "Decode a single object by its raw ID, including field values.",
+        .description = "Decode a single object by its raw ID with typed field values (\"type\" + \"value\"); java.lang.String instances include their decoded \"string\" text, and char[]/byte[] arrays include a text \"preview\".",
         .inputSchema = .{
             .type = "object",
             .properties = .{

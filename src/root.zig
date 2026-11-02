@@ -1649,6 +1649,7 @@ test {
     _ = @import("index/Validate.zig");
     _ = @import("index/Publish.zig");
     _ = @import("index/IndexReader.zig");
+    _ = @import("Decoder.zig");
     _ = @import("Overview.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
@@ -1665,4 +1666,213 @@ test {
     _ = @import("Overview.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
+}
+
+test "object query decodes string values, scalar types, and array previews" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    // Synthetic HPROF: String instances backed by char[]/byte[] (both coder
+    // variants) plus a POJO with scalar fields for type-tag assertions.
+    var b = @import("tests/HprofBuilder.zig").Builder.init(allocator, 4);
+    defer b.deinit();
+    try b.header(0);
+
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.utf8(0x1001, "java/lang/String");
+    try b.utf8(0x1002, "com/example/Pojo");
+    try b.utf8(0x1010, "value");
+    try b.utf8(0x1011, "coder");
+    try b.utf8(0x1012, "count");
+    try b.utf8(0x1013, "letter");
+    try b.utf8(0x1014, "ratio");
+    try b.utf8(0x1015, "flag");
+
+    try b.loadClass(1, 0x2000, 0x1000);
+    try b.loadClass(2, 0x2001, 0x1001);
+    try b.loadClass(3, 0x2002, 0x1002);
+
+    var heap = try b.heapDump();
+    _ = try heap.rootUnknown(0x3000);
+    _ = try heap.classDump(.{ .class_id = 0x2000, .instance_size = 0 });
+    _ = try heap.classDump(.{
+        .class_id = 0x2001,
+        .super_class_id = 0x2000,
+        .instance_size = 8,
+        .instance_fields = &.{
+            .{ .name_id = 0x1010, .type = .object }, // value
+            .{ .name_id = 0x1011, .type = .byte }, // coder
+        },
+    });
+    _ = try heap.classDump(.{
+        .class_id = 0x2002,
+        .super_class_id = 0x2000,
+        .instance_size = 11,
+        .instance_fields = &.{
+            .{ .name_id = 0x1012, .type = .int }, // count
+            .{ .name_id = 0x1013, .type = .char }, // letter
+            .{ .name_id = 0x1014, .type = .float }, // ratio
+            .{ .name_id = 0x1015, .type = .boolean }, // flag
+        },
+    });
+
+    var str_bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, str_bytes[0..4], 0x3100, .big);
+    str_bytes[4] = 0; // coder Latin-1 (unused for char[])
+    _ = try heap.instanceDump(0x3000, 0x2001, &str_bytes);
+
+    var str_cafe_bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, str_cafe_bytes[0..4], 0x3200, .big);
+    str_cafe_bytes[4] = 0; // coder 0: byte[] is Latin-1
+    _ = try heap.instanceDump(0x3001, 0x2001, &str_cafe_bytes);
+
+    var str_utf16_bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, str_utf16_bytes[0..4], 0x3300, .big);
+    str_utf16_bytes[4] = 1; // coder 1: byte[] is UTF-16LE
+    _ = try heap.instanceDump(0x3002, 0x2001, &str_utf16_bytes);
+
+    var pojo_bytes: [11]u8 = undefined;
+    std.mem.writeInt(u32, pojo_bytes[0..4], 42, .big);
+    std.mem.writeInt(u16, pojo_bytes[4..6], 0x41, .big); // 'A'
+    std.mem.writeInt(u32, pojo_bytes[6..10], 0x3FC00000, .big); // 1.5f
+    pojo_bytes[10] = 1;
+    _ = try heap.instanceDump(0x3400, 0x2002, &pojo_bytes);
+
+    _ = try heap.primitiveArrayDump(0x3100, .char, 4, &[_]u8{ 0, 'm', 0, 'a', 0, 'i', 0, 'n' });
+    _ = try heap.primitiveArrayDump(0x3200, .byte, 4, &[_]u8{ 'c', 'a', 'f', 0xE9 });
+    _ = try heap.primitiveArrayDump(0x3300, .byte, 6, &[_]u8{ 'h', 0, 0xE9, 0, 'i', 0 });
+    _ = try heap.primitiveArrayDump(0x3500, .int, 3, &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3 });
+    heap.end();
+    const dump_bytes = try b.finish();
+    defer allocator.free(dump_bytes);
+
+    const dump_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "test.hprof" });
+    defer allocator.free(dump_path_tmp);
+    const dump_path = try allocator.dupeZ(u8, dump_path_tmp);
+    defer allocator.free(dump_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dump_path, .data = dump_bytes });
+
+    const base_dir = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "idx" });
+    defer allocator.free(base_dir);
+    const config_json = try std.fmt.allocPrint(allocator, "{{\"index-dir\": \"{s}\"}}", .{base_dir});
+    defer allocator.free(config_json);
+
+    const config_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "config.json" });
+    defer allocator.free(config_path_tmp);
+    const config_path = try allocator.dupeZ(u8, config_path_tmp);
+    defer allocator.free(config_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
+
+    const stdout_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "stdout.txt" });
+    defer allocator.free(stdout_path_tmp);
+    const stdout_path = try allocator.dupeZ(u8, stdout_path_tmp);
+    defer allocator.free(stdout_path);
+
+    const stderr_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "stderr.txt" });
+    defer allocator.free(stderr_path_tmp);
+    const stderr_path = try allocator.dupeZ(u8, stderr_path_tmp);
+    defer allocator.free(stderr_path);
+
+    const helper = struct {
+        fn runCommand(alloc: std.mem.Allocator, io_arg: Io, out_path: [:0]const u8, err_path: [:0]const u8, command_args: []const [:0]const u8) ![]const u8 {
+            var stdout_file = try Io.Dir.cwd().createFile(io_arg, out_path, .{});
+            defer stdout_file.close(io_arg);
+            var stdout_buf: [4096]u8 = undefined;
+            var stdout_writer: Io.File.Writer = .init(stdout_file, io_arg, &stdout_buf);
+            var stderr_file = try Io.Dir.cwd().createFile(io_arg, err_path, .{});
+            defer stderr_file.close(io_arg);
+            var stderr_buf: [4096]u8 = undefined;
+            var stderr_writer: Io.File.Writer = .init(stderr_file, io_arg, &stderr_buf);
+            try runCli(alloc, io_arg, command_args, &stdout_writer.interface, &stderr_writer.interface, null);
+            try stdout_writer.flush();
+            return try Io.Dir.cwd().readFileAlloc(io_arg, out_path, alloc, .limited(16384));
+        }
+    };
+
+    // Index.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "index", dump_path };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.startsWith(u8, out, "{\"status\":\"complete\""));
+    }
+
+    // Regression: a failing open (unresolvable source override) must return
+    // an error cleanly instead of crashing via the error path.
+    {
+        const idx_path = try std.fs.path.join(allocator, &.{ base_dir, "test.idx" });
+        defer allocator.free(idx_path);
+        try std.testing.expectError(
+            error.FileNotFound,
+            IndexReader.open(allocator, io, idx_path, "/nonexistent/source.hprof"),
+        );
+    }
+
+    // char[]-backed String: value decoded in one call.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3000" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"string\":\"main\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"byte\",\"value\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"string_truncated\"") == null);
+    }
+
+    // byte[] + coder 0 -> Latin-1 (é encodes as 2-byte UTF-8).
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3001" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "caf\u{00e9}") != null);
+    }
+
+    // byte[] + coder 1 -> UTF-16LE.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3002" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "h\u{00e9}i") != null);
+    }
+
+    // POJO: every scalar carries its Java type; char gets a printable form.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3400" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"int\",\"value\":42") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"char\",\"value\":65,\"char\":\"A\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"float\",\"value\":1.5") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"boolean\",\"value\":true") != null);
+    }
+
+    // char[] itself: text preview alongside raw values.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3100" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"element_type\":\"char\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"preview\":\"main\"") != null);
+    }
+
+    // byte[] Latin-1 preview.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3200" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "caf\u{00e9}") != null);
+    }
+
+    // int[] gets no preview.
+    {
+        const args = &[_][:0]const u8{ "hunt", "--config", config_path, "object", dump_path, "0x3500" };
+        const out = try helper.runCommand(allocator, io, stdout_path, stderr_path, args);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"element_type\":\"int\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"preview\"") == null);
+    }
 }
