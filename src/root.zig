@@ -92,6 +92,10 @@ pub fn runCli(
 
     if (std.mem.eql(u8, command, "mcp")) {
         log.debug("dispatching to runMcp", .{});
+        if (shifted.len >= 3 and Cli.isHelpFlag(shifted[2])) {
+            try Cli.printCommandHelp(stdout, command);
+            return;
+        }
         return runMcp(allocator, io, shifted, config_load);
     }
 

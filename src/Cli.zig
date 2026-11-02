@@ -214,6 +214,7 @@ pub const commands = [_]Command{
         .options = &.{},
         .examples = &.{
             "hunt mcp",
+            "hunt --config /path/to/config.json mcp",
         },
         .exit_codes = &.{
             .{ .code = 0, .description = "Server shut down cleanly." },

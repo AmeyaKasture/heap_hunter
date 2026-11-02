@@ -16,6 +16,7 @@ so output composes with `jq`, shell pipelines, and automated tooling.
 - [Features](#features)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [MCP server](#mcp-server)
 - [Commands](#commands)
 - [Sample output](#sample-output)
 - [Configuration](#configuration)
@@ -114,6 +115,9 @@ the time the dump was taken and what call sites they were executing.
   against the output are predictable.
 - **Paging support** via `--offset` and `--limit` on the list commands,
   with a `next_offset` field returned in JSON.
+- **MCP server** (`mcp`): exposes every hunt command as a Model Context
+  Protocol tool over stdio, so LLM clients and agents can index dumps
+  and run queries directly.
 - **No required environment**: the binary is self-contained and has no
   JVM, GUI, or daemon dependencies.
 
@@ -243,6 +247,80 @@ hunt sample 'java.util.HashMap\$Node' --index-dir ./idx --limit 3
 hunt roots 0x3000      --index-dir ./idx
 ```
 
+## MCP server
+
+`hunt mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io)
+server that exposes hunt commands as tools. The server speaks JSON-RPC 2.0
+over stdin/stdout with newline-delimited messages — no sockets, no daemon —
+and terminates when stdin closes. This lets coding agents and LLM clients
+index dumps and query the heap graph directly from their tool loop.
+
+### Starting the server
+
+```bash
+hunt mcp
+hunt --config /path/to/config.json mcp
+```
+
+The config file's `index-dir` is used as the default base directory when
+`analyze_heap_dump` is called without an explicit `index_dir` argument.
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `analyze_heap_dump` | Index a dump and build the overview cache. First tool to call for a new dump. |
+| `heap_info` | Header and high-level summary. |
+| `heap_histogram` | Class-level histogram of instance counts and shallow bytes. |
+| `heap_classes` | Loaded class metadata with names, superclasses, and instance sizes. |
+| `find_objects` | Object IDs whose class name matches a regex. |
+| `sample_objects` | Decoded sample objects matching a class regex. |
+| `get_object` | Full decode of a single object, including field values. |
+| `refs_from` | Outgoing references of an object. |
+| `refs_to` | Incoming references of an object. |
+| `find_roots` | Shortest path from an object to a GC root. |
+| `reference_tree` | Bounded reference tree expansion from an object. |
+
+### Example session
+
+Each line below is one JSON-RPC message on stdin; responses come back
+newline-delimited on stdout.
+
+Initialize the session:
+
+```
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}
+```
+
+Response:
+
+```
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"hunt","version":"0.1.0"}}}
+```
+
+List available tools:
+
+```
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+```
+
+Index a dump (first tool to call for a new dump; emits
+`notifications/progress` while the index is built):
+
+```
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"analyze_heap_dump","arguments":{"hprof_path":"/tmp/heap.hprof"}}}
+```
+
+Query the histogram:
+
+```
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"heap_histogram","arguments":{"index_dir":"index/heap.idx","limit":10}}}
+```
+
+Tool results are returned as `text` content blocks containing the same JSON
+the corresponding CLI command emits. Failures are reported with
+`isError: true` and a JSON error payload inside the content block.
+
 ## Commands
 
 ### Indexing
@@ -295,6 +373,12 @@ hunt roots 0x3000      --index-dir ./idx
 | `--max-nodes <n>` | `tree` | Maximum number of nodes in the tree. |
 | `--max-visited <n>` | `roots` | BFS visit budget for the root search. |
 | `--source <path>` | query commands | Override the path to the original HPROF dump. |
+
+### Server
+
+| Command | Description |
+|---------|-------------|
+| `mcp` | Run hunt as an MCP server over stdio (JSON-RPC 2.0). |
 
 Run `hunt <command> --help` for the full option list of any command.
 
@@ -495,9 +579,13 @@ src/
   main.zig              CLI entry point
   root.zig              CLI logic and command dispatch
   Cli.zig               Help generation and argument parsing
+  Commands.zig          Command implementations shared by the CLI and MCP server
   Config.zig            User configuration
+  Progress.zig          TTY progress bar and progress callbacks
   Analysis.zig          Single-pass indexer and overview commands
   Overview.zig          Overview cache (histogram, classes, threads, stack traces)
+  Mcp.zig               MCP JSON-RPC 2.0 server over stdio
+  McpTools.zig          MCP tool definitions and dispatch
   hprof/                HPROF binary format parser
     Header.zig          Header record
     Record.zig          Record-type dispatch
