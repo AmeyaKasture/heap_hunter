@@ -225,24 +225,22 @@ pub const Reader = struct {
         defer allocator.free(manifest_path);
 
         const manifest = try Manifest.IndexManifest.parseFromFile(allocator, io, manifest_path);
-        errdefer manifest.deinit(allocator);
+        // Ownership moves into `self` below; the guard keeps this deferred
+        // free from running twice once that has happened.
+        var manifest_moved = false;
+        errdefer if (!manifest_moved) manifest.deinit(allocator);
 
         if (manifest.format_version != 1) {
             return error.InvalidManifest;
         }
 
         const source_path = source_override orelse manifest.source_path orelse return error.SourceFileNotFound;
-        const source_path_owned = try allocator.dupe(u8, source_path);
-        errdefer allocator.free(source_path_owned);
-
-        const index_dir_owned = try allocator.dupe(u8, index_dir);
-        errdefer allocator.free(index_dir_owned);
 
         var self: Reader = .{
             .allocator = allocator,
             .io = io,
-            .index_dir = index_dir_owned,
-            .source_path = source_path_owned,
+            .index_dir = "",
+            .source_path = "",
             .manifest = manifest,
             .id_size = manifest.fingerprint.id_size,
             .n_objects = manifest.n_objects,
@@ -264,6 +262,11 @@ pub const Reader = struct {
             .root_kinds = std.AutoHashMap(u32, u8).init(allocator),
         };
         errdefer self.deinit();
+        manifest_moved = true;
+
+        // Covered by `errdefer self.deinit()` from here on.
+        self.source_path = try allocator.dupe(u8, source_path);
+        self.index_dir = try allocator.dupe(u8, index_dir);
 
         // Open and validate the source dump.
         try self.openSource();
