@@ -6,6 +6,7 @@ const Regex = @import("Regex.zig");
 const Analysis = @import("Analysis.zig");
 const Manifest = @import("index/Manifest.zig");
 const Scanner = @import("index/Scanner.zig");
+const Csr = @import("index/Csr.zig");
 const log = @import("log");
 
 pub const HistogramOptions = struct {
@@ -131,8 +132,9 @@ pub const IndexBuildError = error{
 ///
 /// This is the fast, large-dump-safe path: `catalog.bin` is memory-mapped and
 /// scanned once, `classes.bin` and `prim_histogram.bin` are small files, and
-/// no source HPROF record decoding is performed. Thread details are not
-/// currently stored in the index, so `threads` is left empty.
+/// no source HPROF record decoding is performed. Thread details are served by
+/// the on-demand `threads` query instead; the overview only records the
+/// thread count, derived from `gc_root_thread_object` entries in `roots.bin`.
 pub fn buildFromIndex(
     allocator: std.mem.Allocator,
     io: Io,
@@ -293,6 +295,27 @@ pub fn buildFromIndex(
 
     const classloader_count = try computeClassloaderCount(allocator, class_table, catalog_data);
 
+    // Thread count comes from the GC roots: one `gc_root_thread_object`
+    // record per live thread object in the dump.
+    const roots_path = try std.fs.path.join(allocator, &.{ index_dir, "roots.bin" });
+    defer allocator.free(roots_path);
+    const roots_data = dir.readFileAlloc(io, roots_path, allocator, .unlimited) catch {
+        log.err("failed to read roots.bin", .{});
+        return error.MissingIndexFile;
+    };
+    defer allocator.free(roots_data);
+    if (roots_data.len % Csr.roots_bin_record_size != 0) {
+        log.err("roots.bin size is not a multiple of record size", .{});
+        return error.CorruptIndexFile;
+    }
+    var thread_count: u32 = 0;
+    const thread_object_root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object);
+    var roots_i: usize = 0;
+    while (roots_i < roots_data.len) : (roots_i += Csr.roots_bin_record_size) {
+        const rec = Csr.readRootRecord(roots_data[roots_i..][0..Csr.roots_bin_record_size]);
+        if (rec.root_kind == thread_object_root_kind) thread_count += 1;
+    }
+
     return .{
         .allocator = allocator,
         .summary = .{
@@ -302,7 +325,7 @@ pub fn buildFromIndex(
             .total_arrays = total_arrays,
             .total_heap_bytes = total_heap_bytes,
             .class_count = @intCast(class_table.ids.len),
-            .thread_count = 0,
+            .thread_count = thread_count,
             .classloader_count = classloader_count,
         },
         .histogram = try hist_items.toOwnedSlice(allocator),

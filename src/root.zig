@@ -15,6 +15,7 @@ const Analysis = @import("Analysis.zig");
 const Regex = @import("Regex.zig");
 const Manifest = @import("index/Manifest.zig");
 const IndexReader = @import("index/IndexReader.zig");
+const ThreadQuery = @import("index/ThreadQuery.zig");
 const Overview = @import("Overview.zig");
 const Config = @import("Config.zig").Config;
 const Progress = @import("Progress.zig");
@@ -104,6 +105,11 @@ pub fn runCli(
     {
         log.debug("dispatching to runObjectsCommand ({s})", .{command});
         return runObjectsCommand(allocator, io, command, shifted, stdout, stderr, config_load);
+    }
+
+    if (std.mem.eql(u8, command, "threads")) {
+        log.debug("dispatching to runThreadsCommand", .{});
+        return runThreadsCommand(allocator, io, shifted, stdout, stderr, config_load);
     }
 
     if (std.mem.eql(u8, command, "object") or
@@ -421,6 +427,81 @@ fn runQueryCommand(
     try stdout.flush();
 }
 
+fn runThreadsCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    config_load: Config.LoadResult,
+) anyerror!void {
+    errdefer |err| {
+        log.traceError(err);
+    }
+
+    log.debug("runThreadsCommand", .{});
+
+    const usage = "hunt threads [file.hprof] [options]";
+
+    var index_dir_opt: ?[]const u8 = null;
+    var dump_path_opt: ?[]const u8 = null;
+    var source_override: ?[]const u8 = null;
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (Cli.isHelpFlag(arg)) {
+            try Cli.printCommandHelp(stdout, "threads");
+            return;
+        } else if (std.mem.eql(u8, arg, "--index-dir")) {
+            const value = try Cli.expectNextArg(stderr, "threads", usage, arg, args, i);
+            i += 1;
+            index_dir_opt = value;
+        } else if (std.mem.eql(u8, arg, "--source")) {
+            const value = try Cli.expectNextArg(stderr, "threads", usage, arg, args, i);
+            i += 1;
+            source_override = value;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try Cli.printUnknownOption(stderr, "threads", usage, arg);
+            return error.InvalidArgument;
+        } else {
+            if (dump_path_opt == null) {
+                dump_path_opt = arg;
+            } else {
+                try Cli.printError(stderr, "multiple file arguments specified", .{});
+                return error.InvalidArgument;
+            }
+        }
+    }
+
+    var index_dir_owned = false;
+    const index_dir = (try Commands.resolveIndexDir(allocator, config_load, index_dir_opt, dump_path_opt, &index_dir_owned)) orelse {
+        try Cli.printMissingConfig(stderr, config_load.candidates_checked, config_load.explicit_path);
+        return error.InvalidArgument;
+    };
+    defer if (index_dir_owned) allocator.free(index_dir);
+
+    log.debug("threads: loading index from {s}", .{index_dir});
+
+    var progress = Progress.create(stderr, io, 1, false);
+    defer progress.stop(null);
+    progress.nextStep("loading index");
+
+    var reader = IndexReader.open(allocator, io, index_dir, source_override) catch |err| {
+        log.err("failed to open index: {s}", .{@errorName(err)});
+        try Cli.printError(stderr, "failed to open index: {s}", .{@errorName(err)});
+        return @as(anyerror!void, err);
+    };
+    progress.stop("index loaded");
+    defer reader.deinit();
+
+    var threads = try ThreadQuery.build(allocator, &reader);
+    defer threads.deinit();
+
+    try ThreadQuery.print(&threads, stdout);
+    try stdout.flush();
+}
+
 fn runObjectsCommand(
     allocator: std.mem.Allocator,
     io: Io,
@@ -624,6 +705,7 @@ test "index command publishes complete index" {
         "in_sources.bin",
         "roots.bin",
         "prim_histogram.bin",
+        "thread_traces.bin",
     };
     for (expected_files) |name| {
         const path = try std.fs.path.join(allocator, &.{ index_dir_tmp, name });
@@ -1638,6 +1720,222 @@ test "positional dump path derives index directory from config base" {
     }
 }
 
+test "threads command decodes threads and stack traces on demand" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    const HprofBuilder = @import("tests/HprofBuilder.zig");
+    var b = HprofBuilder.Builder.init(allocator, 4);
+    defer b.deinit();
+
+    try b.header(0);
+
+    // Class name utf8s.
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.utf8(0x1001, "java/lang/Thread");
+    try b.utf8(0x1002, "java/lang/Thread$FieldHolder");
+    try b.utf8(0x1003, "java/lang/String");
+
+    // Field name utf8s.
+    try b.utf8(0x1010, "name");
+    try b.utf8(0x1011, "tid");
+    try b.utf8(0x1012, "holder");
+    try b.utf8(0x1013, "daemon");
+    try b.utf8(0x1014, "priority");
+    try b.utf8(0x1015, "threadStatus");
+    try b.utf8(0x1016, "value");
+    try b.utf8(0x1017, "coder");
+
+    // Frame-related utf8s.
+    try b.utf8(0x1030, "java/lang/SocketInputStream");
+    try b.utf8(0x1031, "read");
+    try b.utf8(0x1032, "SocketInputStream.java");
+
+    // LOAD_CLASS records. Serial 5 backs the frame's class reference.
+    try b.loadClass(1, 0x2000, 0x1000);
+    try b.loadClass(2, 0x2001, 0x1001);
+    try b.loadClass(3, 0x2002, 0x1002);
+    try b.loadClass(4, 0x2003, 0x1003);
+    try b.loadClass(5, 0x2004, 0x1030);
+
+    try b.frame(0x5000, 0x1031, 0x1031, 0x1032, 5, 204);
+    try b.trace(1, 1, &.{0x5000});
+
+    var heap = try b.heapDump();
+    _ = try heap.classDump(.{ .class_id = 0x2000, .instance_size = 0 });
+
+    // java.lang.Thread { String name; long tid; Thread$FieldHolder holder; }
+    _ = try heap.classDump(.{
+        .class_id = 0x2001,
+        .super_class_id = 0x2000,
+        .instance_size = 16,
+        .instance_fields = &.{
+            .{ .name_id = 0x1010, .type = .object },
+            .{ .name_id = 0x1011, .type = .long },
+            .{ .name_id = 0x1012, .type = .object },
+        },
+    });
+
+    // java.lang.Thread$FieldHolder { boolean daemon; int priority; int threadStatus; }
+    _ = try heap.classDump(.{
+        .class_id = 0x2002,
+        .super_class_id = 0x2000,
+        .instance_size = 9,
+        .instance_fields = &.{
+            .{ .name_id = 0x1013, .type = .boolean },
+            .{ .name_id = 0x1014, .type = .int },
+            .{ .name_id = 0x1015, .type = .int },
+        },
+    });
+
+    // java.lang.String { byte[] value; byte coder; }
+    _ = try heap.classDump(.{
+        .class_id = 0x2003,
+        .super_class_id = 0x2000,
+        .instance_size = 5,
+        .instance_fields = &.{
+            .{ .name_id = 0x1016, .type = .object },
+            .{ .name_id = 0x1017, .type = .byte },
+        },
+    });
+
+    var thread_bytes: [16]u8 = undefined;
+    std.mem.writeInt(u32, thread_bytes[0..4], 0x2200, .big);
+    std.mem.writeInt(u64, thread_bytes[4..12], 42, .big);
+    std.mem.writeInt(u32, thread_bytes[12..16], 0x2110, .big);
+
+    var holder_bytes: [9]u8 = .{0} ** 9;
+    holder_bytes[0] = 0; // daemon=false
+    std.mem.writeInt(u32, holder_bytes[1..5], 5, .big); // priority=5
+    std.mem.writeInt(u32, holder_bytes[5..9], 4, .big); // threadStatus=RUNNABLE
+
+    var string_bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, string_bytes[0..4], 0x2300, .big);
+    string_bytes[4] = 0; // coder=0
+
+    _ = try heap.instanceDump(0x2100, 0x2001, &thread_bytes);
+    _ = try heap.instanceDump(0x2110, 0x2002, &holder_bytes);
+    _ = try heap.instanceDump(0x2200, 0x2003, &string_bytes);
+    const payload = "pool-worker-1";
+    _ = try heap.primitiveArrayDump(0x2300, .byte, @intCast(payload.len), payload);
+
+    _ = try heap.rootThreadObject(0x2100, 1, 1);
+    heap.end();
+
+    const dump_bytes = try b.finish();
+    defer allocator.free(dump_bytes);
+
+    const dump_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "threads.hprof" });
+    defer allocator.free(dump_path_tmp);
+    const dump_path = try allocator.dupeZ(u8, dump_path_tmp);
+    defer allocator.free(dump_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dump_path, .data = dump_bytes });
+
+    const index_dir_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "index" });
+    defer allocator.free(index_dir_tmp);
+    const index_dir = try allocator.dupeZ(u8, index_dir_tmp);
+    defer allocator.free(index_dir);
+
+    const stdout_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "stdout.txt" });
+    defer allocator.free(stdout_path_tmp);
+    const stdout_path = try allocator.dupeZ(u8, stdout_path_tmp);
+    defer allocator.free(stdout_path);
+
+    const stderr_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "stderr.txt" });
+    defer allocator.free(stderr_path_tmp);
+    const stderr_path = try allocator.dupeZ(u8, stderr_path_tmp);
+    defer allocator.free(stderr_path);
+
+    const run = struct {
+        fn cli(alloc: std.mem.Allocator, io_arg: Io, out_path: [:0]const u8, err_path: [:0]const u8, argv: []const [:0]const u8) ![]const u8 {
+            var stdout_file = try Io.Dir.cwd().createFile(io_arg, out_path, .{});
+            defer stdout_file.close(io_arg);
+            var stdout_buf: [8192]u8 = undefined;
+            var stdout_writer: Io.File.Writer = .init(stdout_file, io_arg, &stdout_buf);
+            var stderr_file = try Io.Dir.cwd().createFile(io_arg, err_path, .{});
+            defer stderr_file.close(io_arg);
+            var stderr_buf: [4096]u8 = undefined;
+            var stderr_writer: Io.File.Writer = .init(stderr_file, io_arg, &stderr_buf);
+            try runCli(alloc, io_arg, argv, &stdout_writer.interface, &stderr_writer.interface, null);
+            try stdout_writer.flush();
+            return try Io.Dir.cwd().readFileAlloc(io_arg, out_path, alloc, .limited(16384));
+        }
+    };
+
+    // Build the index.
+    {
+        const index_args = [_][:0]const u8{ "hunt", "index", dump_path, "--index-dir", index_dir };
+        const output = try run.cli(allocator, io, stdout_path, stderr_path, &index_args);
+        defer allocator.free(output);
+        try std.testing.expect(std.mem.startsWith(u8, output, "{\"status\":\"complete\""));
+    }
+
+    // Build the overview cache and check that info counts the thread.
+    {
+        const overview_args = [_][:0]const u8{ "hunt", "overview", dump_path, "--index-dir", index_dir };
+        const output = try run.cli(allocator, io, stdout_path, stderr_path, &overview_args);
+        defer allocator.free(output);
+        try std.testing.expect(std.mem.startsWith(u8, output, "{\"status\":\"complete\""));
+
+        const info_args = [_][:0]const u8{ "hunt", "info", "--index-dir", index_dir };
+        const info_out = try run.cli(allocator, io, stdout_path, stderr_path, &info_args);
+        defer allocator.free(info_out);
+        try std.testing.expect(std.mem.indexOf(u8, info_out, "threads:        1") != null);
+    }
+
+    // `hunt threads` decodes name, state, priority, daemon, tid, and frames.
+    {
+        const args = [_][:0]const u8{ "hunt", "threads", "--index-dir", index_dir };
+        const output = try run.cli(allocator, io, stdout_path, stderr_path, &args);
+        defer allocator.free(output);
+
+        try std.testing.expect(std.mem.indexOf(u8, output, "Thread: pool-worker-1\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "State:    RUNNABLE") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "Priority: 5") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "Daemon:   false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "TID:      42") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "  Stack trace:\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "at java.lang.SocketInputStream.read(SocketInputStream.java:204)") != null);
+    }
+
+    // MCP list_threads returns the same data as JSON.
+    {
+        const McpTools = @import("McpTools.zig");
+        var config_load: Config.LoadResult = .{};
+        const arguments = try std.fmt.allocPrint(allocator, "{{\"index_dir\":\"{s}\"}}", .{index_dir});
+        defer allocator.free(arguments);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+        defer parsed.deinit();
+
+        const result = try McpTools.dispatch(allocator, io, &config_load, "list_threads", parsed.value, .{});
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .success);
+
+        const json = try std.json.parseFromSlice(std.json.Value, allocator, result.success, .{});
+        defer json.deinit();
+        const threads = json.value.object.get("threads").?.array;
+        try std.testing.expectEqual(@as(usize, 1), threads.items.len);
+
+        const thread = threads.items[0].object;
+        try std.testing.expectEqualStrings("pool-worker-1", thread.get("name").?.string);
+        try std.testing.expectEqualStrings("RUNNABLE", thread.get("state").?.string);
+        try std.testing.expectEqual(@as(i64, 5), thread.get("priority").?.integer);
+        try std.testing.expectEqual(false, thread.get("daemon").?.bool);
+        try std.testing.expectEqual(@as(i64, 42), thread.get("tid").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), thread.get("thread_serial").?.integer);
+        try std.testing.expectEqual(false, thread.get("virtual").?.bool);
+        const frames = thread.get("stack_frames").?.array;
+        try std.testing.expectEqual(@as(usize, 1), frames.items.len);
+        try std.testing.expectEqualStrings("java.lang.SocketInputStream", frames.items[0].object.get("class_name").?.string);
+        try std.testing.expectEqual(@as(i64, 204), frames.items[0].object.get("line_number").?.integer);
+    }
+}
+
 test {
     _ = @import("index/ExtSort.zig");
     _ = @import("index/Scanner.zig");
@@ -1649,6 +1947,8 @@ test {
     _ = @import("index/Validate.zig");
     _ = @import("index/Publish.zig");
     _ = @import("index/IndexReader.zig");
+    _ = @import("index/ThreadTraces.zig");
+    _ = @import("index/ThreadQuery.zig");
     _ = @import("Decoder.zig");
     _ = @import("Overview.zig");
     _ = @import("tests/HprofBuilder.zig");

@@ -13,6 +13,7 @@
 //!   5. CSR offset files are monotone, start at 0, and end at `n_edges`.
 //!   6. CSR adjacency files contain exactly `n_edges` in-range ordinals.
 //!   7. `roots.bin` contains exactly `n_roots` in-range ordinals.
+//!   8. `thread_traces.bin` is parseable and structurally valid.
 //!
 //! Validation is streaming: each file is memory-mapped or treated as empty and
 //! scanned sequentially. No index file is loaded into the heap in its entirety,
@@ -26,6 +27,7 @@ const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
 const CatalogSorter = @import("CatalogSorter.zig");
 const Csr = @import("Csr.zig");
+const ThreadTraces = @import("ThreadTraces.zig");
 const Cli = @import("../Cli.zig");
 
 /// Errors that can be returned by the validation pipeline.
@@ -46,6 +48,8 @@ pub const Error = error{
     InvalidFieldsFile,
     /// `roots.bin` has the wrong size or malformed records.
     InvalidRootsFile,
+    /// `thread_traces.bin` is malformed (bad magic/version or truncated).
+    InvalidThreadTracesFile,
     OutOfMemory,
     WriteFailed,
 };
@@ -63,6 +67,7 @@ const expected_files = &[_][]const u8{
     "in_sources.bin",
     "roots.bin",
     "prim_histogram.bin",
+    "thread_traces.bin",
 };
 
 /// A read-only memory map of a file plus its exposed byte slice.
@@ -189,6 +194,32 @@ pub fn validate(
 
     // 7. roots.bin target ordinals are valid and its record count matches n_roots.
     try validateRoots(io, roots_path, n_roots, virtual_root_ordinal, stderr);
+
+    // 8. thread_traces.bin is parseable and structurally valid.
+    const thread_traces_path = try std.fs.path.join(allocator, &.{ staging_dir, "thread_traces.bin" });
+    defer allocator.free(thread_traces_path);
+    try validateThreadTraces(allocator, io, thread_traces_path, stderr);
+}
+
+/// Validate `thread_traces.bin` by parsing it; the parser performs full
+/// structural validation (magic, version, section sizes, index bounds).
+fn validateThreadTraces(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path: []const u8,
+    stderr: *Io.Writer,
+) Error!void {
+    const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch {
+        try Cli.printError(stderr, "index validation failed: thread_traces.bin is unreadable", .{});
+        return error.InvalidThreadTracesFile;
+    };
+    defer allocator.free(data);
+
+    var parsed = ThreadTraces.Parsed.parse(allocator, data) catch {
+        try Cli.printError(stderr, "index validation failed: thread_traces.bin is malformed", .{});
+        return error.InvalidThreadTracesFile;
+    };
+    defer parsed.deinit();
 }
 
 /// Return the size of `path` in bytes, or propagate the underlying I/O error.
@@ -691,6 +722,28 @@ fn createSyntheticPrimHistogram(
     try writer.flush();
 }
 
+/// Create a synthetic (empty but valid) `thread_traces.bin` file in `dir`.
+fn createSyntheticThreadTraces(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir, "thread_traces.bin" });
+    defer allocator.free(path);
+
+    const data = try allocator.alloc(u8, ThreadTraces.header_size);
+    defer allocator.free(data);
+    var fixed_writer = Io.Writer.fixed(data);
+    try ThreadTraces.serialize(allocator, &fixed_writer, &.{}, &.{}, &.{});
+
+    const f = try Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [65536]u8 = undefined;
+    var writer: Io.File.Writer = .init(f, io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.flush();
+}
+
 /// Run `validate` on `dir` with the given counts and capture stderr to a buffer.
 fn runValidate(
     allocator: std.mem.Allocator,
@@ -725,6 +778,7 @@ test "validate accepts consistent 2-node graph" {
     try createSyntheticClasses(allocator, io, tmp_path, &[_]SyntheticClass{});
     try createSyntheticFields(allocator, io, tmp_path, 0);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 1, 1, 1 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 1, 1 });
@@ -758,6 +812,7 @@ test "validate rejects unsorted catalog" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
@@ -786,6 +841,7 @@ test "validate rejects non-monotone offsets" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 1, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0 });
@@ -814,6 +870,7 @@ test "validate rejects adjacency ordinal exceeding virtual root" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 1 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 1 });
@@ -842,6 +899,7 @@ test "validate rejects catalog row count mismatch" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0 });
@@ -872,6 +930,7 @@ test "validate rejects classes.bin count mismatch" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 2);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
@@ -901,6 +960,7 @@ test "validate rejects roots.bin count mismatch" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0 });
@@ -931,6 +991,7 @@ test "validate rejects roots target ordinal exceeding virtual root" {
     });
     try createSyntheticFields(allocator, io, tmp_path, 1);
     try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
 
     try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0 });
     try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0 });

@@ -397,7 +397,7 @@ fn isVirtualThreadOrSubclass(ctx: Context, class_id: hprof.Id) bool {
     return false;
 }
 
-fn platformStateString(status: i32) []const u8 {
+pub fn platformStateString(status: i32) []const u8 {
     // JVMTI thread state bits, with a simple ordinal fallback.
     if (status & 0x0002 != 0) return "TERMINATED";
     if (status & 0x0004 != 0) return "RUNNABLE";
@@ -413,7 +413,7 @@ fn platformStateString(status: i32) []const u8 {
     return "unknown";
 }
 
-fn virtualStateString(state: i32) []const u8 {
+pub fn virtualStateString(state: i32) []const u8 {
     return switch (state) {
         0 => "NEW",
         1, 2, 3, 7 => "RUNNABLE",

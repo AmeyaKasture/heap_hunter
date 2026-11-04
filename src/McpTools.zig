@@ -12,6 +12,7 @@ const Commands = @import("Commands.zig");
 const Overview = @import("Overview.zig");
 const Manifest = @import("index/Manifest.zig");
 const IndexReader = @import("index/IndexReader.zig");
+const ThreadQuery = @import("index/ThreadQuery.zig");
 const Regex = @import("Regex.zig");
 const Progress = @import("Progress.zig");
 
@@ -175,6 +176,17 @@ pub const tool_definitions = .{
         },
     },
     .{
+        .name = "list_threads",
+        .description = "List threads with names, states, priorities, daemon flags, and stack traces decoded on demand from the dump.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+            },
+            .required = .{"index_dir"},
+        },
+    },
+    .{
         .name = "find_roots",
         .description = "Find the shortest path from an object to a GC root.",
         .inputSchema = .{
@@ -231,6 +243,8 @@ pub fn dispatch(
         return try refsFrom(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "refs_to")) {
         return try refsTo(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "list_threads")) {
+        return try listThreads(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "find_roots")) {
         return try findRoots(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "reference_tree")) {
@@ -539,6 +553,27 @@ fn loadOverviewData(allocator: std.mem.Allocator, io: Io, index_dir: []const u8)
     return try Overview.readCache(allocator, io, index_dir, &manifest.fingerprint);
 }
 
+fn listThreads(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    const index_dir = getRequiredString(arguments, "index_dir") orelse return Result{
+        .failure = .{
+            .message = "Missing required argument: index_dir",
+            .error_type = "InvalidArgument",
+        },
+    };
+
+    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    defer reader.deinit();
+
+    var threads = try ThreadQuery.build(allocator, &reader);
+    defer threads.deinit();
+
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+    try ThreadQuery.writeJson(&threads, &buf.writer);
+
+    return Result{ .success = try allocator.dupe(u8, buf.writer.buffer[0..buf.writer.end]) };
+}
+
 fn findObjects(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
     return try runQueryTool(allocator, io, arguments, "objects");
 }
@@ -769,8 +804,7 @@ test "dispatch analyze_heap_dump missing hprof_path returns failure" {
 test "dispatch analyze_heap_dump missing file returns failure" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        "{\"hprof_path\":\"/nonexistent/hunt/test/file.hprof\",\"index_dir\":\"/tmp/hunt-mcp-test-missing-file.idx\"}", .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"hprof_path\":\"/nonexistent/hunt/test/file.hprof\",\"index_dir\":\"/tmp/hunt-mcp-test-missing-file.idx\"}", .{});
     defer parsed.deinit();
     const result = try dispatch(allocator, std.testing.io, &config_load, "analyze_heap_dump", parsed.value, .{});
     defer result.deinit(allocator);

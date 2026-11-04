@@ -469,8 +469,7 @@ test "handleMessage initialize returns server info" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}");
     defer response.deinit();
 
     const root = response.value.object;
@@ -492,8 +491,7 @@ test "handleMessage tools/list returns all tools" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/list\"}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/list\"}");
     defer response.deinit();
 
     const root = response.value.object;
@@ -501,7 +499,7 @@ test "handleMessage tools/list returns all tools" {
     try std.testing.expectEqual(@as(i64, 42), root.get("id").?.integer);
 
     const tools = root.get("result").?.object.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 11), tools.items.len);
+    try std.testing.expectEqual(@as(usize, 12), tools.items.len);
 
     const expected_names = [_][]const u8{
         "analyze_heap_dump",
@@ -513,6 +511,7 @@ test "handleMessage tools/list returns all tools" {
         "get_object",
         "refs_from",
         "refs_to",
+        "list_threads",
         "find_roots",
         "reference_tree",
     };
@@ -525,8 +524,7 @@ test "handleMessage unknown method returns -32601" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"unknown/method\"}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"unknown/method\"}");
     defer response.deinit();
 
     const err = response.value.object.get("error").?.object;
@@ -538,8 +536,7 @@ test "handleMessage missing method returns -32600" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":8}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":8}");
     defer response.deinit();
 
     const err = response.value.object.get("error").?.object;
@@ -561,8 +558,7 @@ test "handleMessage tools/call missing arguments returns -32602" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"heap_info\"}}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"heap_info\"}}");
     defer response.deinit();
 
     const err = response.value.object.get("error").?.object;
@@ -573,8 +569,7 @@ test "handleMessage tools/call unknown tool returns isError true" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
     var server = Server.init(allocator, std.testing.io, &config_load);
-    const response = try callServer(allocator, &server,
-        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}");
+    const response = try callServer(allocator, &server, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}");
     defer response.deinit();
 
     const result = response.value.object.get("result").?.object;

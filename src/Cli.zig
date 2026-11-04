@@ -205,8 +205,7 @@ pub const commands = [_]Command{
     .{
         .name = "mcp",
         .description = "Run hunt as an MCP server over stdio.",
-        .long_description =
-            "Starts a Model Context Protocol (MCP) server that exposes hunt " ++
+        .long_description = "Starts a Model Context Protocol (MCP) server that exposes hunt " ++
             "commands as tools. The server communicates over stdin/stdout using " ++
             "newline-delimited JSON-RPC 2.0 messages. Progress notifications are " ++
             "sent for long-running operations such as analyze_heap_dump.",
@@ -220,13 +219,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Server shut down cleanly." },
             .{ .code = 1, .description = "Invalid argument or server error." },
         },
-        .see_also = &.{"index", "overview"},
+        .see_also = &.{ "index", "overview" },
     },
     .{
         .name = "index",
         .description = "Build a persistent heap-graph index from an HPROF dump.",
-        .long_description =
-            "Reads a Java HPROF heap dump and builds a persistent on-disk index " ++
+        .long_description = "Reads a Java HPROF heap dump and builds a persistent on-disk index " ++
             "consisting of a sorted object catalog, class metadata, field layouts, " ++
             "and a bidirectional reference graph. Once built, the index can be " ++
             "queried with objects, sample, object, refs-from, refs-to, roots, and tree. " ++
@@ -248,14 +246,13 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Index built or reused successfully." },
             .{ .code = 1, .description = "Invalid argument, missing file, or missing index directory." },
         },
-        .see_also = &.{"overview", "objects", "refs-from"},
+        .see_also = &.{ "overview", "objects", "refs-from" },
         .notes = "Large dumps may take several minutes. Progress is shown on stderr.",
     },
     .{
         .name = "overview",
         .description = "Build a cached overview file from an HPROF dump for fast summary queries.",
-        .long_description =
-            "Scans the HPROF dump once and builds a small binary overview cache " ++
+        .long_description = "Scans the HPROF dump once and builds a small binary overview cache " ++
             "(overview.bin) containing header information, a class histogram, and the " ++
             "loaded classes list. This cache is used by info, histogram, and classes.",
         .usage = "hunt overview <file.hprof> [options]",
@@ -273,13 +270,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Overview cache built successfully." },
             .{ .code = 1, .description = "Invalid argument, missing file, or cache already exists." },
         },
-        .see_also = &.{"index", "info", "histogram"},
+        .see_also = &.{ "index", "info", "histogram" },
     },
     .{
         .name = "info",
         .description = "Show HPROF header and a high-level summary of the dump.",
-        .long_description =
-            "Prints the HPROF header (id size and timestamp) and a high-level " ++
+        .long_description = "Prints the HPROF header (id size and timestamp) and a high-level " ++
             "summary including total objects, arrays, classes, classloaders, " ++
             "and total heap bytes. Requires the overview cache produced by overview.",
         .usage = "hunt info [file.hprof] [options]",
@@ -295,13 +291,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Summary printed successfully." },
             .{ .code = 1, .description = "Invalid argument or missing overview cache." },
         },
-        .see_also = &.{"overview", "histogram", "classes"},
+        .see_also = &.{ "overview", "histogram", "classes" },
     },
     .{
         .name = "histogram",
         .description = "Print a class-level histogram of instance counts and shallow heap.",
-        .long_description =
-            "Lists classes ordered by total shallow heap size. By default the output " ++
+        .long_description = "Lists classes ordered by total shallow heap size. By default the output " ++
             "is CSV; use --view for a human-readable table. Output can be filtered " ++
             "and sorted to focus on specific packages or large instance counts.",
         .usage = "hunt histogram [file.hprof] [options]",
@@ -325,13 +320,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Histogram printed successfully." },
             .{ .code = 1, .description = "Invalid argument, bad regex, or missing overview cache." },
         },
-        .see_also = &.{"classes", "objects", "info"},
+        .see_also = &.{ "classes", "objects", "info" },
     },
     .{
         .name = "classes",
         .description = "List loaded classes with names, superclasses, and instance sizes.",
-        .long_description =
-            "Lists loaded classes with their names, superclass names, and instance " ++
+        .long_description = "Lists loaded classes with their names, superclass names, and instance " ++
             "sizes. By default the output is CSV; use --view for a table. Regex " ++
             "filters can include or exclude packages.",
         .usage = "hunt classes [file.hprof] [options]",
@@ -353,36 +347,38 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Class list printed successfully." },
             .{ .code = 1, .description = "Invalid argument, bad regex, or missing overview cache." },
         },
-        .see_also = &.{"histogram", "objects"},
+        .see_also = &.{ "histogram", "objects" },
     },
-    // NOTE: threads command is disabled until thread details are persisted in the index.
-    // .{
-    //     .name = "threads",
-    //     .description = "List threads with IDs, names, and group information.",
-    //     .long_description =
-    //         "Lists threads discovered from the heap dump, including thread names, " ++
-    //         "states, priorities, daemon flags, and stack frames. Requires the " ++
-    //         "overview cache produced by overview.",
-    //     .usage = "hunt threads [file.hprof] [options]",
-    //     .options = &.{
-    //         .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
-    //         .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the overview cache. Overrides the derived/default index directory." },
-    //     },
-    //     .examples = &.{
-    //         "hunt threads heapdump.hprof",
-    //         "hunt threads --index-dir ./idx",
-    //     },
-    //     .exit_codes = &.{
-    //         .{ .code = 0, .description = "Thread list printed successfully." },
-    //         .{ .code = 1, .description = "Invalid argument or missing overview cache." },
-    //     },
-    //     .see_also = &.{"overview", "info"},
-    // },
+    .{
+        .name = "threads",
+        .description = "List threads with names, states, priorities, daemon flags, and stack traces.",
+        .long_description = "Lists threads discovered from the heap dump, including thread names, " ++
+            "states, priorities, daemon flags, OS thread ids, and full stack traces " ++
+            "reconstructed from the frame metadata stored in the index. Requires an " ++
+            "index built by 'hunt index' plus the original dump at its indexed path " ++
+            "(or overridden via --source): thread objects and names are decoded from " ++
+            "the dump on demand.",
+        .usage = "hunt threads [file.hprof] [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
+            .{ .flags = "--source", .argument = "<file>", .description = "Path to the original HPROF dump; overrides the path recorded in the index." },
+        },
+        .examples = &.{
+            "hunt threads heapdump.hprof",
+            "hunt threads --index-dir ./idx",
+            "hunt threads --index-dir ./idx --source ./moved/heapdump.hprof",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Thread list printed successfully." },
+            .{ .code = 1, .description = "Invalid argument, missing index, or inaccessible source dump." },
+        },
+        .see_also = &.{ "object", "overview" },
+    },
     .{
         .name = "objects",
         .description = "List object IDs whose class name matches a regex.",
-        .long_description =
-            "Queries the persistent index for objects whose class name matches the " ++
+        .long_description = "Queries the persistent index for objects whose class name matches the " ++
             "given regular expression and prints their raw object IDs as JSON. Use " ++
             "this to discover object IDs before decoding them with object or sample. " ++
             "Both Java dotted form (e.g. 'com\\.example\\.Foo') and JVM internal form " ++
@@ -405,13 +401,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Object list printed successfully." },
             .{ .code = 1, .description = "Invalid argument, bad regex, or missing index." },
         },
-        .see_also = &.{"sample", "object", "refs-from"},
+        .see_also = &.{ "sample", "object", "refs-from" },
     },
     .{
         .name = "sample",
         .description = "Decode sample objects whose class name matches a regex.",
-        .long_description =
-            "Queries the persistent index for objects whose class name matches the " ++
+        .long_description = "Queries the persistent index for objects whose class name matches the " ++
             "given regular expression and prints a decoded JSON view of each object, " ++
             "including primitive and reference field values. Both Java dotted form " ++
             "(e.g. 'com\\.example\\.Foo') and JVM internal form (e.g. 'com/example/Foo') " ++
@@ -433,13 +428,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Sample objects decoded successfully." },
             .{ .code = 1, .description = "Invalid argument, bad regex, or missing index." },
         },
-        .see_also = &.{"objects", "object"},
+        .see_also = &.{ "objects", "object" },
     },
     .{
         .name = "object",
         .description = "Decode a single object as JSON, including field values.",
-        .long_description =
-            "Looks up a single object by its raw ID and prints a JSON view of the " ++
+        .long_description = "Looks up a single object by its raw ID and prints a JSON view of the " ++
             "object, including class information and field values. Reference fields " ++
             "are shown as raw object IDs.",
         .usage = "hunt object [file.hprof] <id> [options]",
@@ -456,13 +450,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Object decoded successfully." },
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
-        .see_also = &.{"sample", "refs-from", "refs-to"},
+        .see_also = &.{ "sample", "refs-from", "refs-to" },
     },
     .{
         .name = "refs-from",
         .description = "List outgoing references from an object as JSON.",
-        .long_description =
-            "Prints the outgoing (field or array element) references from the object " ++
+        .long_description = "Prints the outgoing (field or array element) references from the object " ++
             "with the given raw ID. Use --limit and --offset to page through large " ++
             "reference lists.",
         .usage = "hunt refs-from [file.hprof] <id> [options]",
@@ -481,13 +474,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "References printed successfully." },
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
-        .see_also = &.{"refs-to", "object", "roots"},
+        .see_also = &.{ "refs-to", "object", "roots" },
     },
     .{
         .name = "refs-to",
         .description = "List incoming references to an object as JSON.",
-        .long_description =
-            "Prints the incoming references to the object with the given raw ID. " ++
+        .long_description = "Prints the incoming references to the object with the given raw ID. " ++
             "This is useful for understanding what keeps an object alive.",
         .usage = "hunt refs-to [file.hprof] <id> [options]",
         .options = &.{
@@ -505,13 +497,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "References printed successfully." },
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
-        .see_also = &.{"refs-from", "roots"},
+        .see_also = &.{ "refs-from", "roots" },
     },
     .{
         .name = "roots",
         .description = "Find the shortest path from an object to a GC root as JSON.",
-        .long_description =
-            "Performs a breadth-first search from the object to the nearest GC root " ++
+        .long_description = "Performs a breadth-first search from the object to the nearest GC root " ++
             "and prints the shortest path. Use --max-visited to limit the search " ++
             "space for very large heaps.",
         .usage = "hunt roots [file.hprof] <id> [options]",
@@ -530,13 +521,12 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Root path printed successfully, or no path found within limits." },
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
-        .see_also = &.{"refs-to", "tree"},
+        .see_also = &.{ "refs-to", "tree" },
     },
     .{
         .name = "tree",
         .description = "Perform a bounded tree expansion from an object as JSON.",
-        .long_description =
-            "Expands a tree starting from the given object, following outbound " ++
+        .long_description = "Expands a tree starting from the given object, following outbound " ++
             "references by default or inbound references with --direction to. " ++
             "The expansion is bounded by --depth and --max-nodes to keep the " ++
             "output manageable.",
@@ -558,7 +548,7 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Tree printed successfully." },
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
-        .see_also = &.{"refs-from", "roots"},
+        .see_also = &.{ "refs-from", "roots" },
     },
 };
 
@@ -588,8 +578,7 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
     try writeStyled(writer, Style.cyan, "hunt");
     try writer.writeAll(" {-v|--version}\n\n");
     try writeStyled(writer, Style.bold, "Overview commands:\n");
-    try printCommandGroup(writer, &.{
-        "overview", "info", "histogram", "classes" });
+    try printCommandGroup(writer, &.{ "overview", "info", "histogram", "classes" });
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Index commands:\n");
@@ -601,7 +590,7 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Query commands:\n");
-    try printCommandGroup(writer, &.{ "objects", "sample", "object", "refs-from", "refs-to", "roots", "tree" });
+    try printCommandGroup(writer, &.{ "objects", "sample", "object", "threads", "refs-from", "refs-to", "roots", "tree" });
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Global options:\n");

@@ -6,6 +6,7 @@ const hprof = @import("../hprof.zig");
 const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Progress = @import("../Progress.zig").Progress;
+const ThreadTraces = @import("ThreadTraces.zig");
 const log = @import("log");
 
 /// Fixed size of a catalog row on disk: 32 bytes, little-endian.
@@ -291,6 +292,8 @@ pub const Result = struct {
     roots_path: []const u8,
     /// Path to `prim_histogram.bin` in the staging directory.
     prim_histogram_path: []const u8,
+    /// Path to `thread_traces.bin` in the staging directory.
+    thread_traces_path: []const u8,
     /// In-memory class/name tables used by later stages.
     class_table: ClassTable,
     /// Total catalog rows written.
@@ -304,6 +307,7 @@ pub const Result = struct {
         allocator.free(self.catalog_path);
         allocator.free(self.roots_path);
         allocator.free(self.prim_histogram_path);
+        allocator.free(self.thread_traces_path);
         self.class_table.deinit();
     }
 };
@@ -327,6 +331,8 @@ pub fn run(
     errdefer allocator.free(roots_path);
     const prim_histogram_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "prim_histogram.bin" });
     errdefer allocator.free(prim_histogram_path);
+    const thread_traces_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "thread_traces.bin" });
+    errdefer allocator.free(thread_traces_path);
 
     const dir = Io.Dir.cwd();
     var catalog_file = try dir.createFile(io, catalog_path, .{});
@@ -349,6 +355,9 @@ pub fn run(
 
     var class_table = ClassTable.init(allocator);
     errdefer class_table.deinit();
+
+    var thread_traces = ThreadTraces.Collector.init(allocator);
+    defer thread_traces.deinit();
 
     var diagnostics: Manifest.Diagnostics = .{};
     var n_catalog_rows: u64 = 0;
@@ -378,6 +387,12 @@ pub fn run(
             .load_class => |lc| {
                 try class_table.addLoadClass(lc.serial, lc.class_id, lc.name_id);
             },
+            .frame => |frame| {
+                try thread_traces.addFrame(frame);
+            },
+            .trace => |trace| {
+                try thread_traces.addTrace(trace, job.header.id_size);
+            },
             // HPROF 1.0.2 uses either a single HEAP_DUMP or multiple HEAP_DUMP_SEGMENT records.
             .heap_dump => |heap_reader| {
                 var hr = heap_reader;
@@ -385,6 +400,7 @@ pub fn run(
                     job,
                     &hr,
                     &class_table,
+                    &thread_traces,
                     catalog_writer,
                     roots_writer,
                     &n_catalog_rows,
@@ -399,6 +415,7 @@ pub fn run(
                     job,
                     &hr,
                     &class_table,
+                    &thread_traces,
                     catalog_writer,
                     roots_writer,
                     &n_catalog_rows,
@@ -428,17 +445,160 @@ pub fn run(
     }
     try prim_histogram_file_writer.flush();
 
-    log.debug("scanner complete: n_catalog_rows={d}, n_roots={d}, diagnostics={any}", .{ n_catalog_rows, n_roots, diagnostics });
+    try writeThreadTraces(allocator, io, &class_table, &thread_traces, thread_traces_path);
+
+    log.debug(
+        "scanner complete: n_catalog_rows={d}, n_roots={d}, n_followup_frames={d}, n_traces={d}, n_thread_roots={d}, diagnostics={any}",
+        .{
+            n_catalog_rows,
+            n_roots,
+            thread_traces.frames.count(),
+            thread_traces.traces.count(),
+            thread_traces.thread_roots.count(),
+            diagnostics,
+        },
+    );
 
     return .{
         .catalog_path = catalog_path,
         .roots_path = roots_path,
         .prim_histogram_path = prim_histogram_path,
+        .thread_traces_path = thread_traces_path,
         .class_table = class_table,
         .n_catalog_rows = n_catalog_rows,
         .n_roots = n_roots,
         .diagnostics = diagnostics,
     };
+}
+
+/// Resolve the captured FRAME/TRACE/thread-root metadata against the fully
+/// populated class table and write `thread_traces.bin` into the staging dir.
+///
+/// This runs once after the heap walk so frame class serials can be resolved
+/// even for LOAD_CLASS records that appear after the heap dump records.
+fn writeThreadTraces(
+    allocator: std.mem.Allocator,
+    io: Io,
+    class_table: *const ClassTable,
+    collector: *ThreadTraces.Collector,
+    path: []const u8,
+) !void {
+    const dir = Io.Dir.cwd();
+    var file = try dir.createFile(io, path, .{});
+    defer file.close(io);
+    var write_buf: [65536]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(file, io, &write_buf);
+    const writer = &file_writer.interface;
+
+    var resolved_frames = std.ArrayList(ThreadTraces.ResolvedFrame).empty;
+    errdefer {
+        for (resolved_frames.items) |frame| {
+            allocator.free(frame.class_name);
+        }
+        resolved_frames.deinit(allocator);
+    }
+    var frame_index = std.AutoHashMap(hprof.Id, u32).init(allocator);
+    defer frame_index.deinit();
+
+    // Frames sorted by raw id for deterministic output.
+    var frame_ids = std.ArrayList(hprof.Id).empty;
+    defer frame_ids.deinit(allocator);
+    var fit = collector.frames.iterator();
+    while (fit.next()) |entry| {
+        try frame_ids.append(allocator, entry.key_ptr.*);
+    }
+    std.mem.sort(hprof.Id, frame_ids.items, {}, std.sort.asc(hprof.Id));
+
+    for (frame_ids.items, 0..) |frame_id, ordinal| {
+        try frame_index.put(frame_id, @intCast(ordinal));
+        const frame = collector.frames.get(frame_id).?;
+        const class_name = try resolveFrameClassName(allocator, class_table, frame.class_serial);
+        const method_name = class_table.utf8.get(frame.method_name_id) orelse "<?>";
+        const source_name = class_table.utf8.get(frame.source_file_name_id) orelse "<?>";
+        try resolved_frames.append(allocator, .{
+            .frame_id = frame_id,
+            .class_name = class_name,
+            .method_name = method_name,
+            .source_name = source_name,
+            .line_number = frame.line_number,
+        });
+    }
+
+    // Traces sorted by serial, with frame ids resolved to frame-table indices
+    // (missing frames become the sentinel index).
+    var traces = std.ArrayList(ThreadTraces.TraceOut).empty;
+    defer {
+        for (traces.items) |trace| allocator.free(trace.frame_indices);
+        traces.deinit(allocator);
+    }
+    var trace_serials = std.ArrayList(u32).empty;
+    defer trace_serials.deinit(allocator);
+    var tit = collector.traces.iterator();
+    while (tit.next()) |entry| {
+        try trace_serials.append(allocator, entry.key_ptr.*);
+    }
+    std.mem.sort(u32, trace_serials.items, {}, std.sort.asc(u32));
+
+    for (trace_serials.items) |serial| {
+        const raw = collector.traces.get(serial).?;
+        const indices = try allocator.alloc(u32, raw.frame_ids.len);
+        errdefer allocator.free(indices);
+        for (raw.frame_ids, 0..) |fid, i| {
+            indices[i] = frame_index.get(fid) orelse ThreadTraces.missing_frame_index;
+        }
+        try traces.append(allocator, .{
+            .serial = serial,
+            .thread_serial = raw.thread_serial,
+            .frame_indices = indices,
+        });
+    }
+
+    // Thread roots sorted by object id for deterministic output.
+    var thread_roots = std.ArrayList(ThreadTraces.ThreadRoot).empty;
+    defer thread_roots.deinit(allocator);
+    var rit = collector.thread_roots.iterator();
+    while (rit.next()) |entry| {
+        try thread_roots.append(allocator, entry.value_ptr.*);
+    }
+    std.mem.sort(ThreadTraces.ThreadRoot, thread_roots.items, {}, struct {
+        fn less(_: void, a: ThreadTraces.ThreadRoot, b: ThreadTraces.ThreadRoot) bool {
+            return a.thread_object_id < b.thread_object_id;
+        }
+    }.less);
+
+    try ThreadTraces.serialize(allocator, writer, resolved_frames.items, traces.items, thread_roots.items);
+    try file_writer.flush();
+
+    // Free the resolved class names (method/source are borrowed utf8 values).
+    for (resolved_frames.items) |frame| {
+        allocator.free(frame.class_name);
+    }
+    resolved_frames.deinit(allocator);
+}
+
+/// Resolve the dotted class name for a frame's `class_serial`, mirroring
+/// `Threads.formatFrameClassName`. Returns an owned copy.
+fn resolveFrameClassName(
+    allocator: std.mem.Allocator,
+    class_table: *const ClassTable,
+    class_serial: u32,
+) ![]const u8 {
+    const load = class_table.loaded.get(class_serial) orelse {
+        return try replaceSlashes(allocator, "<?>");
+    };
+    const name_id = class_table.class_names.get(load.class_id) orelse {
+        return try replaceSlashes(allocator, "<?>");
+    };
+    const raw = class_table.utf8.get(name_id) orelse "<?>";
+    return try replaceSlashes(allocator, raw);
+}
+
+fn replaceSlashes(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var result = try allocator.dupe(u8, s);
+    for (result, 0..) |c, i| {
+        if (c == '/') result[i] = '.';
+    }
+    return result;
 }
 
 fn writeU32(writer: *Io.Writer, value: u32) !void {
@@ -453,6 +613,7 @@ fn scanHeapDump(
     job: *const Preflight.Job,
     hr: *hprof.HeapDumpReader,
     class_table: *ClassTable,
+    thread_traces: *ThreadTraces.Collector,
     catalog_writer: *Io.Writer,
     roots_writer: *Io.Writer,
     n_catalog_rows: *u64,
@@ -532,6 +693,18 @@ fn scanHeapDump(
                     prim_histogram[ty_int].count += 1;
                     prim_histogram[ty_int].bytes += size;
                 }
+            },
+            // Thread object roots carry the stack-trace serial needed to map a
+            // thread instance to its recorded stack trace; capture it before
+            // falling through to the generic root handling.
+            .gc_root_thread_object => |r| {
+                try thread_traces.addThreadRoot(r.thread_object_id, r.thread_serial, r.stack_trace_serial);
+                try writeRootRecord(roots_writer, .{
+                    .target_raw_id = r.thread_object_id,
+                    .root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object),
+                    .thread_serial = r.thread_serial,
+                });
+                n_roots.* += 1;
             },
             // Any remaining subtag is one of the nine GC root kinds.
             else => |root| {
