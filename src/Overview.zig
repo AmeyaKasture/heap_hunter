@@ -197,8 +197,13 @@ pub fn buildFromIndex(
     };
     defer allocator.free(prim_data);
 
+    // Ownership transfers to the returned OverviewData; deinit frees
+    // both the slice and each entry name.
     const prim_histogram = try parsePrimHistogram(allocator, prim_data);
-    defer allocator.free(prim_histogram);
+    errdefer {
+        for (prim_histogram) |entry| allocator.free(entry.name);
+        allocator.free(prim_histogram);
+    }
 
     const HistValue = struct {
         count: u64,
