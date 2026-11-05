@@ -845,6 +845,17 @@ test "dispatch heap_classes missing index_dir returns failure" {
     try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
 }
 
+test "dispatch list_threads missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "list_threads", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
 fn mapError(err: anyerror, context: []const u8) Result {
     return Result{
         .failure = .{

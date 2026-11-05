@@ -226,8 +226,9 @@ pub const commands = [_]Command{
         .description = "Build a persistent heap-graph index from an HPROF dump.",
         .long_description = "Reads a Java HPROF heap dump and builds a persistent on-disk index " ++
             "consisting of a sorted object catalog, class metadata, field layouts, " ++
-            "and a bidirectional reference graph. Once built, the index can be " ++
-            "queried with objects, sample, object, refs-from, refs-to, roots, and tree. " ++
+            "thread stack-trace metadata, and a bidirectional reference graph. Once built, " ++
+            "the index can be queried with objects, sample, object, threads, refs-from, " ++
+            "refs-to, roots, and tree. " ++
             "If an up-to-date index already exists for the same dump, the command " ++
             "reports reuse instead of rebuilding.",
         .usage = "hunt index <file.hprof> [options]",
@@ -373,7 +374,7 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Thread list printed successfully." },
             .{ .code = 1, .description = "Invalid argument, missing index, or inaccessible source dump." },
         },
-        .see_also = &.{ "object", "overview" },
+        .see_also = &.{ "index", "info", "object" },
     },
     .{
         .name = "objects",

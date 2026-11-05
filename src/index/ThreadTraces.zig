@@ -17,7 +17,7 @@
 //! File layout (all little-endian):
 //!
 //!   header (24 bytes):
-//!     magic:    4 bytes "HTHR"
+//!     magic:    4 bytes "HTRC"
 //!     version:  u16
 //!     reserved: u16 (zero)
 //!     n_strings:      u32
@@ -77,8 +77,8 @@ pub const FrameEntry = struct {
     line_number: i32,
 };
 
-/// One `STACK_TRACE` record as stored in the file. `frame_indices` is a
-/// borrowed slice into the parsed data buffer.
+/// One `STACK_TRACE` record as stored in the file. `frame_indices` is an
+/// owned slice freed by `Parsed.deinit`.
 pub const TraceEntry = struct {
     serial: u32,
     thread_serial: u32,
@@ -345,6 +345,15 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, raw: []const u8) Error!Parsed {
     const n_traces = std.mem.readInt(u32, raw[16..20], .little);
     const n_thread_roots = std.mem.readInt(u32, raw[20..24], .little);
 
+    // Pre-validate counts against the available buffer so a corrupted header
+    // cannot drive a multi-gigabyte allocation.
+    if (raw.len < header_size) return invalid; // already checked, but keep
+    const avail_after_header = raw.len - header_size;
+    if (n_strings > avail_after_header / 4) return invalid;
+    if (n_frames > avail_after_header / frame_record_size) return invalid;
+    if (n_traces > avail_after_header / 12) return invalid;
+    if (n_thread_roots > avail_after_header / thread_root_record_size) return invalid;
+
     const data = try allocator.dupe(u8, raw);
     errdefer allocator.free(data);
 
@@ -354,17 +363,17 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, raw: []const u8) Error!Parsed {
     var n_strings_read: usize = 0;
     errdefer allocator.free(strings);
     for (0..n_strings) |i| {
-        if (offset + 4 > data.len) return invalid;
+        if (data.len - offset < 4) return invalid;
         const len = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
-        if (offset + len > data.len) return invalid;
+        if (data.len - offset < len) return invalid;
         strings[i] = data[offset..][0..len];
         offset += len;
         n_strings_read = i + 1;
     }
 
     // Frames.
-    if (offset + n_frames * frame_record_size > data.len) return invalid;
+    if (n_frames > (data.len - offset) / frame_record_size) return invalid;
     const frames = try allocator.alloc(FrameEntry, n_frames);
     var n_frames_read: usize = 0;
     errdefer allocator.free(frames);
@@ -398,12 +407,12 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, raw: []const u8) Error!Parsed {
         allocator.free(traces);
     }
     for (0..n_traces) |i| {
-        if (offset + 12 > data.len) return invalid;
+        if (data.len - offset < 12) return invalid;
         const serial = std.mem.readInt(u32, data[offset..][0..4], .little);
         const thread_serial = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
         const frame_count = std.mem.readInt(u32, data[offset + 8 ..][0..4], .little);
         offset += 12;
-        if (offset + frame_count * 4 > data.len) return invalid;
+        if (frame_count > (data.len - offset) / 4) return invalid;
         const indices = try allocator.alloc(u32, frame_count);
         errdefer allocator.free(indices);
         for (0..frame_count) |j| {
@@ -421,7 +430,7 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, raw: []const u8) Error!Parsed {
     }
 
     // Thread roots.
-    if (offset + n_thread_roots * thread_root_record_size > data.len) return invalid;
+    if (n_thread_roots > (data.len - offset) / thread_root_record_size) return invalid;
     const thread_roots = try allocator.alloc(ThreadRoot, n_thread_roots);
     var n_roots_read: usize = 0;
     errdefer allocator.free(thread_roots);
@@ -441,6 +450,7 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, raw: []const u8) Error!Parsed {
     }
 
     // Lookup indices.
+    if (offset != data.len) return invalid;
     var trace_by_serial = std.AutoHashMap(u32, usize).init(allocator);
     errdefer trace_by_serial.deinit();
     for (traces, 0..) |trace, i| {

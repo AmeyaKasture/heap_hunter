@@ -509,10 +509,15 @@ fn writeThreadTraces(
     }
     std.mem.sort(hprof.Id, frame_ids.items, {}, std.sort.asc(hprof.Id));
 
+    if (frame_ids.items.len >= ThreadTraces.missing_frame_index) {
+        return error.TooManyFrames;
+    }
+
     for (frame_ids.items, 0..) |frame_id, ordinal| {
         try frame_index.put(frame_id, @intCast(ordinal));
         const frame = collector.frames.get(frame_id).?;
         const class_name = try resolveFrameClassName(allocator, class_table, frame.class_serial);
+        errdefer allocator.free(class_name);
         const method_name = class_table.utf8.get(frame.method_name_id) orelse "<?>";
         const source_name = class_table.utf8.get(frame.source_file_name_id) orelse "<?>";
         try resolved_frames.append(allocator, .{

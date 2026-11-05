@@ -68,10 +68,16 @@ pub fn build(allocator: std.mem.Allocator, reader: *const IndexReader.Reader) !T
 
     const thread_object_root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object);
 
+    var seen_ordinals = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_ordinals.deinit();
+
     var i: u32 = 0;
     while (i < reader.rootCount()) : (i += 1) {
         const root = reader.rootRecordAt(i);
         if (root.root_kind != thread_object_root_kind) continue;
+
+        const gop = try seen_ordinals.getOrPut(root.target_ordinal);
+        if (gop.found_existing) continue;
 
         const raw_id = reader.rawIdForOrdinal(root.target_ordinal) orelse continue;
 
@@ -79,7 +85,7 @@ pub fn build(allocator: std.mem.Allocator, reader: *const IndexReader.Reader) !T
         const thread_serial = if (tt_root) |r| r.thread_serial else root.thread_serial;
 
         var view = reader.decodeObject(root.target_ordinal) catch |err| switch (err) {
-            error.InvalidSourceOffset, error.SourceNotAvailable, error.ObjectNotFound => continue,
+            error.InvalidSourceOffset, error.ObjectNotFound => continue,
             else => return err,
         };
         defer view.deinit(allocator);
@@ -219,7 +225,15 @@ fn buildFrames(
     errdefer frames.deinit(allocator);
 
     for (trace.frame_indices) |frame_idx| {
-        if (frame_idx == ThreadTraces.missing_frame_index) continue;
+        if (frame_idx == ThreadTraces.missing_frame_index) {
+            try frames.append(allocator, .{
+                .class_name = "<unknown>",
+                .method = "<unknown>",
+                .source = "<?>",
+                .line_number = -1,
+            });
+            continue;
+        }
         const frame = reader.frameAt(frame_idx);
         try frames.append(allocator, .{
             .class_name = frame.class_name,

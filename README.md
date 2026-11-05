@@ -324,9 +324,10 @@ Query the histogram:
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"heap_histogram","arguments":{"index_dir":"index/heap.idx","limit":10}}}
 ```
 
-Tool results are returned as `text` content blocks containing the same JSON
-the corresponding CLI command emits. Failures are reported with
-`isError: true` and a JSON error payload inside the content block.
+Tool results are returned as `text` content blocks containing JSON (matching
+the corresponding CLI command's JSON output, or structured JSON equivalents for
+summary and thread tools). Failures are reported with `isError: true` and a
+JSON error payload inside the content block.
 
 ## Commands
 
