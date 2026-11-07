@@ -1,4 +1,4 @@
-//! Shared index types used by Analysis and Threads.
+//! Shared index types used by Analysis.
 const hprof = @import("hprof.zig");
 
 pub const ClassInfo = struct {

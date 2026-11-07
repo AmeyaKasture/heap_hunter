@@ -582,7 +582,7 @@ fn writeThreadTraces(
 }
 
 /// Resolve the dotted class name for a frame's `class_serial`, mirroring
-/// `Threads.formatFrameClassName`. Returns an owned copy.
+/// Resolve the dotted class name for a frame class serial. Returns an owned copy.
 fn resolveFrameClassName(
     allocator: std.mem.Allocator,
     class_table: *const ClassTable,

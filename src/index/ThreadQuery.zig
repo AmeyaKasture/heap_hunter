@@ -14,7 +14,6 @@ const Io = std.Io;
 const hprof = @import("../hprof.zig");
 const IndexReader = @import("IndexReader.zig");
 const ThreadTraces = @import("ThreadTraces.zig");
-const Threads = @import("../Threads.zig");
 
 /// One decoded stack frame. Strings are borrowed from the reader.
 pub const FrameView = struct {
@@ -127,13 +126,13 @@ pub fn build(allocator: std.mem.Allocator, reader: *const IndexReader.Reader) !T
                 priority = holder.priority;
                 daemon = holder.daemon;
                 if (holder.thread_status >= 0) {
-                    state = Threads.platformStateString(holder.thread_status);
+                    state = platformStateString(holder.thread_status);
                 }
             }
         }
 
         if (is_virtual and virtual_state >= 0) {
-            state = Threads.virtualStateString(virtual_state);
+            state = virtualStateString(virtual_state);
         }
 
         // Stack frames from the indexed trace metadata.
@@ -260,6 +259,32 @@ fn decodeStringText(allocator: std.mem.Allocator, reader: *const IndexReader.Rea
         return allocator.dupe(u8, s);
     }
     return allocator.dupe(u8, fallback);
+}
+
+fn platformStateString(status: i32) []const u8 {
+    if (status & 0x0002 != 0) return "TERMINATED";
+    if (status & 0x0004 != 0) return "RUNNABLE";
+    if (status & 0x0400 != 0) return "BLOCKED";
+    if (status & 0x0010 != 0) return "WAITING";
+    if (status & 0x0020 != 0) return "TIMED_WAITING";
+    if (status & 0x0001 != 0) return "RUNNABLE";
+    if (status == 0) return "NEW";
+    if (status >= 0 and status <= 5) {
+        const states = [_][]const u8{ "NEW", "RUNNABLE", "BLOCKED", "WAITING", "TIMED_WAITING", "TERMINATED" };
+        return states[@intCast(status)];
+    }
+    return "unknown";
+}
+
+fn virtualStateString(state: i32) []const u8 {
+    return switch (state) {
+        0 => "NEW",
+        1, 2, 3, 7 => "RUNNABLE",
+        4, 5 => "WAITING",
+        6 => "BLOCKED",
+        8 => "TERMINATED",
+        else => "unknown",
+    };
 }
 
 fn isVirtualThreadOrSubclass(reader: *const IndexReader.Reader, class_id: hprof.Id) bool {
