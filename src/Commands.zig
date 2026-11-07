@@ -226,7 +226,7 @@ pub fn runIndexCommand(
             log.debug("stage: validate complete", .{});
 
             var manifest = Manifest.IndexManifest{
-                .format_version = 1,
+                .format_version = 2,
                 .fingerprint = try job.fingerprint.clone(allocator),
                 .n_objects = n_objects,
                 .n_edges = n_edges,

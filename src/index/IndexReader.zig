@@ -243,7 +243,7 @@ pub const Reader = struct {
         var manifest_moved = false;
         errdefer if (!manifest_moved) manifest.deinit(allocator);
 
-        if (manifest.format_version != 1) {
+        if (manifest.format_version != 2) {
             return error.InvalidManifest;
         }
 
