@@ -23,6 +23,6 @@ fn loadIndex(allocator: std.mem.Allocator, relative_path: []const u8) !Analysis.
 
 test "buildIndex finds heap-derived threads in real Java 21 dump" {
     const allocator = std.heap.page_allocator;
-    var index = try loadIndex(allocator, "test_hprofs/heapforge.hprof");
+    var index = try loadIndex(allocator, "fixtures/heapforge.hprof");
     defer index.deinit();
 }

@@ -881,7 +881,7 @@ test "index command reuses existing index on fixture" {
     const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_path_z);
 
-    const source_path = "test_hprofs/heapforge.hprof";
+    const source_path = "fixtures/heapforge.hprof";
 
     const index_dir_tmp = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "index" });
     defer allocator.free(index_dir_tmp);

@@ -32,5 +32,9 @@ hunt-output/
 index-*/
 
 # HPROF test dumps (large, not for version control)
-test_hprofs/
+# Ignore all HPROF files except the committed fixtures used by the test suite.
 *.hprof
+!fixtures/*.hprof
+
+# Scratch directory for local HPROF experiments and generated PR docs.
+test_hprofs/
