@@ -35,6 +35,7 @@ pub const final_files = &[_][]const u8{
     "in_sources.bin",
     "roots.bin",
     "prim_histogram.bin",
+    "thread_traces.bin",
 };
 
 /// Result of Stage 8 publication. Holds the total byte size of the published
@@ -269,7 +270,7 @@ test "publish computes total index bytes" {
     defer allocator.free(index_dir);
     try Io.Dir.cwd().createDirPath(io, index_dir);
 
-    // Write 4 bytes to each file: total should be 8 files * 4 = 32 bytes.
+    // Write 4 bytes to each file: total should be file count * 4 bytes.
     for (final_files) |name| {
         try createSyntheticFile(allocator, io, staging_dir, name, "abcd");
     }

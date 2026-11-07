@@ -55,8 +55,8 @@ the size of the source dump.
   configurable memory budget.
 - **Fingerprint verification** that refuses to query an index built from
   a different dump.
-- **Cached overview** for sub-second histogram, classes, info, and
-  thread queries.
+- **Cached overview** for sub-second histogram, classes, and info
+  queries.
 
 ### Summary queries
 
@@ -65,9 +65,6 @@ the size of the source dump.
 - **Class histogram** (`histogram`): aggregate instances and shallow
   bytes per class, with regex match, exclude, and minimum-size filters.
 - **Loaded classes** (`classes`): class name, superclass, instance size.
-- **Thread summary** (`threads`, in the overview cache): name, state,
-  priority, daemon flag, OS thread id, and Java thread id, plus a
-  per-thread stack trace reconstructed from HPROF `STACK_TRACE` records.
 
 ### Object queries
 
@@ -94,18 +91,25 @@ the size of the source dump.
 - **Bounded subtree expansion** (`tree`): depth- and node-limited tree
   walk in either direction, with cycle suppression.
 
-### Stack traces
+### Threads and stack traces
 
-HPROF `STACK_TRACE` records are captured during indexing and surfaced
-through the overview cache. Each thread entry in the overview output
-includes:
+Thread metadata is captured during indexing and decoded on demand. The
+index stores only tiny stack-trace structures (HPROF `FRAME` /
+`STACK_TRACE` records and per-thread root mappings) in
+`thread_traces.bin`; the `threads` command and the MCP `list_threads`
+tool then decode the live `java.lang.Thread`, `Thread$FieldHolder`, and
+name-`String` objects straight from the source dump. Each thread
+listing includes:
 
-- Thread name, daemon flag, OS and JVM thread ids, and priority.
+- Thread name, daemon flag, OS thread id (TID), priority, and state
+  (both platform and virtual-thread states).
 - Reconstructed Java stack frames: class name, method name, source
-  file, and line number.
+  file, and line number, with `--source` falling back to the dump
+  recorded in the index manifest.
 
-This makes it straightforward to identify which threads were active at
-the time the dump was taken and what call sites they were executing.
+This keeps the index small while still making it straightforward to
+identify which threads were active at the time the dump was taken and
+what call sites they were executing.
 
 ### Output and automation
 
@@ -246,6 +250,7 @@ hunt objects 'com.example.*' --index-dir ./idx --limit 5
 hunt object 0x3000     --index-dir ./idx
 hunt sample 'java.util.HashMap\$Node' --index-dir ./idx --limit 3
 hunt roots 0x3000      --index-dir ./idx
+hunt threads           --index-dir ./idx --source path/to/heap.hprof
 ```
 
 ## MCP server
@@ -279,6 +284,7 @@ The config file's `index-dir` is used as the default base directory when
 | `get_object` | Full decode of a single object, including typed field values, decoded `java.lang.String` text, and `char[]` / `byte[]` previews. |
 | `refs_from` | Outgoing references of an object. |
 | `refs_to` | Incoming references of an object. |
+| `list_threads` | Threads with names, states, priorities, daemon flags, and stack traces decoded on demand from the dump. |
 | `find_roots` | Shortest path from an object to a GC root. |
 | `reference_tree` | Bounded reference tree expansion from an object. |
 
@@ -318,9 +324,10 @@ Query the histogram:
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"heap_histogram","arguments":{"index_dir":"index/heap.idx","limit":10}}}
 ```
 
-Tool results are returned as `text` content blocks containing the same JSON
-the corresponding CLI command emits. Failures are reported with
-`isError: true` and a JSON error payload inside the content block.
+Tool results are returned as `text` content blocks containing JSON (matching
+the corresponding CLI command's JSON output, or structured JSON equivalents for
+summary and thread tools). Failures are reported with `isError: true` and a
+JSON error payload inside the content block.
 
 ## Commands
 
@@ -338,6 +345,12 @@ the corresponding CLI command emits. Failures are reported with
 | `info --index-dir <dir>` | Header and high-level summary. |
 | `histogram --index-dir <dir>` | Class histogram by instance count or shallow bytes. |
 | `classes --index-dir <dir>` | Loaded classes with names, superclasses, and instance sizes. |
+
+### Thread queries (require `index` + source dump)
+
+| Command | Description |
+|---------|-------------|
+| `threads --index-dir <dir>` | List live threads with names, states, priorities, daemon flags, TIDs, and stack traces. Requires access to the original HPROF (pass `--source` if it moved). |
 
 ### Object queries (require `index`)
 
@@ -485,20 +498,38 @@ java.lang.String,892103,178420600
 }
 ```
 
-### `hunt threads` (excerpt, includes stack traces)
+### `hunt threads` (plain text, excerpt)
+
+```
+Thread: pool-worker-1
+  State:    RUNNABLE
+  Priority: 5
+  Daemon:   false
+  TID:      42
+  Stack trace:
+    at java.net.SocketInputStream.read(SocketInputStream.java:204)
+    at java.net.Socket$SocketInputStream.read(Socket.java:956)
+    at com.example.worker.Worker.process(Worker.java:88)
+```
+
+### MCP `list_threads` (JSON, excerpt)
 
 ```json
 {
-  "name": "pool-1-thread-3",
-  "state": "RUNNABLE",
-  "priority": 5,
-  "daemon": true,
-  "tid": 17,
-  "virtual": false,
-  "stack_frames": [
-    { "class_name": "java.net.SocketInputStream",  "method": "read",      "source": "SocketInputStream.java", "line_number": 204 },
-    { "class_name": "java.net.SocketInputStream",  "method": "read0",     "source": "SocketInputStream.java", "line_number": 145 },
-    { "class_name": "com.example.worker.Worker",   "method": "process",   "source": "Worker.java",           "line_number": 88  }
+  "threads": [
+    {
+      "id": "0x2100",
+      "thread_serial": 1,
+      "name": "pool-worker-1",
+      "state": "RUNNABLE",
+      "priority": 5,
+      "daemon": false,
+      "tid": 42,
+      "virtual": false,
+      "stack_frames": [
+        { "class_name": "java.net.SocketInputStream", "method": "read", "source": "SocketInputStream.java", "line_number": 204 }
+      ]
+    }
   ]
 }
 ```
@@ -556,6 +587,9 @@ Typical measurements on a single modern core:
   milliseconds (served from the overview cache).
 - `roots` and `tree` queries run as BFS over the CSR graph; latency
   scales with the visit budget, not the heap size.
+- `threads` decodes only the live `Thread`, holder, and name-`String`
+  objects on demand, so it depends on access to the source dump rather
+  than the index size.
 
 ## Testing
 
@@ -586,7 +620,7 @@ src/
   Config.zig            User configuration
   Progress.zig          TTY progress bar and progress callbacks
   Analysis.zig          Single-pass indexer and overview commands
-  Overview.zig          Overview cache (histogram, classes, threads, stack traces)
+  Overview.zig          Overview cache (histogram, classes, info)
   Mcp.zig               MCP JSON-RPC 2.0 server over stdio
   McpTools.zig          MCP tool definitions and dispatch
   hprof/                HPROF binary format parser
@@ -608,6 +642,8 @@ src/
     Validate.zig        Post-build validation
     Manifest.zig        Index manifest and fingerprinting
     IndexReader.zig     Query-side reader
+    ThreadTraces.zig    Thread stack-trace metadata (`thread_traces.bin`)
+    ThreadQuery.zig     On-demand thread/stack-trace query over the index
   tests/                Synthetic HPROF builder and integration tests
     HprofBuilder.zig
     integration.zig

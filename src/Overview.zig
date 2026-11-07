@@ -6,6 +6,7 @@ const Regex = @import("Regex.zig");
 const Analysis = @import("Analysis.zig");
 const Manifest = @import("index/Manifest.zig");
 const Scanner = @import("index/Scanner.zig");
+const Csr = @import("index/Csr.zig");
 const log = @import("log");
 
 pub const HistogramOptions = struct {
@@ -48,23 +49,6 @@ pub const ClassEntry = struct {
     instance_size: u64,
 };
 
-pub const FrameEntry = struct {
-    class_name: []const u8,
-    method: []const u8,
-    source: []const u8,
-    line_number: i32,
-};
-
-pub const ThreadEntry = struct {
-    name: []const u8,
-    state: []const u8,
-    priority: i32,
-    daemon: bool,
-    tid: i64,
-    virtual: bool,
-    stack_frames: []const FrameEntry,
-};
-
 pub const Summary = struct {
     id_size: u32,
     timestamp: u64,
@@ -82,7 +66,6 @@ pub const OverviewData = struct {
     histogram: []const HistogramEntry,
     primitive_histogram: []const HistogramEntry,
     classes: []const ClassEntry,
-    threads: []const ThreadEntry,
 
     pub fn deinit(self: *OverviewData) void {
         for (self.histogram) |entry| {
@@ -100,18 +83,6 @@ pub const OverviewData = struct {
             self.allocator.free(entry.superclass);
         }
         self.allocator.free(self.classes);
-
-        for (self.threads) |entry| {
-            self.allocator.free(entry.name);
-            self.allocator.free(entry.state);
-            for (entry.stack_frames) |frame| {
-                self.allocator.free(frame.class_name);
-                self.allocator.free(frame.method);
-                self.allocator.free(frame.source);
-            }
-            self.allocator.free(entry.stack_frames);
-        }
-        self.allocator.free(self.threads);
     }
 };
 
@@ -131,8 +102,9 @@ pub const IndexBuildError = error{
 ///
 /// This is the fast, large-dump-safe path: `catalog.bin` is memory-mapped and
 /// scanned once, `classes.bin` and `prim_histogram.bin` are small files, and
-/// no source HPROF record decoding is performed. Thread details are not
-/// currently stored in the index, so `threads` is left empty.
+/// no source HPROF record decoding is performed. Thread details are served by
+/// the on-demand `threads` query instead; the overview only records the
+/// thread count, derived from `gc_root_thread_object` entries in `roots.bin`.
 pub fn buildFromIndex(
     allocator: std.mem.Allocator,
     io: Io,
@@ -197,8 +169,13 @@ pub fn buildFromIndex(
     };
     defer allocator.free(prim_data);
 
+    // Ownership transfers to the returned OverviewData; deinit frees
+    // both the slice and each entry name.
     const prim_histogram = try parsePrimHistogram(allocator, prim_data);
-    defer allocator.free(prim_histogram);
+    errdefer {
+        for (prim_histogram) |entry| allocator.free(entry.name);
+        allocator.free(prim_histogram);
+    }
 
     const HistValue = struct {
         count: u64,
@@ -288,6 +265,32 @@ pub fn buildFromIndex(
 
     const classloader_count = try computeClassloaderCount(allocator, class_table, catalog_data);
 
+    // Thread count comes from the GC roots: one `gc_root_thread_object`
+    // record per live thread object in the dump.
+    const roots_path = try std.fs.path.join(allocator, &.{ index_dir, "roots.bin" });
+    defer allocator.free(roots_path);
+    const roots_data = dir.readFileAlloc(io, roots_path, allocator, .unlimited) catch {
+        log.err("failed to read roots.bin", .{});
+        return error.MissingIndexFile;
+    };
+    defer allocator.free(roots_data);
+    if (roots_data.len % Csr.roots_bin_record_size != 0) {
+        log.err("roots.bin size is not a multiple of record size", .{});
+        return error.CorruptIndexFile;
+    }
+    var thread_count: u32 = 0;
+    var seen_ordinals = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_ordinals.deinit();
+    const thread_object_root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object);
+    var roots_i: usize = 0;
+    while (roots_i < roots_data.len) : (roots_i += Csr.roots_bin_record_size) {
+        const rec = Csr.readRootRecord(roots_data[roots_i..][0..Csr.roots_bin_record_size]);
+        if (rec.root_kind != thread_object_root_kind) continue;
+        const gop = try seen_ordinals.getOrPut(rec.target_ordinal);
+        if (gop.found_existing) continue;
+        thread_count += 1;
+    }
+
     return .{
         .allocator = allocator,
         .summary = .{
@@ -297,13 +300,12 @@ pub fn buildFromIndex(
             .total_arrays = total_arrays,
             .total_heap_bytes = total_heap_bytes,
             .class_count = @intCast(class_table.ids.len),
-            .thread_count = 0,
+            .thread_count = thread_count,
             .classloader_count = classloader_count,
         },
         .histogram = try hist_items.toOwnedSlice(allocator),
         .primitive_histogram = prim_histogram,
         .classes = try class_items.toOwnedSlice(allocator),
-        .threads = &.{},
     };
 }
 
@@ -527,69 +529,6 @@ fn buildFromAnalysis(allocator: std.mem.Allocator, index: *const Analysis.Index)
     }
     std.mem.sort(ClassEntry, class_items.items, {}, compareClassBySize);
 
-    var thread_items = std.ArrayList(ThreadEntry).empty;
-    defer thread_items.deinit(allocator);
-    errdefer {
-        for (thread_items.items) |item| {
-            allocator.free(item.name);
-            allocator.free(item.state);
-            for (item.stack_frames) |frame| {
-                allocator.free(frame.class_name);
-                allocator.free(frame.method);
-                allocator.free(frame.source);
-            }
-            allocator.free(item.stack_frames);
-        }
-    }
-
-    const ctx = index.threadContext();
-    for (index.thread_index.threads.items) |t| {
-        var frames = std.ArrayList(FrameEntry).empty;
-        defer frames.deinit(allocator);
-        errdefer {
-            for (frames.items) |frame| {
-                allocator.free(frame.class_name);
-                allocator.free(frame.method);
-                allocator.free(frame.source);
-            }
-        }
-
-        if (index.thread_index.traces.get(t.stack_trace_serial)) |trace| {
-            for (trace.frames) |fid| {
-                if (index.thread_index.frames.get(fid)) |frame| {
-                    const class_name = try index.thread_index.formatFrameClassName(ctx, frame.class_serial);
-                    errdefer allocator.free(class_name);
-                    const method = index.utf8.get(frame.method_name_id) orelse "<?>";
-                    const source = index.utf8.get(frame.source_file_name_id) orelse "<?>";
-                    const method_copy = try allocator.dupe(u8, method);
-                    errdefer allocator.free(method_copy);
-                    const source_copy = try allocator.dupe(u8, source);
-                    errdefer allocator.free(source_copy);
-                    try frames.append(allocator, .{
-                        .class_name = class_name,
-                        .method = method_copy,
-                        .source = source_copy,
-                        .line_number = frame.line_number,
-                    });
-                }
-            }
-        }
-
-        const name = try allocator.dupe(u8, t.name);
-        errdefer allocator.free(name);
-        const state = try allocator.dupe(u8, t.state);
-        errdefer allocator.free(state);
-        try thread_items.append(allocator, .{
-            .name = name,
-            .state = state,
-            .priority = t.priority,
-            .daemon = t.daemon,
-            .tid = t.tid,
-            .virtual = t.virtual,
-            .stack_frames = try frames.toOwnedSlice(allocator),
-        });
-    }
-
     return .{
         .allocator = allocator,
         .summary = .{
@@ -605,7 +544,6 @@ fn buildFromAnalysis(allocator: std.mem.Allocator, index: *const Analysis.Index)
         .histogram = try hist_items.toOwnedSlice(allocator),
         .primitive_histogram = try prim_hist_items.toOwnedSlice(allocator),
         .classes = try class_items.toOwnedSlice(allocator),
-        .threads = try thread_items.toOwnedSlice(allocator),
     };
 }
 
@@ -754,34 +692,6 @@ pub fn printClasses(data: *const OverviewData, writer: anytype, options: ClassOp
     }
 }
 
-pub fn printThreads(data: *const OverviewData, writer: anytype) !void {
-    for (data.threads) |t| {
-        if (t.virtual) {
-            try writer.print("Thread: {s} (virtual)\n", .{t.name});
-        } else {
-            try writer.print("Thread: {s}\n", .{t.name});
-        }
-        try writer.print("  State:    {s}\n", .{t.state});
-        try writer.print("  Priority: {d}\n", .{t.priority});
-        try writer.print("  Daemon:   {s}\n", .{if (t.daemon) "true" else "false"});
-        try writer.print("  TID:      {d}\n", .{t.tid});
-
-        if (t.stack_frames.len > 0) {
-            try writer.print("  Stack trace:\n", .{});
-            for (t.stack_frames) |frame| {
-                if (frame.line_number < 0) {
-                    try writer.print("    at {s}.{s}({s})\n", .{ frame.class_name, frame.method, frame.source });
-                } else {
-                    try writer.print("    at {s}.{s}({s}:{d})\n", .{ frame.class_name, frame.method, frame.source, frame.line_number });
-                }
-            }
-        } else {
-            try writer.print("  Stack trace: <none>\n", .{});
-        }
-        try writer.print("\n", .{});
-    }
-}
-
 fn decodeDescriptor(allocator: std.mem.Allocator, descriptor: []const u8) std.mem.Allocator.Error![]const u8 {
     var dims: usize = 0;
     var i: usize = 0;
@@ -855,7 +765,7 @@ fn primitiveTypeName(ty: hprof.PrimitiveType) ?[]const u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const magic = "POVW";
-const version: u32 = 1;
+const version: u32 = 2;
 
 const Error = error{
     CacheCorrupt,
@@ -900,7 +810,6 @@ pub fn writeCache(
     try writeHistogram(writer, data.histogram);
     try writeHistogram(writer, data.primitive_histogram);
     try writeClasses(writer, data.classes);
-    try writeThreads(writer, data.threads);
 
     try file_writer.flush();
 }
@@ -949,7 +858,6 @@ pub fn readCache(
     const histogram = try cursor.readHistogram(allocator);
     const primitive_histogram = try cursor.readHistogram(allocator);
     const classes = try cursor.readClasses(allocator);
-    const threads = try cursor.readThreads(allocator);
 
     if (!cursor.isEmpty()) return error.CacheCorrupt;
 
@@ -959,7 +867,6 @@ pub fn readCache(
         .histogram = histogram,
         .primitive_histogram = primitive_histogram,
         .classes = classes,
-        .threads = threads,
     };
 }
 
@@ -989,25 +896,6 @@ fn writeClasses(writer: *Io.Writer, entries: []const ClassEntry) !void {
         try writeString(writer, entry.name);
         try writeString(writer, entry.superclass);
         try writeU64(writer, entry.instance_size);
-    }
-}
-
-fn writeThreads(writer: *Io.Writer, entries: []const ThreadEntry) !void {
-    try writeU32(writer, @intCast(entries.len));
-    for (entries) |entry| {
-        try writeString(writer, entry.name);
-        try writeString(writer, entry.state);
-        try writeI32(writer, entry.priority);
-        try writeU8(writer, if (entry.daemon) 1 else 0);
-        try writeI64(writer, entry.tid);
-        try writeU8(writer, if (entry.virtual) 1 else 0);
-        try writeU32(writer, @intCast(entry.stack_frames.len));
-        for (entry.stack_frames) |frame| {
-            try writeString(writer, frame.class_name);
-            try writeString(writer, frame.method);
-            try writeString(writer, frame.source);
-            try writeI32(writer, frame.line_number);
-        }
     }
 }
 
@@ -1164,71 +1052,7 @@ const CacheCursor = struct {
         return try items.toOwnedSlice(allocator);
     }
 
-    fn readThreads(self: *CacheCursor, allocator: std.mem.Allocator) Error![]ThreadEntry {
-        const n = try self.readU32();
-        var items = std.ArrayList(ThreadEntry).empty;
-        errdefer {
-            for (items.items) |item| {
-                allocator.free(item.name);
-                allocator.free(item.state);
-                for (item.stack_frames) |frame| {
-                    allocator.free(frame.class_name);
-                    allocator.free(frame.method);
-                    allocator.free(frame.source);
-                }
-                allocator.free(item.stack_frames);
-            }
-            items.deinit(allocator);
-        }
-        for (0..n) |_| {
-            const name = try self.readString(allocator);
-            errdefer allocator.free(name);
-            const state = try self.readString(allocator);
-            errdefer allocator.free(state);
-            const priority = try self.readI32();
-            const daemon = (try self.readU8()) != 0;
-            const tid = try self.readI64();
-            const virtual = (try self.readU8()) != 0;
-            const frame_count = try self.readU32();
-            var frames = std.ArrayList(FrameEntry).empty;
-            errdefer {
-                for (frames.items) |frame| {
-                    allocator.free(frame.class_name);
-                    allocator.free(frame.method);
-                    allocator.free(frame.source);
-                }
-                frames.deinit(allocator);
-            }
-            for (0..frame_count) |_| {
-                const class_name = try self.readString(allocator);
-                errdefer allocator.free(class_name);
-                const method = try self.readString(allocator);
-                errdefer allocator.free(method);
-                const source = try self.readString(allocator);
-                errdefer allocator.free(source);
-                const line_number = try self.readI32();
-                try frames.append(allocator, .{
-                    .class_name = class_name,
-                    .method = method,
-                    .source = source,
-                    .line_number = line_number,
-                });
-            }
-            try items.append(allocator, .{
-                .name = name,
-                .state = state,
-                .priority = priority,
-                .daemon = daemon,
-                .tid = tid,
-                .virtual = virtual,
-                .stack_frames = try frames.toOwnedSlice(allocator),
-            });
-        }
-        return try items.toOwnedSlice(allocator);
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
+};// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1267,7 +1091,6 @@ test "buildFromDump matches Analysis output on synthetic index" {
     try std.testing.expectEqual(data.histogram.len, read_data.histogram.len);
     try std.testing.expectEqual(data.primitive_histogram.len, read_data.primitive_histogram.len);
     try std.testing.expectEqual(data.classes.len, read_data.classes.len);
-    try std.testing.expectEqual(data.threads.len, read_data.threads.len);
 
     for (data.histogram, read_data.histogram) |a, b| {
         try std.testing.expectEqualStrings(a.name, b.name);
@@ -1279,13 +1102,6 @@ test "buildFromDump matches Analysis output on synthetic index" {
         try std.testing.expectEqualStrings(a.name, b.name);
         try std.testing.expectEqualStrings(a.superclass, b.superclass);
         try std.testing.expectEqual(a.instance_size, b.instance_size);
-    }
-
-    for (data.threads, read_data.threads) |a, b| {
-        try std.testing.expectEqualStrings(a.name, b.name);
-        try std.testing.expectEqual(a.priority, b.priority);
-        try std.testing.expectEqual(a.tid, b.tid);
-        try std.testing.expectEqual(a.stack_frames.len, b.stack_frames.len);
     }
 }
 
@@ -1441,25 +1257,6 @@ fn makeTestOverview(allocator: std.mem.Allocator) !OverviewData {
     classes[0] = .{ .name = try allocator.dupe(u8, "java.lang.Object"), .superclass = try allocator.dupe(u8, "(none)"), .instance_size = 8 };
     classes[1] = .{ .name = try allocator.dupe(u8, "java.lang.String"), .superclass = try allocator.dupe(u8, "java.lang.Object"), .instance_size = 24 };
 
-    const frames = try allocator.alloc(FrameEntry, 1);
-    frames[0] = .{
-        .class_name = try allocator.dupe(u8, "java.lang.Thread"),
-        .method = try allocator.dupe(u8, "run"),
-        .source = try allocator.dupe(u8, "Thread.java"),
-        .line_number = 42,
-    };
-
-    const threads = try allocator.alloc(ThreadEntry, 1);
-    threads[0] = .{
-        .name = try allocator.dupe(u8, "main"),
-        .state = try allocator.dupe(u8, "RUNNABLE"),
-        .priority = 5,
-        .daemon = false,
-        .tid = 1,
-        .virtual = false,
-        .stack_frames = frames,
-    };
-
     return .{
         .allocator = allocator,
         .summary = .{
@@ -1475,6 +1272,5 @@ fn makeTestOverview(allocator: std.mem.Allocator) !OverviewData {
         .histogram = hist,
         .primitive_histogram = prim_hist,
         .classes = classes,
-        .threads = threads,
     };
 }

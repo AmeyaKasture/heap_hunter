@@ -92,6 +92,38 @@ pub const Builder = struct {
         self.finishRecord(start);
     }
 
+    pub fn frame(
+        self: *Builder,
+        id: Id,
+        method_name_id: Id,
+        method_signature_id: Id,
+        source_file_name_id: Id,
+        class_serial: u32,
+        line_number: i32,
+    ) !void {
+        try self.startRecord(.frame);
+        const start = self.buf.items.len;
+        try self.writeId(id);
+        try self.writeId(method_name_id);
+        try self.writeId(method_signature_id);
+        try self.writeId(source_file_name_id);
+        try self.writeU32(class_serial);
+        try self.writeU32(@bitCast(line_number));
+        self.finishRecord(start);
+    }
+
+    pub fn trace(self: *Builder, serial: u32, thread_serial: u32, frame_ids: []const Id) !void {
+        try self.startRecord(.trace);
+        const start = self.buf.items.len;
+        try self.writeU32(serial);
+        try self.writeU32(thread_serial);
+        try self.writeU32(@intCast(frame_ids.len));
+        for (frame_ids) |fid| {
+            try self.writeId(fid);
+        }
+        self.finishRecord(start);
+    }
+
     pub fn heapDump(self: *Builder) !HeapDumpBuilder {
         return try HeapDumpBuilder.init(self, .heap_dump);
     }
@@ -227,21 +259,21 @@ pub const Builder = struct {
             return offset;
         }
 
-        pub fn rootJniLocal(self: *HeapDumpBuilder, object_id: Id, thread_serial: u32, frame: i32) !usize {
+        pub fn rootJniLocal(self: *HeapDumpBuilder, object_id: Id, thread_serial: u32, line_frame: i32) !usize {
             const offset = self.subtagBodyOffset();
             try self.parent.buf.append(self.parent.allocator, @intFromEnum(hprof.HeapSubtag.gc_root_jni_local));
             try self.parent.writeId(object_id);
             try self.parent.writeU32(thread_serial);
-            try self.parent.writeU32(@bitCast(frame));
+            try self.parent.writeU32(@bitCast(line_frame));
             return offset;
         }
 
-        pub fn rootJavaFrame(self: *HeapDumpBuilder, object_id: Id, thread_serial: u32, frame: i32) !usize {
+        pub fn rootJavaFrame(self: *HeapDumpBuilder, object_id: Id, thread_serial: u32, line_frame: i32) !usize {
             const offset = self.subtagBodyOffset();
             try self.parent.buf.append(self.parent.allocator, @intFromEnum(hprof.HeapSubtag.gc_root_java_frame));
             try self.parent.writeId(object_id);
             try self.parent.writeU32(thread_serial);
-            try self.parent.writeU32(@bitCast(frame));
+            try self.parent.writeU32(@bitCast(line_frame));
             return offset;
         }
 
@@ -371,7 +403,7 @@ test "builder produces parseable HPROF buffer" {
     });
     const inst_off = try heap.instanceDump(0x2222, 0x5678, &[_]u8{0} ** 8);
     _ = try heap.objectArrayDump(0x3333, 0x5678, &[_]Id{ 0x4444, 0, 0x5555 });
-    _ = try heap.primitiveArrayDump(0x6666, .int, 2, &[_]u8{0, 0, 0, 0, 0, 0, 0, 0});
+    _ = try heap.primitiveArrayDump(0x6666, .int, 2, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
     heap.end();
 
     const bytes = try b.finish();
@@ -408,5 +440,4 @@ test "builder produces parseable HPROF buffer" {
     _ = (try hr.next()).?;
     _ = (try hr.next()).?;
     try std.testing.expectEqual(@as(?hprof.HeapRecord, null), try hr.next());
-
 }

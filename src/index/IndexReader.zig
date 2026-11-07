@@ -6,6 +6,7 @@ const Manifest = @import("Manifest.zig");
 const Scanner = @import("Scanner.zig");
 const CatalogSorter = @import("CatalogSorter.zig");
 const Csr = @import("Csr.zig");
+const ThreadTraces = @import("ThreadTraces.zig");
 const Regex = @import("../Regex.zig");
 const Decoder = @import("../Decoder.zig");
 const log = @import("log");
@@ -217,6 +218,7 @@ pub const Reader = struct {
 
     classes_data: []const u8,
     fields_data: []const u8,
+    thread_traces: ThreadTraces.Parsed,
 
     classes: []const ClassInfo,
     layouts: []const LayoutInfo,
@@ -241,7 +243,7 @@ pub const Reader = struct {
         var manifest_moved = false;
         errdefer if (!manifest_moved) manifest.deinit(allocator);
 
-        if (manifest.format_version != 1) {
+        if (manifest.format_version != 2) {
             return error.InvalidManifest;
         }
 
@@ -266,6 +268,7 @@ pub const Reader = struct {
             .roots_data = &.{},
             .classes_data = &.{},
             .fields_data = &.{},
+            .thread_traces = ThreadTraces.Parsed.empty(allocator),
             .classes = &.{},
             .layouts = &.{},
             .class_index = std.AutoHashMap(hprof.Id, usize).init(allocator),
@@ -300,7 +303,14 @@ pub const Reader = struct {
         try self.parseFields();
         try self.parseRoots();
 
-        log.debug("IndexReader.open complete: n_objects={d}, n_edges={d}, n_roots={d}", .{ self.n_objects, self.out_targets.len / self.id_size, self.roots_data.len / 8 });
+        // Load thread stack-trace metadata (small file).
+        const tt_bytes = try self.readFile("thread_traces.bin");
+        defer self.allocator.free(tt_bytes);
+        const parsed_traces = try ThreadTraces.Parsed.parse(self.allocator, tt_bytes);
+        self.thread_traces.deinit();
+        self.thread_traces = parsed_traces;
+
+        log.debug("IndexReader.open complete: n_objects={d}, n_edges={d}, n_roots={d}, n_traces={d}", .{ self.n_objects, self.out_targets.len / self.id_size, self.roots_data.len / 8, self.thread_traces.traces.len });
 
         return self;
     }
@@ -322,6 +332,7 @@ pub const Reader = struct {
 
         self.allocator.free(self.classes_data);
         self.allocator.free(self.fields_data);
+        self.thread_traces.deinit();
 
         self.allocator.free(self.index_dir);
         self.allocator.free(self.source_path);
@@ -528,6 +539,45 @@ pub const Reader = struct {
     pub fn layoutForClass(self: *const Reader, class_id: hprof.Id) ?*const LayoutInfo {
         const idx = self.layout_index.get(class_id) orelse return null;
         return &self.layouts[idx];
+    }
+
+    /// A resolved root record from `roots.bin`, exposed for query commands.
+    pub const RootRecordView = struct {
+        target_ordinal: u32,
+        root_kind: u8,
+        thread_serial: u32,
+    };
+
+    /// Number of root records in `roots.bin`.
+    pub fn rootCount(self: *const Reader) u32 {
+        return @intCast(self.roots_data.len / Csr.roots_bin_record_size);
+    }
+
+    /// Root record at `index`; `index` must be `< rootCount()`.
+    pub fn rootRecordAt(self: *const Reader, index: u32) RootRecordView {
+        const rec = Csr.readRootRecord(self.roots_data[index * Csr.roots_bin_record_size ..][0..Csr.roots_bin_record_size]);
+        return .{
+            .target_ordinal = rec.target_ordinal,
+            .root_kind = rec.root_kind,
+            .thread_serial = rec.thread_serial,
+        };
+    }
+
+    /// Thread-object -> stack-trace mapping from `thread_traces.bin`.
+    pub fn threadTraceRoot(self: *const Reader, thread_object_id: hprof.Id) ?*const ThreadTraces.ThreadRoot {
+        const idx = self.thread_traces.root_by_object.get(thread_object_id) orelse return null;
+        return &self.thread_traces.thread_roots[idx];
+    }
+
+    /// Stack trace for a serial number, or null if not recorded.
+    pub fn traceBySerial(self: *const Reader, serial: u32) ?*const ThreadTraces.TraceEntry {
+        const idx = self.thread_traces.trace_by_serial.get(serial) orelse return null;
+        return &self.thread_traces.traces[idx];
+    }
+
+    /// Stack frame by frame-table index; `index` must be in bounds.
+    pub fn frameAt(self: *const Reader, index: u32) *const ThreadTraces.FrameEntry {
+        return &self.thread_traces.frames[index];
     }
 
     pub fn outEdges(self: *const Reader, ordinal: u32) []align(1) const u32 {

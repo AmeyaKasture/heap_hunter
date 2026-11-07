@@ -12,6 +12,7 @@ const Commands = @import("Commands.zig");
 const Overview = @import("Overview.zig");
 const Manifest = @import("index/Manifest.zig");
 const IndexReader = @import("index/IndexReader.zig");
+const ThreadQuery = @import("index/ThreadQuery.zig");
 const Regex = @import("Regex.zig");
 const Progress = @import("Progress.zig");
 
@@ -111,6 +112,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .class_regex = .{ .type = "string", .description = "Regular expression matching class names." },
                 .limit = .{ .type = "integer", .description = "Maximum number of objects to return.", .default = 100 },
                 .offset = .{ .type = "integer", .description = "Skip the first n matching objects.", .default = 0 },
@@ -126,6 +128,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .class_regex = .{ .type = "string", .description = "Regular expression matching class names." },
                 .limit = .{ .type = "integer", .description = "Maximum number of objects to decode.", .default = 100 },
                 .offset = .{ .type = "integer", .description = "Skip the first n matching objects.", .default = 0 },
@@ -141,6 +144,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Object ID, e.g. 0x3000." },
             },
             .required = .{ "index_dir", "id" },
@@ -153,6 +157,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Source object ID." },
                 .limit = .{ .type = "integer", .description = "Maximum number of references to return.", .default = 64 },
                 .offset = .{ .type = "integer", .description = "Skip the first n references.", .default = 0 },
@@ -167,11 +172,24 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Target object ID." },
                 .limit = .{ .type = "integer", .description = "Maximum number of references to return.", .default = 64 },
                 .offset = .{ .type = "integer", .description = "Skip the first n references.", .default = 0 },
             },
             .required = .{ "index_dir", "id" },
+        },
+    },
+    .{
+        .name = "list_threads",
+        .description = "List threads with names, states, priorities, daemon flags, and stack traces decoded on demand from the dump.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
+            },
+            .required = .{"index_dir"},
         },
     },
     .{
@@ -181,6 +199,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Object ID to trace." },
                 .max_visited = .{ .type = "integer", .description = "Maximum nodes to visit during the search.", .default = 1_000_000 },
             },
@@ -194,6 +213,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Root object ID." },
                 .direction = .{ .type = "string", .description = "Traverse outbound ('from') or inbound ('to') references.", .default = "from" },
                 .depth = .{ .type = "integer", .description = "Maximum depth of the expansion.", .default = 4 },
@@ -231,6 +251,8 @@ pub fn dispatch(
         return try refsFrom(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "refs_to")) {
         return try refsTo(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "list_threads")) {
+        return try listThreads(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "find_roots")) {
         return try findRoots(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "reference_tree")) {
@@ -539,6 +561,28 @@ fn loadOverviewData(allocator: std.mem.Allocator, io: Io, index_dir: []const u8)
     return try Overview.readCache(allocator, io, index_dir, &manifest.fingerprint);
 }
 
+fn listThreads(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    const index_dir = getRequiredString(arguments, "index_dir") orelse return Result{
+        .failure = .{
+            .message = "Missing required argument: index_dir",
+            .error_type = "InvalidArgument",
+        },
+    };
+    const source = getOptionalString(arguments, "source");
+
+    var reader = try IndexReader.open(allocator, io, index_dir, source);
+    defer reader.deinit();
+
+    var threads = try ThreadQuery.build(allocator, &reader);
+    defer threads.deinit();
+
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+    try ThreadQuery.writeJson(&threads, &buf.writer);
+
+    return Result{ .success = try allocator.dupe(u8, buf.writer.buffer[0..buf.writer.end]) };
+}
+
 fn findObjects(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
     return try runQueryTool(allocator, io, arguments, "objects");
 }
@@ -579,8 +623,9 @@ fn runQueryTool(
             .error_type = "InvalidArgument",
         },
     };
+    const source = getOptionalString(arguments, "source");
 
-    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    var reader = try IndexReader.open(allocator, io, index_dir, source);
     defer reader.deinit();
 
     var buf = Io.Writer.Allocating.init(allocator);
@@ -769,8 +814,7 @@ test "dispatch analyze_heap_dump missing hprof_path returns failure" {
 test "dispatch analyze_heap_dump missing file returns failure" {
     const allocator = std.testing.allocator;
     var config_load: Config.LoadResult = .{};
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        "{\"hprof_path\":\"/nonexistent/hunt/test/file.hprof\",\"index_dir\":\"/tmp/hunt-mcp-test-missing-file.idx\"}", .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"hprof_path\":\"/nonexistent/hunt/test/file.hprof\",\"index_dir\":\"/tmp/hunt-mcp-test-missing-file.idx\"}", .{});
     defer parsed.deinit();
     const result = try dispatch(allocator, std.testing.io, &config_load, "analyze_heap_dump", parsed.value, .{});
     defer result.deinit(allocator);
@@ -806,6 +850,17 @@ test "dispatch heap_classes missing index_dir returns failure" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
     defer parsed.deinit();
     const result = try dispatch(allocator, std.testing.io, &config_load, "heap_classes", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch list_threads missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "list_threads", parsed.value, .{});
     defer result.deinit(allocator);
     try std.testing.expect(result == .failure);
     try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
