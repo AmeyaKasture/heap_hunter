@@ -112,6 +112,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .class_regex = .{ .type = "string", .description = "Regular expression matching class names." },
                 .limit = .{ .type = "integer", .description = "Maximum number of objects to return.", .default = 100 },
                 .offset = .{ .type = "integer", .description = "Skip the first n matching objects.", .default = 0 },
@@ -127,6 +128,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .class_regex = .{ .type = "string", .description = "Regular expression matching class names." },
                 .limit = .{ .type = "integer", .description = "Maximum number of objects to decode.", .default = 100 },
                 .offset = .{ .type = "integer", .description = "Skip the first n matching objects.", .default = 0 },
@@ -142,6 +144,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Object ID, e.g. 0x3000." },
             },
             .required = .{ "index_dir", "id" },
@@ -154,6 +157,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Source object ID." },
                 .limit = .{ .type = "integer", .description = "Maximum number of references to return.", .default = 64 },
                 .offset = .{ .type = "integer", .description = "Skip the first n references.", .default = 0 },
@@ -168,6 +172,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Target object ID." },
                 .limit = .{ .type = "integer", .description = "Maximum number of references to return.", .default = 64 },
                 .offset = .{ .type = "integer", .description = "Skip the first n references.", .default = 0 },
@@ -182,6 +187,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
             },
             .required = .{"index_dir"},
         },
@@ -193,6 +199,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Object ID to trace." },
                 .max_visited = .{ .type = "integer", .description = "Maximum nodes to visit during the search.", .default = 1_000_000 },
             },
@@ -206,6 +213,7 @@ pub const tool_definitions = .{
             .type = "object",
             .properties = .{
                 .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
                 .id = .{ .type = "string", .description = "Root object ID." },
                 .direction = .{ .type = "string", .description = "Traverse outbound ('from') or inbound ('to') references.", .default = "from" },
                 .depth = .{ .type = "integer", .description = "Maximum depth of the expansion.", .default = 4 },
@@ -560,8 +568,9 @@ fn listThreads(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) 
             .error_type = "InvalidArgument",
         },
     };
+    const source = getOptionalString(arguments, "source");
 
-    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    var reader = try IndexReader.open(allocator, io, index_dir, source);
     defer reader.deinit();
 
     var threads = try ThreadQuery.build(allocator, &reader);
@@ -614,8 +623,9 @@ fn runQueryTool(
             .error_type = "InvalidArgument",
         },
     };
+    const source = getOptionalString(arguments, "source");
 
-    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    var reader = try IndexReader.open(allocator, io, index_dir, source);
     defer reader.deinit();
 
     var buf = Io.Writer.Allocating.init(allocator);
