@@ -25,7 +25,7 @@ pub const Error = error{
 /// The set of staged files that are moved into the final index directory.
 /// These names match the files produced by earlier stages and checked by
 /// `Validate.zig`.
-pub const final_files = &[_][]const u8{
+pub const required_files = &[_][]const u8{
     "catalog.bin",
     "classes.bin",
     "fields.bin",
@@ -37,6 +37,14 @@ pub const final_files = &[_][]const u8{
     "prim_histogram.bin",
     "thread_traces.bin",
 };
+
+pub const optional_files = &[_][]const u8{
+    "dom_parent.bin",
+    "dom_order.bin",
+    "retained.bin",
+};
+
+pub const final_files = required_files;
 
 /// Result of Stage 8 publication. Holds the total byte size of the published
 /// index files and the manifest file entries.
@@ -90,10 +98,38 @@ pub fn publish(
     };
     defer index_dir_handle.close(io);
 
-    for (final_files) |name| {
+    // Remove dominator files left in the index directory by a previous build
+    // so they never shadow newer required files (e.g. when rebuilding the same
+    // dump with --no-dominators, or rebuilding with a different byte layout).
+    for (optional_files) |name| {
+        const staged_path = try std.fs.path.join(allocator, &.{ staging_dir, name });
+        defer allocator.free(staged_path);
+        if (fileExists(io, staged_path)) continue;
+
+        const old_path = try std.fs.path.join(allocator, &.{ index_dir, name });
+        defer allocator.free(old_path);
+        dir.deleteFile(io, old_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                try stderr.print("error: failed to remove stale {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            },
+        };
+    }
+
+    for (required_files) |name| {
         staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| {
             try stderr.print("error: failed to publish {s}: {}\n", .{ name, err });
             return error.PublishFailed;
+        };
+    }
+    for (optional_files) |name| {
+        staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                try stderr.print("error: failed to publish {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            },
         };
     }
 
@@ -107,13 +143,30 @@ pub fn publish(
     }
 
     var index_bytes: u64 = 0;
-    for (final_files) |name| {
+    for (required_files) |name| {
         const new_path = try std.fs.path.join(allocator, &.{ index_dir, name });
         defer allocator.free(new_path);
 
         const stat = dir.statFile(io, new_path, .{}) catch |err| {
             try stderr.print("error: failed to stat published file {s}: {}\n", .{ name, err });
             return error.PublishFailed;
+        };
+
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        try files.append(allocator, .{ .name = owned_name, .size = stat.size });
+        index_bytes += stat.size;
+    }
+    for (optional_files) |name| {
+        const new_path = try std.fs.path.join(allocator, &.{ index_dir, name });
+        defer allocator.free(new_path);
+
+        const stat = dir.statFile(io, new_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => {
+                try stderr.print("error: failed to stat published file {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            },
         };
 
         const owned_name = try allocator.dupe(u8, name);

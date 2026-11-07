@@ -199,6 +199,19 @@ pub fn validate(
     const thread_traces_path = try std.fs.path.join(allocator, &.{ staging_dir, "thread_traces.bin" });
     defer allocator.free(thread_traces_path);
     try validateThreadTraces(allocator, io, thread_traces_path, stderr);
+
+    // 9. Dominator files, if present, are structurally valid.
+    const dom_parent_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_parent.bin" });
+    defer allocator.free(dom_parent_path);
+    const dom_order_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_order.bin" });
+    defer allocator.free(dom_order_path);
+    const retained_path = try std.fs.path.join(allocator, &.{ staging_dir, "retained.bin" });
+    defer allocator.free(retained_path);
+
+    // Only validate if all three core files exist.
+    if (fileSize(io, dom_parent_path) catch 0 > 0) {
+        try validateDominators(allocator, io, staging_dir, n_nodes, stderr);
+    }
 }
 
 /// Validate `thread_traces.bin` by parsing it; the parser performs full
@@ -220,6 +233,130 @@ fn validateThreadTraces(
         return error.InvalidThreadTracesFile;
     };
     defer parsed.deinit();
+}
+
+/// Validate dominator files.
+fn validateDominators(
+    allocator: std.mem.Allocator,
+    io: Io,
+    staging_dir: []const u8,
+    n_nodes: u64,
+    stderr: *Io.Writer,
+) Error!void {
+    const dom_parent_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_parent.bin" });
+    defer allocator.free(dom_parent_path);
+    const dom_order_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_order.bin" });
+    defer allocator.free(dom_order_path);
+    const retained_path = try std.fs.path.join(allocator, &.{ staging_dir, "retained.bin" });
+    defer allocator.free(retained_path);
+
+    const dp_size = fileSize(io, dom_parent_path) catch {
+        try Cli.printError(stderr, "index validation failed: dom_parent.bin missing", .{});
+        return error.MissingFile;
+    };
+    const do_size = fileSize(io, dom_order_path) catch {
+        try Cli.printError(stderr, "index validation failed: dom_order.bin missing", .{});
+        return error.MissingFile;
+    };
+    const ret_size = fileSize(io, retained_path) catch {
+        try Cli.printError(stderr, "index validation failed: retained.bin missing", .{});
+        return error.MissingFile;
+    };
+
+    if (dp_size != n_nodes * 4) {
+        try Cli.printError(stderr, "index validation failed: dom_parent.bin size", .{});
+        return error.InvariantViolation;
+    }
+    if (ret_size != n_nodes * 8) {
+        try Cli.printError(stderr, "index validation failed: retained.bin size", .{});
+        return error.InvariantViolation;
+    }
+    if (do_size % 4 != 0) {
+        try Cli.printError(stderr, "index validation failed: dom_order.bin size", .{});
+        return error.InvariantViolation;
+    }
+    const n_reachable = do_size / 4;
+
+    // Read dom_parent into memory (V u32) - for validation ok (small).
+    const dp_data = Io.Dir.cwd().readFileAlloc(io, dom_parent_path, allocator, .unlimited) catch {
+        return error.InvariantViolation;
+    };
+    defer allocator.free(dp_data);
+    const do_data = Io.Dir.cwd().readFileAlloc(io, dom_order_path, allocator, .unlimited) catch {
+        return error.InvariantViolation;
+    };
+    defer allocator.free(do_data);
+    const ret_data = Io.Dir.cwd().readFileAlloc(io, retained_path, allocator, .unlimited) catch {
+        return error.InvariantViolation;
+    };
+    defer allocator.free(ret_data);
+
+    const V: usize = @intCast(n_nodes);
+    const NONE: u32 = std.math.maxInt(u32);
+
+    // Check 4/5/6.
+    var idx: usize = 0;
+    while (idx < V) : (idx += 1) {
+        const p = std.mem.readInt(u32, dp_data[idx * 4 ..][0..4], .little);
+        if (p != NONE and p >= V) {
+            try Cli.printError(stderr, "index validation failed: dom_parent out of range", .{});
+            return error.InvariantViolation;
+        }
+        if (p == @as(u32, @intCast(idx)) and idx != V - 1) {
+            // self-domination not allowed except virtual root handled as NONE
+            try Cli.printError(stderr, "index validation failed: self dominator", .{});
+            return error.InvariantViolation;
+        }
+    }
+
+    // retained >= shallow
+    const catalog_path = try std.fs.path.join(allocator, &.{ staging_dir, "catalog.bin" });
+    defer allocator.free(catalog_path);
+    const cat_data = Io.Dir.cwd().readFileAlloc(io, catalog_path, allocator, .unlimited) catch {
+        return error.InvariantViolation;
+    };
+    defer allocator.free(cat_data);
+
+    var total_reachable_shallow: u64 = 0;
+    var ridx: usize = 0;
+    while (ridx < V - 1) : (ridx += 1) {
+        const shallow = std.mem.readInt(u32, cat_data[ridx * Scanner.catalog_row_size + 24 ..][0..4], .little);
+        const ret = std.mem.readInt(u64, ret_data[ridx * 8 ..][0..8], .little);
+        if (ret < shallow) {
+            try Cli.printError(stderr, "index validation failed: retained < shallow", .{});
+            return error.InvariantViolation;
+        }
+        // reachable? We don't have reachable set easily; assume all with parent != NONE reachable.
+        const p = std.mem.readInt(u32, dp_data[ridx * 4 ..][0..4], .little);
+        if (p != NONE) total_reachable_shallow += shallow;
+    }
+
+    // reconciliation: retained[virtual_root] == sum shallow reachable
+    const root_ret = std.mem.readInt(u64, ret_data[(V - 1) * 8 ..][0..8], .little);
+    if (root_ret != total_reachable_shallow) {
+        try Cli.printError(stderr, "index validation failed: root retained mismatch", .{});
+        return error.InvariantViolation;
+    }
+
+    // dom_order contains each reachable node exactly once
+    if (n_reachable == 0) return;
+    var seen = try allocator.alloc(bool, V);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var s: usize = 0;
+    while (s < n_reachable) : (s += 1) {
+        const node = std.mem.readInt(u32, do_data[s * 4 ..][0..4], .little);
+        if (node >= V) {
+            try Cli.printError(stderr, "index validation failed: dom_order out of range", .{});
+            return error.InvariantViolation;
+        }
+        if (seen[node]) {
+            try Cli.printError(stderr, "index validation failed: dom_order duplicate", .{});
+            return error.InvariantViolation;
+        }
+        seen[node] = true;
+    }
+
 }
 
 /// Return the size of `path` in bytes, or propagate the underlying I/O error.

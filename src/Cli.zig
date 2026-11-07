@@ -100,7 +100,8 @@ pub fn printMissingConfig(writer: *Io.Writer, candidates: []const []const u8, ex
     try writeStyled(writer, Style.cyan, "config.json\n");
     try writer.writeAll("{\n");
     try writer.writeAll("  \"index-dir\": \"/path/to/hunt/indexes\",\n");
-    try writer.writeAll("  \"sorting-budget-mb\": 4096\n");
+    try writer.writeAll("  \"sorting-budget-mb\": 4096,\n");
+    try writer.writeAll("  \"dominator-budget-mb\": 4096\n");
     try writer.writeAll("}\n\n");
 
     try writer.writeAll("For ");
@@ -235,6 +236,8 @@ pub const commands = [_]Command{
         .options = &.{
             .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory where the index will be written. Defaults to the config value, or <base>/<stem>.idx/ when the config is a base directory." },
             .{ .flags = "--sorting-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for external sorting.", .default_value = "4096" },
+            .{ .flags = "--dominator-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for dominator computation. Defaults to the config value, or 4096.", .default_value = "4096" },
+            .{ .flags = "--no-dominators", .argument = null, .description = "Skip dominator/retained-size computation." },
             .{ .flags = "--force", .argument = null, .description = "Rebuild the index even if a matching index already exists." },
             .{ .flags = "--no-progress", .argument = null, .description = "Suppress the progress spinner and checkpoint output." },
         },
@@ -550,6 +553,35 @@ pub const commands = [_]Command{
             .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
         },
         .see_also = &.{ "refs-from", "roots" },
+    },
+    .{
+        .name = "retained",
+        .description = "Show retained size and retention chain for an object.",
+        .usage = "hunt retained [file.hprof] <id> [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index." },
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Retained size printed." },
+            .{ .code = 1, .description = "Invalid argument, object not found, or missing index." },
+        },
+        .see_also = &.{ "retainers", "tree" },
+    },
+    .{
+        .name = "retainers",
+        .description = "List objects with the largest retained size.",
+        .usage = "hunt retainers [file.hprof] [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index." },
+            .{ .flags = "--top", .argument = "<n>", .description = "Number of objects to report." },
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Retainers printed." },
+            .{ .code = 1, .description = "Invalid argument or missing index." },
+        },
+        .see_also = &.{ "retained" },
     },
 };
 

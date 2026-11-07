@@ -56,6 +56,8 @@ pub const tool_definitions = .{
                 .hprof_path = .{ .type = "string", .description = "Path to the .hprof file." },
                 .index_dir = .{ .type = "string", .description = "Directory where the index will be written. Defaults to the config value or <base>/<stem>.idx/." },
                 .sorting_budget_mb = .{ .type = "integer", .description = "Memory budget in megabytes for external sorting." },
+                .dominator_budget_mb = .{ .type = "integer", .description = "Memory budget in megabytes for dominator computation. Defaults to the dominator-budget-mb config value, or 4096." },
+                .compute_dominators = .{ .type = "boolean", .description = "Compute dominators and retained sizes (default true).", .default = true },
                 .force = .{ .type = "boolean", .description = "Rebuild the index even if a matching index already exists." },
                 .no_progress = .{ .type = "boolean", .description = "Suppress progress notifications." },
             },
@@ -214,6 +216,30 @@ pub const tool_definitions = .{
             .required = .{ "index_dir", "id" },
         },
     },
+    .{
+        .name = "retained_size",
+        .description = "Show retained size, shallow size, retention delta, and dominator chain for an object.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .id = .{ .type = "string", .description = "Object ID, e.g. 0x3000." },
+            },
+            .required = .{ "index_dir", "id" },
+        },
+    },
+    .{
+        .name = "top_retainers",
+        .description = "List the objects with the largest retained size.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .top = .{ .type = "integer", .description = "Number of objects to report.", .default = 10 },
+            },
+            .required = .{"index_dir"},
+        },
+    },
 };
 
 /// Dispatch an MCP tool call to the appropriate handler.
@@ -249,6 +275,10 @@ pub fn dispatch(
         return try findRoots(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "reference_tree")) {
         return try referenceTree(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "retained_size")) {
+        return try retainedSize(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "top_retainers")) {
+        return try topRetainers(allocator, io, arguments);
     } else {
         return Result{ .failure = .{
             .message = "Unknown tool",
@@ -274,6 +304,8 @@ fn analyzeHeapDump(
 
     const index_dir = getOptionalString(arguments, "index_dir");
     const sorting_budget_mb = getOptionalU32(arguments, "sorting_budget_mb");
+    const dominator_budget_mb = getOptionalU32(arguments, "dominator_budget_mb");
+    const compute_dominators = getOptionalBool(arguments, "compute_dominators") orelse true;
     const force = getOptionalBool(arguments, "force");
     const no_progress = getOptionalBool(arguments, "no_progress");
 
@@ -293,6 +325,8 @@ fn analyzeHeapDump(
             .hprof_path = hprof_path,
             .index_dir = index_dir,
             .sorting_budget_mb = sorting_budget_mb,
+            .dominator_budget_mb = dominator_budget_mb,
+            .compute_dominators = compute_dominators,
             .force = force orelse false,
             .no_progress = no_progress orelse false,
         },
@@ -600,6 +634,57 @@ fn findRoots(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !R
 
 fn referenceTree(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
     return try runQueryTool(allocator, io, arguments, "tree");
+}
+
+fn retainedSize(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    const index_dir = getRequiredString(arguments, "index_dir") orelse return Result{
+        .failure = .{ .message = "Missing required argument: index_dir", .error_type = "InvalidArgument" },
+    };
+    const id_str = getRequiredString(arguments, "id") orelse return Result{
+        .failure = .{ .message = "Missing required argument: id", .error_type = "InvalidArgument" },
+    };
+    const raw_id = IndexReader.parseRawId(id_str) catch return Result{
+        .failure = .{ .message = "Invalid object id", .error_type = "InvalidArgument" },
+    };
+
+    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    defer reader.deinit();
+
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+
+    IndexReader.writeRetained(&reader, &buf.writer, raw_id) catch |err| {
+        if (err == error.ObjectNotFound) {
+            return Result{ .failure = .{ .message = "Object not found", .error_type = "InvalidArgument" } };
+        }
+        if (err == error.NoRetainedData) {
+            return Result{ .failure = .{ .message = "Retained size unavailable because this index has no dominator data; rebuild the index with compute_dominators enabled", .error_type = "NoRetainedData" } };
+        }
+        return Result{ .failure = .{ .message = "Retained size unavailable", .error_type = @errorName(err) } };
+    };
+
+    return Result{ .success = try allocator.dupe(u8, buf.writer.buffer[0..buf.writer.end]) };
+}
+
+fn topRetainers(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    const index_dir = getRequiredString(arguments, "index_dir") orelse return Result{
+        .failure = .{ .message = "Missing required argument: index_dir", .error_type = "InvalidArgument" },
+    };
+    const top: u32 = if (getOptionalU32(arguments, "top")) |v| v else 10;
+
+    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    defer reader.deinit();
+
+    if (!reader.hasDominators()) {
+        return Result{ .failure = .{ .message = "This index has no retained-size data", .error_type = "NoRetainedData" } };
+    }
+
+    var buf = Io.Writer.Allocating.init(allocator);
+    defer buf.deinit();
+
+    try IndexReader.writeRetainers(&reader, &buf.writer, top);
+
+    return Result{ .success = try allocator.dupe(u8, buf.writer.buffer[0..buf.writer.end]) };
 }
 
 fn runQueryTool(

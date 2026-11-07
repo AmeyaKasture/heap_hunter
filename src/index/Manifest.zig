@@ -49,6 +49,7 @@ pub const Diagnostics = struct {
     unknown_root_kind: u64 = 0,
     missing_layout: u64 = 0,
     dangling_root_targets: u64 = 0,
+    unreachable_objects: u64 = 0,
 };
 
 pub const FileEntry = struct {
@@ -62,6 +63,9 @@ pub const IndexManifest = struct {
     n_objects: u64 = 0,
     n_edges: u64 = 0,
     virtual_root_ordinal: u32 = 0,
+    has_dominators: bool = false,
+    n_dominator_nodes: u64 = 0,
+    retained_total_bytes: u64 = 0,
     diagnostics: Diagnostics = .{},
     files: []const FileEntry = &.{},
     /// Absolute or relative path to the source HPROF file used to build the
@@ -93,6 +97,9 @@ pub const IndexManifest = struct {
             .n_objects = self.n_objects,
             .n_edges = self.n_edges,
             .virtual_root_ordinal = self.virtual_root_ordinal,
+            .has_dominators = self.has_dominators,
+            .n_dominator_nodes = self.n_dominator_nodes,
+            .retained_total_bytes = self.retained_total_bytes,
             .diagnostics = self.diagnostics,
             .files = files,
             .source_path = if (self.source_path) |p| try allocator.dupe(u8, p) else null,

@@ -499,7 +499,7 @@ test "handleMessage tools/list returns all tools" {
     try std.testing.expectEqual(@as(i64, 42), root.get("id").?.integer);
 
     const tools = root.get("result").?.object.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 12), tools.items.len);
+    try std.testing.expectEqual(@as(usize, 14), tools.items.len);
 
     const expected_names = [_][]const u8{
         "analyze_heap_dump",
@@ -514,6 +514,8 @@ test "handleMessage tools/list returns all tools" {
         "list_threads",
         "find_roots",
         "reference_tree",
+        "retained_size",
+        "top_retainers",
     };
     for (expected_names, tools.items) |expected, tool| {
         try std.testing.expectEqualStrings(expected, tool.object.get("name").?.string);

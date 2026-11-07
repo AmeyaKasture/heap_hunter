@@ -25,6 +25,7 @@ pub const Error = error{
     InvalidFieldType,
     LimitTooLarge,
     InvalidDirection,
+    NoRetainedData,
 };
 
 const MappedFile = struct {
@@ -216,6 +217,10 @@ pub const Reader = struct {
     in_sources: []const u8,
     roots_data: []const u8,
 
+    dom_parent_data: []const u8,
+    dom_order_data: []const u8,
+    retained_data: []const u8,
+
     classes_data: []const u8,
     fields_data: []const u8,
     thread_traces: ThreadTraces.Parsed,
@@ -266,6 +271,9 @@ pub const Reader = struct {
             .in_offsets = &.{},
             .in_sources = &.{},
             .roots_data = &.{},
+            .dom_parent_data = &.{},
+            .dom_order_data = &.{},
+            .retained_data = &.{},
             .classes_data = &.{},
             .fields_data = &.{},
             .thread_traces = ThreadTraces.Parsed.empty(allocator),
@@ -292,6 +300,11 @@ pub const Reader = struct {
         self.in_offsets = try self.mapFile("in_offsets.bin");
         self.in_sources = try self.mapFile("in_sources.bin");
         self.roots_data = try self.mapFile("roots.bin");
+
+        // Optional dominator files (present only for Pro/full builds).
+        self.dom_parent_data = self.mapFile("dom_parent.bin") catch &.{};
+        self.dom_order_data = self.mapFile("dom_order.bin") catch &.{};
+        self.retained_data = self.mapFile("retained.bin") catch &.{};
 
         try self.validateSizes();
 
@@ -404,6 +417,13 @@ pub const Reader = struct {
         if (self.manifest.n_edges * 4 != self.out_targets.len) return error.CorruptIndexFile;
         if (self.manifest.n_edges * 4 != self.in_sources.len) return error.CorruptIndexFile;
         if (self.roots_data.len % Csr.roots_bin_record_size != 0) return error.CorruptIndexFile;
+
+        if (self.retained_data.len > 0) {
+            if (self.retained_data.len != (self.n_objects + 1) * 8) return error.CorruptIndexFile;
+        }
+        if (self.dom_parent_data.len > 0) {
+            if (self.dom_parent_data.len != (self.n_objects + 1) * 4) return error.CorruptIndexFile;
+        }
     }
 
     fn parseClasses(self: *Reader) !void {
@@ -586,6 +606,66 @@ pub const Reader = struct {
 
     pub fn inEdges(self: *const Reader, ordinal: u32) []align(1) const u32 {
         return self.csrRange(self.in_offsets, self.in_sources, ordinal);
+    }
+
+    pub fn hasDominators(self: *const Reader) bool {
+        return self.retained_data.len > 0;
+    }
+
+    pub fn dominatorOf(self: *const Reader, ordinal: u32) ?u32 {
+        if (ordinal >= self.n_objects) return null;
+        if (self.dom_parent_data.len == 0) return null;
+        const p = std.mem.readInt(u32, self.dom_parent_data[ordinal * 4 ..][0..4], .little);
+        if (p == 0xFFFFFFFF) return null;
+        return p;
+    }
+
+    pub fn retainedSize(self: *const Reader, ordinal: u32) u64 {
+        if (ordinal > self.n_objects) return 0;
+        if (self.retained_data.len == 0) return 0;
+        return std.mem.readInt(u64, self.retained_data[ordinal * 8 ..][0..8], .little);
+    }
+
+    pub fn domDepth(self: *const Reader, ordinal: u32) u32 {
+        var depth: u32 = 0;
+        var cur = ordinal;
+        var guard: u32 = 0;
+        while (guard < self.n_objects + 1) : (guard += 1) {
+            const p = self.dominatorOf(cur) orelse break;
+            if (p == cur) break;
+            cur = p;
+            depth += 1;
+            if (cur == self.virtual_root_ordinal) break;
+        }
+        return depth;
+    }
+
+    pub fn domPath(self: *const Reader, allocator: std.mem.Allocator, ordinal: u32, max: u32) ![]u32 {
+        var list = std.ArrayList(u32).empty;
+        errdefer list.deinit(allocator);
+        var cur = ordinal;
+        var guard: u32 = 0;
+        while (guard < max + 1 and guard < self.n_objects + 1) : (guard += 1) {
+            try list.append(allocator, cur);
+            if (cur == self.virtual_root_ordinal) break;
+            const p = self.dominatorOf(cur) orelse break;
+            if (p == cur) break;
+            cur = p;
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    pub fn domChildren(self: *const Reader, allocator: std.mem.Allocator, ordinal: u32) ![]u32 {
+        var list = std.ArrayList(u32).empty;
+        errdefer list.deinit(allocator);
+        if (self.dom_parent_data.len == 0) return list.toOwnedSlice(allocator);
+        const V: u32 = @intCast(self.n_objects + 1);
+        var i: u32 = 0;
+        while (i < V) : (i += 1) {
+            const p = std.mem.readInt(u32, self.dom_parent_data[i * 4 ..][0..4], .little);
+            if (p == ordinal) try list.append(allocator, i);
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     fn csrRange(self: *const Reader, offsets: []const u8, adjacency: []const u8, ordinal: u32) []align(1) const u32 {
@@ -922,11 +1002,11 @@ pub fn parseRawId(s: []const u8) !hprof.Id {
 // JSON output helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn writeId(writer: *Io.Writer, id: hprof.Id) !void {
+pub fn writeId(writer: *Io.Writer, id: hprof.Id) !void {
     try writer.print("\"0x{x:0>16}\"", .{id});
 }
 
-fn writeRawIdOrNull(writer: *Io.Writer, id: hprof.Id) !void {
+pub fn writeRawIdOrNull(writer: *Io.Writer, id: hprof.Id) !void {
     if (id == 0) {
         try writer.writeAll("null");
     } else {
@@ -934,7 +1014,7 @@ fn writeRawIdOrNull(writer: *Io.Writer, id: hprof.Id) !void {
     }
 }
 
-fn writeJsonString(writer: *Io.Writer, s: []const u8) !void {
+pub fn writeJsonString(writer: *Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| {
         switch (c) {
@@ -1134,7 +1214,7 @@ fn writeRefsHeader(writer: *Io.Writer, raw_id: hprof.Id, direction: []const u8) 
     try writer.print(",\"direction\":\"{s}\",\"items\":[", .{direction});
 }
 
-fn classNameForOrdinal(self: *const Reader, ordinal: u32) []const u8 {
+pub fn classNameForOrdinal(self: *const Reader, ordinal: u32) []const u8 {
     if (ordinal == self.virtual_root_ordinal) return "virtual root";
     const row = self.catalogRow(ordinal);
     return self.className(row.class_raw_id);
@@ -1390,6 +1470,134 @@ pub fn writeRoots(
         }
     }
 
+    try writer.writeAll("]}\n");
+}
+
+pub fn writeRetained(
+    self: *const Reader,
+    writer: *Io.Writer,
+    raw_id: hprof.Id,
+) !void {
+    if (!self.hasDominators()) return error.NoRetainedData;
+    const ordinal = self.ordinalForRawId(raw_id) orelse return error.ObjectNotFound;
+    const shallow = self.catalogRow(ordinal).shallow_size;
+    const retained = self.retainedSize(ordinal);
+    const delta = if (retained >= shallow) retained - shallow else 0;
+    const depth = self.domDepth(ordinal);
+
+    var dominated_count: u64 = 0;
+    if (self.dom_parent_data.len != 0) {
+        const V: u32 = @intCast(self.n_objects + 1);
+        var i: u32 = 0;
+        while (i < V) : (i += 1) {
+            const p = std.mem.readInt(u32, self.dom_parent_data[i * 4 ..][0..4], .little);
+            if (p == ordinal) dominated_count += 1;
+        }
+    }
+
+    const path = try self.domPath(self.allocator, ordinal, @intCast(self.n_objects + 1));
+    defer self.allocator.free(path);
+
+    try writer.writeAll("{");
+    try writer.writeAll("\"id\":");
+    try writeId(writer, raw_id);
+    try writer.print(",\"ordinal\":{d}", .{ordinal});
+    try writer.writeAll(",\"class\":");
+    try writeJsonString(writer, classNameForOrdinal(self, ordinal));
+    try writer.print(",\"shallow_bytes\":{d}", .{shallow});
+    try writer.print(",\"retained_bytes\":{d}", .{retained});
+    try writer.print(",\"retained_delta_bytes\":{d}", .{delta});
+    try writer.print(",\"dom_depth\":{d}", .{depth});
+    try writer.writeAll(",\"dominators\":[");
+    for (path, 0..) |ord, i| {
+        if (i > 0) try writer.writeByte(',');
+        const rid = if (ord < self.n_objects) self.rawIdForOrdinal(ord) orelse 0 else 0;
+        try writer.writeAll("{\"id\":");
+        try writeRawIdOrNull(writer, rid);
+        try writer.writeAll(",\"class\":");
+        try writeJsonString(writer, classNameForOrdinal(self, ord));
+        try writer.print(",\"retained_bytes\":{d}", .{self.retainedSize(ord)});
+        try writer.writeAll("}");
+    }
+    try writer.print("],\"dominated_objects\":{d},\"dominated_bytes\":{d}", .{ dominated_count, delta });
+    try writer.writeAll("}\n");
+}
+
+/// Emit the objects with the largest retained sizes using a bounded min-heap,
+/// sorted descending. Shared by the CLI `hunt retainers` command and the
+/// `top_retainers` MCP tool.
+pub fn writeRetainers(
+    self: *const Reader,
+    writer: *Io.Writer,
+    top: u32,
+) !void {
+    if (!self.hasDominators()) return error.NoRetainedData;
+
+    try writer.writeAll("{\"limit\":");
+    try writer.print("{d}", .{top});
+    try writer.writeAll(",\"items\":[");
+
+    if (top == 0 or self.n_objects == 0) {
+        try writer.writeAll("]}\n");
+        return;
+    }
+
+    const Item = struct { retained: u64, ordinal: u32 };
+    var heap = std.ArrayList(Item).empty;
+    defer heap.deinit(self.allocator);
+
+    var ord: u32 = 0;
+    while (ord < self.n_objects) : (ord += 1) {
+        if (self.dominatorOf(ord) == null) continue;
+        const r = self.retainedSize(ord);
+        if (heap.items.len < top) {
+            try heap.append(self.allocator, .{ .retained = r, .ordinal = ord });
+            var idx = heap.items.len - 1;
+            while (idx > 0) {
+                const parent = (idx - 1) / 2;
+                if (heap.items[parent].retained <= heap.items[idx].retained) break;
+                const tmp = heap.items[parent];
+                heap.items[parent] = heap.items[idx];
+                heap.items[idx] = tmp;
+                idx = parent;
+            }
+        } else if (r > heap.items[0].retained) {
+            heap.items[0] = .{ .retained = r, .ordinal = ord };
+            var idx: usize = 0;
+            while (true) {
+                const l = 2 * idx + 1;
+                const rr = 2 * idx + 2;
+                var smallest = idx;
+                if (l < heap.items.len and heap.items[l].retained < heap.items[smallest].retained) smallest = l;
+                if (rr < heap.items.len and heap.items[rr].retained < heap.items[smallest].retained) smallest = rr;
+                if (smallest == idx) break;
+                const tmp = heap.items[idx];
+                heap.items[idx] = heap.items[smallest];
+                heap.items[smallest] = tmp;
+                idx = smallest;
+            }
+        }
+    }
+
+    std.mem.sort(Item, heap.items, {}, struct {
+        fn less(_: void, a: Item, b: Item) bool {
+            if (a.retained != b.retained) return a.retained > b.retained;
+            return a.ordinal < b.ordinal;
+        }
+    }.less);
+
+    for (heap.items, 0..) |it, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        const raw_id = self.rawIdForOrdinal(it.ordinal) orelse 0;
+        const shallow = self.catalogRow(it.ordinal).shallow_size;
+        try writer.writeAll("{\"id\":");
+        try writeId(writer, raw_id);
+        try writer.print(",\"ordinal\":{d}", .{it.ordinal});
+        try writer.writeAll(",\"class\":");
+        try writeJsonString(writer, classNameForOrdinal(self, it.ordinal));
+        try writer.print(",\"shallow_bytes\":{d},\"retained_bytes\":{d}", .{ shallow, it.retained });
+        try writer.writeAll("}");
+    }
     try writer.writeAll("]}\n");
 }
 

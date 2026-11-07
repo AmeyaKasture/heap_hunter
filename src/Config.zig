@@ -36,7 +36,14 @@ pub const Config = struct {
     /// object catalog; it is not the total RSS of the process.
     @"sorting-budget-mb": ?u32 = null,
 
+    /// Default dominator budget in megabytes for the index command. This bounds
+    /// the working memory used to compute the dominator tree. Independent of
+    /// the sorting budget; raise it if dominator computation fails with
+    /// DominatorBudgetExceeded.
+    @"dominator-budget-mb": ?u32 = null,
+
     pub const default_sorting_budget_mb: u32 = 4096;
+    pub const default_dominator_budget_mb: u32 = 4096;
 
     pub fn indexDir(self: Config) ?[]const u8 {
         return self.@"index-dir";
@@ -44,6 +51,10 @@ pub const Config = struct {
 
     pub fn sortingBudgetMb(self: Config) u32 {
         return self.@"sorting-budget-mb" orelse default_sorting_budget_mb;
+    }
+
+    pub fn dominatorBudgetMb(self: Config) u32 {
+        return self.@"dominator-budget-mb" orelse default_dominator_budget_mb;
     }
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
@@ -80,7 +91,8 @@ pub const Config = struct {
     pub const sample_config_template =
         \\{
         \\  "index-dir": "/path/to/hunt/indexes",
-        \\  "sorting-budget-mb": 4096
+        \\  "sorting-budget-mb": 4096,
+        \\  "dominator-budget-mb": 4096
         \\}
         \\
         \\For index/overview commands, index-dir is used as a base directory:
@@ -139,6 +151,9 @@ pub const Config = struct {
         }
         if (parsed.value.@"sorting-budget-mb") |mb| {
             config.@"sorting-budget-mb" = mb;
+        }
+        if (parsed.value.@"dominator-budget-mb") |mb| {
+            config.@"dominator-budget-mb" = mb;
         }
         result.config = config;
         return result;
@@ -277,12 +292,13 @@ test "Config defaults" {
     const config: Config = .{};
     try std.testing.expect(config.indexDir() == null);
     try std.testing.expectEqual(@as(u32, 4096), config.sortingBudgetMb());
+    try std.testing.expectEqual(@as(u32, 4096), config.dominatorBudgetMb());
 }
 
 test "Config JSON parsing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const json = "{\"index-dir\": \"temp/\", \"sorting-budget-mb\": 2048}";
+    const json = "{\"index-dir\": \"temp/\", \"sorting-budget-mb\": 2048, \"dominator-budget-mb\": 1024}";
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -299,6 +315,29 @@ test "Config JSON parsing" {
 
     try std.testing.expectEqualStrings("temp/", config.indexDir().?);
     try std.testing.expectEqual(@as(u32, 2048), config.sortingBudgetMb());
+    try std.testing.expectEqual(@as(u32, 1024), config.dominatorBudgetMb());
+}
+
+test "Config dominator budget does not inherit sorting budget" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const json = "{\"sorting-budget-mb\": 512}";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    const config_path = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "config.json" });
+    defer allocator.free(config_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = json });
+
+    const config = try Config.load(allocator, io, config_path, null);
+    defer config.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 512), config.sortingBudgetMb());
+    try std.testing.expectEqual(@as(u32, 4096), config.dominatorBudgetMb());
 }
 
 test "Config load ignores unknown fields" {

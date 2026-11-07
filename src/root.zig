@@ -116,10 +116,16 @@ pub fn runCli(
         std.mem.eql(u8, command, "refs-from") or
         std.mem.eql(u8, command, "refs-to") or
         std.mem.eql(u8, command, "roots") or
-        std.mem.eql(u8, command, "tree"))
+        std.mem.eql(u8, command, "tree") or
+        std.mem.eql(u8, command, "retained"))
     {
         log.debug("dispatching to runQueryCommand ({s})", .{command});
         return runQueryCommand(allocator, io, command, shifted, stdout, stderr, config_load);
+    }
+
+    if (std.mem.eql(u8, command, "retainers")) {
+        log.debug("dispatching to runRetainersCommand", .{});
+        return runRetainersCommand(allocator, io, shifted, stdout, stderr, config_load);
     }
 
     const is_histogram = std.mem.eql(u8, command, "histogram");
@@ -420,10 +426,96 @@ fn runQueryCommand(
         try IndexReader.writeRoots(&reader, stdout, raw_id, roots_opts);
     } else if (std.mem.eql(u8, command, "tree")) {
         try IndexReader.writeTree(&reader, stdout, raw_id, tree_opts);
+    } else if (std.mem.eql(u8, command, "retained")) {
+        IndexReader.writeRetained(&reader, stdout, raw_id) catch |err| {
+            if (err == error.NoRetainedData) {
+                try Cli.printError(stderr, "this index has no retained-size data; rebuild with 'hunt index <dump.hprof>'", .{});
+            } else if (err == error.ObjectNotFound) {
+                try Cli.printError(stderr, "object id not found in index: {s}", .{id_str});
+            }
+            return @as(anyerror!void, err);
+        };
     } else {
         unreachable;
     }
 
+    try stdout.flush();
+}
+
+fn runRetainersCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    config_load: Config.LoadResult,
+) anyerror!void {
+    errdefer |err| {
+        log.traceError(err);
+    }
+
+    const usage = "hunt retainers [file.hprof] [options]";
+    var top: u32 = 10;
+    var index_dir_opt: ?[]const u8 = null;
+    var dump_path_opt: ?[]const u8 = null;
+    var source_override: ?[]const u8 = null;
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (Cli.isHelpFlag(arg)) {
+            try Cli.printCommandHelp(stdout, "retainers");
+            return;
+        } else if (std.mem.eql(u8, arg, "--index-dir")) {
+            const value = try Cli.expectNextArg(stderr, "retainers", usage, arg, args, i);
+            i += 1;
+            index_dir_opt = value;
+        } else if (std.mem.eql(u8, arg, "--source")) {
+            const value = try Cli.expectNextArg(stderr, "retainers", usage, arg, args, i);
+            i += 1;
+            source_override = value;
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            const value = try Cli.expectNextArg(stderr, "retainers", usage, arg, args, i);
+            i += 1;
+            top = try Cli.parseUnsigned(u32, stderr, "retainers", usage, arg, value);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try Cli.printUnknownOption(stderr, "retainers", usage, arg);
+            return error.InvalidArgument;
+        } else {
+            if (dump_path_opt == null) {
+                dump_path_opt = arg;
+            } else {
+                try Cli.printError(stderr, "multiple file arguments specified", .{});
+                return error.InvalidArgument;
+            }
+        }
+    }
+
+    var index_dir_owned = false;
+    const index_dir = (try Commands.resolveIndexDir(allocator, config_load, index_dir_opt, dump_path_opt, &index_dir_owned)) orelse {
+        try Cli.printMissingConfig(stderr, config_load.candidates_checked, config_load.explicit_path);
+        return error.InvalidArgument;
+    };
+    defer if (index_dir_owned) allocator.free(index_dir);
+
+    var progress = Progress.create(stderr, io, 1, false);
+    defer progress.stop(null);
+    progress.nextStep("loading index");
+
+    var reader = IndexReader.open(allocator, io, index_dir, source_override) catch |err| {
+        log.err("failed to open index: {s}", .{@errorName(err)});
+        try Cli.printError(stderr, "failed to open index: {s}", .{@errorName(err)});
+        return @as(anyerror!void, err);
+    };
+    progress.stop("index loaded");
+    defer reader.deinit();
+
+    if (!reader.hasDominators()) {
+        try Cli.printError(stderr, "this index has no retained-size data; rebuild with 'hunt index <dump.hprof>'", .{});
+        return error.NoRetainedData;
+    }
+
+    try IndexReader.writeRetainers(&reader, stdout, top);
     try stdout.flush();
 }
 

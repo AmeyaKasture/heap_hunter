@@ -15,6 +15,7 @@ const Layouts = @import("index/Layouts.zig");
 const EdgeEmitter = @import("index/EdgeEmitter.zig");
 const Join = @import("index/Join.zig");
 const Csr = @import("index/Csr.zig");
+const Dominator = @import("index/Dominator.zig");
 const Validate = @import("index/Validate.zig");
 const Publish = @import("index/Publish.zig");
 const Manifest = @import("index/Manifest.zig");
@@ -24,6 +25,8 @@ pub const IndexOptions = struct {
     hprof_path: []const u8,
     index_dir: ?[]const u8 = null,
     sorting_budget_mb: ?u32 = null,
+    dominator_budget_mb: ?u32 = null,
+    compute_dominators: bool = true,
     force: bool = false,
     no_progress: bool = false,
 };
@@ -55,6 +58,8 @@ pub fn runIndexCommand(
     const path = options.hprof_path;
     const index_dir_opt = options.index_dir;
     const sorting_budget_mb = options.sorting_budget_mb orelse config.sortingBudgetMb();
+    const dominator_budget_mb = options.dominator_budget_mb orelse config.dominatorBudgetMb();
+    const compute_dominators = options.compute_dominators;
     const force = options.force;
     const no_progress = options.no_progress;
 
@@ -78,6 +83,7 @@ pub fn runIndexCommand(
     log.debug("running preflight", .{});
     const preflight_result = try Preflight.run(allocator, io, path, index_dir, .{
         .sorting_budget_mb = sorting_budget_mb,
+        .dominator_budget_mb = dominator_budget_mb,
         .force = force,
     }, stderr);
 
@@ -86,7 +92,7 @@ pub fn runIndexCommand(
     try jsonEscapeString(&escaped_index_dir_buf.writer, index_dir);
     const escaped_index_dir = escaped_index_dir_buf.writer.buffer[0..escaped_index_dir_buf.writer.end];
 
-    var progress = Progress.createEx(stderr, io, 9, no_progress, on_progress, on_progress_ctx);
+    var progress = Progress.createEx(stderr, io, if (compute_dominators) @as(u32, 10) else @as(u32, 9), no_progress, on_progress, on_progress_ctx);
     defer progress.stop(null);
 
     switch (preflight_result) {
@@ -211,6 +217,35 @@ pub fn runIndexCommand(
             const n_roots = csr_result.n_roots;
             const virtual_root_ordinal = n_objects;
 
+            var dominator_n_reachable: u64 = 0;
+            var dominator_total_retained: u64 = 0;
+            if (compute_dominators) {
+                progress.nextStep("computing dominators");
+                log.debug("stage: computing dominators", .{});
+                var dominator_result = stageTimed(io, "dominators", &elapsed, Dominator.run(
+                    allocator,
+                    io,
+                    job,
+                    csr_result.out_offsets_path,
+                    csr_result.out_targets_path,
+                    csr_result.in_offsets_path,
+                    csr_result.in_sources_path,
+                    catalog_result.catalog_path,
+                    catalog_result.n_objects,
+                    join_result.n_edges,
+                    &scan_result.diagnostics,
+                ) catch |err| {
+                    if (err == error.DominatorBudgetExceeded) {
+                        try Cli.printError(stderr, "dominator computation needs more memory than the budget allows; raise with --dominator-budget-mb or disable with --no-dominators", .{});
+                    }
+                    return @as(anyerror!void, err);
+                });
+                defer dominator_result.deinit(allocator);
+                log.debug("stage: dominators complete, n_reachable={d}", .{dominator_result.n_reachable});
+                dominator_n_reachable = dominator_result.n_reachable;
+                dominator_total_retained = dominator_result.total_retained_bytes;
+            }
+
             progress.nextStep("validating index");
             log.debug("stage: validating index", .{});
             stageTimed(io, "validate", &elapsed, try Validate.validate(
@@ -231,6 +266,9 @@ pub fn runIndexCommand(
                 .n_objects = n_objects,
                 .n_edges = n_edges,
                 .virtual_root_ordinal = @intCast(virtual_root_ordinal),
+                .has_dominators = compute_dominators,
+                .n_dominator_nodes = dominator_n_reachable,
+                .retained_total_bytes = dominator_total_retained,
                 .diagnostics = scan_result.diagnostics,
                 .source_path = try allocator.dupe(u8, path),
             };
@@ -250,7 +288,7 @@ pub fn runIndexCommand(
 
             progress.stop("index complete");
             log.debug("index complete: n_objects={d}, n_classes={d}, n_edges={d}, n_roots={d}", .{ n_objects, n_classes, n_edges, n_roots });
-            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
+            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
                 escaped_index_dir,
                 n_objects,
                 n_classes,
@@ -266,12 +304,14 @@ pub fn runIndexCommand(
                 scan_result.diagnostics.unknown_root_kind,
                 scan_result.diagnostics.missing_layout,
                 scan_result.diagnostics.dangling_root_targets,
+                scan_result.diagnostics.unreachable_objects,
                 elapsed.scan,
                 elapsed.sort_catalog,
                 elapsed.layouts,
                 elapsed.emit_edges,
                 elapsed.join,
                 elapsed.csr,
+                elapsed.dominators,
                 elapsed.validate,
                 elapsed.publish,
                 publish_result.index_bytes,
@@ -411,6 +451,8 @@ pub fn parseIndexArgs(
     var path_opt: ?[]const u8 = null;
     var index_dir_opt: ?[]const u8 = null;
     var sorting_budget_mb: ?u32 = null;
+    var dominator_budget_mb: ?u32 = null;
+    var compute_dominators = true;
     var force = false;
     var no_progress = false;
 
@@ -428,6 +470,12 @@ pub fn parseIndexArgs(
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
             sorting_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--dominator-budget-mb")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            dominator_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--no-dominators")) {
+            compute_dominators = false;
         } else if (std.mem.eql(u8, arg, "--force")) {
             force = true;
         } else if (std.mem.eql(u8, arg, "--no-progress")) {
@@ -453,6 +501,8 @@ pub fn parseIndexArgs(
         .hprof_path = path,
         .index_dir = index_dir_opt,
         .sorting_budget_mb = sorting_budget_mb,
+        .dominator_budget_mb = dominator_budget_mb,
+        .compute_dominators = compute_dominators,
         .force = force,
         .no_progress = no_progress,
     };
@@ -551,7 +601,7 @@ fn deleteOldStagingDirs(
     index_dir: []const u8,
     stderr: *Io.Writer,
 ) void {
-    var dir = Io.Dir.cwd().openDir(io, index_dir, .{}) catch return;
+    var dir = Io.Dir.cwd().openDir(io, index_dir, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
     var iter = dir.iterate();
@@ -578,6 +628,7 @@ const StageTimings = struct {
     emit_edges: i64 = 0,
     join: i64 = 0,
     csr: i64 = 0,
+    dominators: i64 = 0,
     validate: i64 = 0,
     publish: i64 = 0,
 };
