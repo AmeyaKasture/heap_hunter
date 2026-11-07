@@ -26,7 +26,7 @@ test "buildIndex finds heap-derived threads in real Java 21 dump" {
     // leak-detecting allocation in unit tests, but use the page allocator here
     // so this end-to-end test remains practical in the default test suite.
     const allocator = std.heap.page_allocator;
-    var index = try loadIndex(allocator, "test_hprofs/heapforge.hprof");
+    var index = try loadIndex(allocator, "fixtures/heapforge.hprof");
     defer index.deinit();
 
     try std.testing.expectEqual(@as(u32, 6), index.threadCount());
@@ -49,7 +49,7 @@ test "buildIndex finds heap-derived threads in real Java 21 dump" {
 
 test "heapforge_threads fixture is parsed and printed exactly" {
     const allocator = std.heap.page_allocator;
-    var index = try loadIndex(allocator, "test_hprofs/heapforge_threads.hprof");
+    var index = try loadIndex(allocator, "fixtures/heapforge_threads.hprof");
     defer index.deinit();
 
     try std.testing.expectEqual(@as(u32, 18), index.threadCount());

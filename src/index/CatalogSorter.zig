@@ -373,9 +373,9 @@ test "fixture catalog count stable after sort and dedupe" {
     const io = std.testing.io;
 
     const fixtures = .{
-        "test_hprofs/heapforge.hprof",
-        "test_hprofs/heapforge_classloaders.hprof",
-        "test_hprofs/heapforge_threads.hprof",
+        "fixtures/heapforge.hprof",
+        "fixtures/heapforge_classloaders.hprof",
+        "fixtures/heapforge_threads.hprof",
     };
 
     inline for (fixtures) |fixture_path| {
