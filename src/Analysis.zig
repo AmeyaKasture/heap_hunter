@@ -3,7 +3,6 @@ const std = @import("std");
 const hprof = @import("hprof.zig");
 const Regex = @import("Regex.zig");
 const IndexTypes = @import("IndexTypes.zig");
-const Threads = @import("Threads.zig");
 
 pub const ClassInfo = IndexTypes.ClassInfo;
 pub const LoadClassEntry = IndexTypes.LoadClassEntry;
@@ -25,8 +24,8 @@ pub const Index = struct {
     classes: std.AutoHashMap(hprof.Id, IndexTypes.ClassInfo),
     // class serial -> load class entry.
     loaded: std.AutoHashMap(u32, IndexTypes.LoadClassEntry),
-    // Heap-derived threads.
-    thread_index: Threads.ThreadIndex,
+    // Unique thread-object roots (for thread count only).
+    thread_roots: std.AutoHashMap(hprof.Id, void),
     // class object id -> aggregate histogram.
     histogram: std.AutoHashMap(hprof.Id, HistogramEntry),
     // primitive type -> aggregate histogram for primitive arrays.
@@ -50,7 +49,7 @@ pub const Index = struct {
             .class_names = std.AutoHashMap(hprof.Id, hprof.Id).init(allocator),
             .classes = std.AutoHashMap(hprof.Id, IndexTypes.ClassInfo).init(allocator),
             .loaded = std.AutoHashMap(u32, IndexTypes.LoadClassEntry).init(allocator),
-            .thread_index = Threads.ThreadIndex.init(allocator, id_size),
+            .thread_roots = std.AutoHashMap(hprof.Id, void).init(allocator),
             .histogram = std.AutoHashMap(hprof.Id, HistogramEntry).init(allocator),
             .prim_histogram = std.AutoHashMap(hprof.PrimitiveType, HistogramEntry).init(allocator),
             .classloaders = std.AutoHashMap(hprof.Id, void).init(allocator),
@@ -71,7 +70,7 @@ pub const Index = struct {
         self.class_names.deinit();
         self.classes.deinit();
         self.loaded.deinit();
-        self.thread_index.deinit();
+        self.thread_roots.deinit();
         self.histogram.deinit();
         self.prim_histogram.deinit();
         self.classloaders.deinit();
@@ -107,12 +106,8 @@ pub const Index = struct {
                     _ = self.class_names.remove(kv.value.class_id);
                 }
             },
-            .frame => |frame| {
-                try self.thread_index.addFrame(frame);
-            },
-            .trace => |trace| {
-                try self.thread_index.addTrace(trace);
-            },
+            .frame => {},
+            .trace => {},
             .start_thread => {},
             .heap_dump => |heap_reader| {
                 var hr = heap_reader;
@@ -172,7 +167,6 @@ pub const Index = struct {
                 try self.addHistogram(id.class_id, 1, size);
                 self.total_objects += 1;
                 self.total_heap_bytes += size;
-                try self.thread_index.addInstance(id, self.threadContext());
                 if (self.isClassLoader(id.class_id)) {
                     self.total_classloaders += 1;
                 }
@@ -190,26 +184,12 @@ pub const Index = struct {
                 self.total_objects += 1;
                 self.total_arrays += 1;
                 self.total_heap_bytes += size;
-                if (pa.element_type == .char or pa.element_type == .byte) {
-                    try self.thread_index.addPrimArray(pa);
-                }
             },
             .gc_root_thread_object => |root| {
-                try self.thread_index.addRoot(root.thread_object_id, root.thread_serial, root.stack_trace_serial);
+                try self.thread_roots.put(root.thread_object_id, {});
             },
             else => {},
         }
-    }
-
-    pub fn threadContext(self: *const Index) Threads.Context {
-        return .{
-            .allocator = self.allocator,
-            .id_size = self.id_size,
-            .utf8 = &self.utf8,
-            .class_names = &self.class_names,
-            .classes = &self.classes,
-            .loaded = &self.loaded,
-        };
     }
 
     fn addHistogram(self: *Index, class_id: hprof.Id, count: u64, bytes: u64) !void {
@@ -237,7 +217,7 @@ pub const Index = struct {
     }
 
     pub fn threadCount(self: *const Index) u32 {
-        return self.thread_index.threadCount();
+        return @intCast(self.thread_roots.count());
     }
 
     pub fn classloaderCount(self: *const Index) u32 {
@@ -265,7 +245,6 @@ pub fn buildIndex(allocator: std.mem.Allocator, reader: *hprof.Reader) !Index {
     while (try reader.next()) |record| {
         try index.addTopLevelRecord(record);
     }
-    try index.thread_index.finish();
     return index;
 }
 
@@ -491,10 +470,6 @@ fn classItemMatches(name: []const u8, instance_size: u64, options: ClassOptions)
         if (Regex.matches(pattern, name)) return false;
     }
     return true;
-}
-
-pub fn printThreads(index: *const Index, writer: anytype) !void {
-    try index.thread_index.print(writer, index.threadContext());
 }
 
 fn decodeDescriptor(allocator: std.mem.Allocator, descriptor: []const u8) std.mem.Allocator.Error![]const u8 {
@@ -812,7 +787,6 @@ fn makeTestIndex(allocator: std.mem.Allocator) !Index {
         .bytes = "xxxxxxxxxxxxxxxxxxxx",
     } });
 
-    try index.thread_index.finish();
     return index;
 }
 
@@ -928,23 +902,6 @@ test "classes filters rows before sorting and limiting" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\njava.lang.Object,") == null);
 }
 
-test "threads prints heap-derived thread details" {
-    const allocator = std.testing.allocator;
-    var index = try makeTestIndex(allocator);
-    defer index.deinit();
-
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-
-    try printThreads(&index, &buf);
-    const output = buf.items;
-
-    try std.testing.expect(std.mem.indexOf(u8, output, "Thread: main") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "State:    RUNNABLE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Priority: 5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Daemon:   false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "TID:      42") != null);
-}
 
 test "buildIndex scans a synthetic HPROF file" {
     const allocator = std.testing.allocator;
