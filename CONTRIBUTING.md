@@ -42,7 +42,7 @@ src/
   hprof/                HPROF binary format parser
   index/                Persistent heap-graph index (scan, sort, join, query)
   tests/                Synthetic HPROF builder and integration tests
-test_hprofs/            (gitignored) sample HPROFs used by the test suite
+fixtures/               (tracked) sample HPROFs used by the test suite
 ```
 
 ## Testing
@@ -54,9 +54,9 @@ zig build test
 The test suite is mostly self-contained: it builds synthetic HPROF dumps in
 memory and exercises the full index → overview → query pipeline. A handful of
 tests in `src/index/` and `src/tests/integration.zig` additionally read real
-HPROF dumps from the `test_hprofs/` directory. The directory is gitignored;
-if you want to run those particular tests, drop the sample HPROFs there
-before running `zig build test`.
+HPROF dumps from the `fixtures/` directory. The directory is tracked
+and the sample HPROFs are committed there, so those tests run out of the
+box with `zig build test`.
 
 ## Pull requests
 
