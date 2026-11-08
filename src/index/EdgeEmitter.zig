@@ -71,7 +71,7 @@ pub fn run(
     const dir = Io.Dir.cwd();
     var edges_file = try dir.createFile(io, edges_path, .{});
     defer edges_file.close(io);
-    var edges_buf: [65536]u8 = undefined;
+    var edges_buf: [262144]u8 = undefined;
     var edges_file_writer: Io.File.Writer = .init(edges_file, io, &edges_buf);
     const edges_writer = &edges_file_writer.interface;
 

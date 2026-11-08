@@ -60,6 +60,8 @@ pub fn isUserError(err: anyerror) bool {
         err == error.IsDir or
         err == error.AccessDenied or
         err == error.TooManyObjects or
+        err == error.DominatorBudgetExceeded or
+        err == error.DominatorDidNotConverge or
         err == error.SourceFingerprintMismatch or
         err == error.CacheMissing or
         err == error.CacheCorrupt or
@@ -581,7 +583,7 @@ pub const commands = [_]Command{
             .{ .code = 0, .description = "Retainers printed." },
             .{ .code = 1, .description = "Invalid argument or missing index." },
         },
-        .see_also = &.{ "retained" },
+        .see_also = &.{"retained"},
     },
 };
 

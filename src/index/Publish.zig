@@ -216,7 +216,7 @@ fn createSyntheticFile(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     try writer.interface.writeAll(data);
     try writer.flush();

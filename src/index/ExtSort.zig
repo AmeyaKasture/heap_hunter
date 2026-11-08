@@ -133,7 +133,7 @@ fn sortInMemory(
 
     var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
     defer out_file.close(io);
-    var out_buf: [65536]u8 = undefined;
+    var out_buf: [262144]u8 = undefined;
     var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
     const out = &out_writer.interface;
 
@@ -164,12 +164,9 @@ fn generateRuns(
     comptime lessThan: fn (@TypeOf(context), []const u8, []const u8) bool,
 ) ![]const []const u8 {
     const n_records = input.len / record_size;
-    if (n_records == 0) {
-        return &[_][]const u8{};
-    }
+    if (n_records == 0) return &[_][]const u8{};
 
-    // Account for the index array overhead so a chunk stays roughly within
-    // the requested memory budget.
+    // Account for index array overhead; keep per-chunk working set within budget.
     const chunk_records = @max(budget_bytes / (record_size + @sizeOf(usize)), 1);
     const chunk_bytes = chunk_records * record_size;
     const n_runs = (n_records + chunk_records - 1) / chunk_records;
@@ -186,44 +183,123 @@ fn generateRuns(
         allocator.free(runs);
     }
 
-    const indices = try allocator.alloc(usize, chunk_records);
-    defer allocator.free(indices);
+    // Precompute run paths in deterministic order.
+    for (0..n_runs) |run_idx| {
+        runs[run_idx] = try std.fmt.allocPrint(allocator, "{s}/run-{d}", .{ staging_dir, run_idx });
+    }
+
+    const cpu = std.Thread.getCpuCount() catch 1;
+    const per_chunk_mem: usize = chunk_records * @sizeOf(usize) + 64 * 1024;
+    const mem_parallel = @max(@as(usize, 1), if (budget_bytes > 0) budget_bytes / @max(per_chunk_mem, 1) else 1);
+    const max_parallel: usize = @max(@as(usize, 1), @min(@min(cpu, 8), @min(mem_parallel, n_runs)));
 
     const C = @TypeOf(context);
     const Less = SortContext(C, lessThan);
 
-    var offset: usize = 0;
-    var run_idx: usize = 0;
-    while (offset < input.len) : (run_idx += 1) {
-        const end = @min(offset + chunk_bytes, input.len);
-        const chunk = input[offset..end];
-        const chunk_n = chunk.len / record_size;
+    if (max_parallel <= 1 or n_runs <= 1) {
+        const indices = try allocator.alloc(usize, chunk_records);
+        defer allocator.free(indices);
+        var offset: usize = 0;
+        var run_idx: usize = 0;
+        while (offset < input.len) : (run_idx += 1) {
+            const end = @min(offset + chunk_bytes, input.len);
+            const chunk = input[offset..end];
+            const chunk_n = chunk.len / record_size;
+            for (0..chunk_n) |i| indices[i] = i;
+            const ctx = Less{ .buf = chunk, .record_size = record_size, .context = context };
+            std.mem.sort(usize, indices[0..chunk_n], ctx, Less.less);
 
-        for (0..chunk_n) |i| indices[i] = i;
-
-        const ctx = Less{
-            .buf = chunk,
-            .record_size = record_size,
-            .context = context,
-        };
-        std.mem.sort(usize, indices[0..chunk_n], ctx, Less.less);
-
-        const run_path = try std.fmt.allocPrint(allocator, "{s}/run-{d}", .{ staging_dir, run_idx });
-        runs[run_idx] = run_path;
-
-        var out_file = try Io.Dir.cwd().createFile(io, run_path, .{});
-        defer out_file.close(io);
-        var out_buf: [65536]u8 = undefined;
-        var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
-        const out = &out_writer.interface;
-
-        for (0..chunk_n) |i| {
-            const rec_idx = indices[i];
-            try out.writeAll(chunk[rec_idx * record_size ..][0..record_size]);
+            var out_file = try Io.Dir.cwd().createFile(io, runs[run_idx], .{});
+            defer out_file.close(io);
+            var out_buf: [262144]u8 = undefined;
+            var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
+            const out = &out_writer.interface;
+            for (0..chunk_n) |i| {
+                const rec_idx = indices[i];
+                try out.writeAll(chunk[rec_idx * record_size ..][0..record_size]);
+            }
+            try out_writer.flush();
+            offset = end;
         }
-        try out_writer.flush();
+        return runs;
+    }
 
-        offset = end;
+    const WorkerCtx = struct {
+        io: Io,
+        input: []const u8,
+        run_path: []const u8,
+        record_size: usize,
+        offset: usize,
+        end: usize,
+        context: C,
+        err: ?anyerror = null,
+    };
+
+    const workerFn = struct {
+        fn run(w: *WorkerCtx) void {
+            runImpl(w) catch |e| {
+                w.err = e;
+            };
+        }
+        fn runImpl(w: *WorkerCtx) !void {
+            const chunk = w.input[w.offset..w.end];
+            const chunk_n = chunk.len / w.record_size;
+            const alloc = std.heap.page_allocator;
+            const indices = try alloc.alloc(usize, chunk_n);
+            defer alloc.free(indices);
+            for (0..chunk_n) |i| indices[i] = i;
+            const ctx = Less{ .buf = chunk, .record_size = w.record_size, .context = w.context };
+            std.mem.sort(usize, indices[0..chunk_n], ctx, Less.less);
+
+            var out_file = try Io.Dir.cwd().createFile(w.io, w.run_path, .{ .truncate = true });
+            defer out_file.close(w.io);
+            var out_buf: [262144]u8 = undefined;
+            var out_writer: Io.File.Writer = .init(out_file, w.io, &out_buf);
+            const out = &out_writer.interface;
+            for (0..chunk_n) |i| {
+                const rec_idx = indices[i];
+                try out.writeAll(chunk[rec_idx * w.record_size ..][0..w.record_size]);
+            }
+            try out_writer.flush();
+        }
+    }.run;
+
+    var next_run: usize = 0;
+    while (next_run < n_runs) {
+        const batch_n = @min(max_parallel, n_runs - next_run);
+        const workers = try allocator.alloc(WorkerCtx, batch_n);
+        defer allocator.free(workers);
+        const threads = try allocator.alloc(std.Thread, batch_n);
+        defer allocator.free(threads);
+        var spawned: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < spawned) : (j += 1) threads[j].join();
+        }
+
+        var bi: usize = 0;
+        while (bi < batch_n) : (bi += 1) {
+            const run_idx = next_run + bi;
+            const offset = run_idx * chunk_bytes;
+            const end = @min(offset + chunk_bytes, input.len);
+            workers[bi] = .{
+                .io = io,
+                .input = input,
+                .run_path = runs[run_idx],
+                .record_size = record_size,
+                .offset = offset,
+                .end = end,
+                .context = context,
+            };
+            threads[bi] = try std.Thread.spawn(.{}, workerFn, .{&workers[bi]});
+            spawned += 1;
+        }
+        var j: usize = 0;
+        while (j < spawned) : (j += 1) threads[j].join();
+        for (workers[0..batch_n]) |*w| {
+            if (w.err) |e| return e;
+        }
+        next_run += batch_n;
     }
 
     return runs;
@@ -373,11 +449,9 @@ fn mergeRunGroup(
         runs[i] = .{ .data = mmaps[i].memory, .cursor = 0 };
     }
 
-
-
     var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
     defer out_file.close(io);
-    var out_buf: [65536]u8 = undefined;
+    var out_buf: [262144]u8 = undefined;
     var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
     const out = &out_writer.interface;
 
@@ -741,7 +815,6 @@ test "external sort removes multi-pass merge intermediates" {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming merge implementation (memory-bounded alternative to mergeRuns)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -749,10 +822,45 @@ test "external sort removes multi-pass merge intermediates" {
 /// Per-run state used by the streaming merger.
 const StreamingRun = struct {
     file: Io.File,
-    /// Current byte offset into the run file (advances by record_size each pop).
-    offset: u64,
-    /// Heap-owned buffer holding the current record for this run.
-    buf: []u8,
+    reader_buf: []u8,
+    reader: Io.File.Reader,
+    current: []u8,
+    exhausted: bool = false,
+
+    fn init(allocator: std.mem.Allocator, io: Io, path: []const u8, record_size: usize) !StreamingRun {
+        const buf_size: usize = @max(record_size * 256, 64 * 1024);
+        const reader_buf = try allocator.alloc(u8, buf_size);
+        errdefer allocator.free(reader_buf);
+        const current = try allocator.alloc(u8, record_size);
+        errdefer allocator.free(current);
+        var sr: StreamingRun = .{
+            .file = undefined,
+            .reader_buf = reader_buf,
+            .reader = undefined,
+            .current = current,
+        };
+        sr.file = try Io.Dir.cwd().openFile(io, path, .{});
+        sr.reader = .init(sr.file, io, sr.reader_buf);
+        return sr;
+    }
+
+    fn deinit(self: *StreamingRun, io: Io, allocator: std.mem.Allocator) void {
+        self.file.close(io);
+        allocator.free(self.reader_buf);
+        allocator.free(self.current);
+    }
+
+    fn readNext(self: *StreamingRun, record_size: usize) !bool {
+        if (self.exhausted) return false;
+        const n = self.reader.interface.readSliceShort(self.current[0..record_size]) catch |err| switch (err) {
+            error.ReadFailed => return self.reader.err orelse error.ReadFailed,
+        };
+        if (n != record_size) {
+            self.exhausted = true;
+            return false;
+        }
+        return true;
+    }
 };
 
 fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []const u8) bool) type {
@@ -761,19 +869,12 @@ fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []cons
         context: C,
 
         pub fn less(self: @This(), a: usize, b: usize) bool {
-            return lt(self.context, self.runs[a].buf, self.runs[b].buf);
+            return lt(self.context, self.runs[a].current, self.runs[b].current);
         }
     };
 }
 
-/// Memory-bounded merge of a group of run files.
-///
-/// Instead of memory-mapping every file, each run is read one record at a time
-/// using positional reads.  The total heap-allocated record storage is:
-///
-///   `run_paths.len × record_size`
-///
-/// which is always bounded by `fanout × record_size` ≤ `budget_bytes`.
+/// Memory-bounded merge of a group of run files using buffered sequential reads.
 fn mergeRunGroupStreaming(
     io: Io,
     allocator: std.mem.Allocator,
@@ -791,23 +892,25 @@ fn mergeRunGroupStreaming(
 
     const sr = try allocator.alloc(StreamingRun, run_paths.len);
     var sr_open: usize = 0;
+    errdefer {
+        var k: usize = 0;
+        while (k < sr_open) : (k += 1) sr[k].deinit(io, allocator);
+        allocator.free(sr);
+    }
     defer {
-        for (sr[0..sr_open]) |*r| r.file.close(io);
-        for (sr) |r| allocator.free(r.buf);
+        var k: usize = 0;
+        while (k < sr_open) : (k += 1) sr[k].deinit(io, allocator);
         allocator.free(sr);
     }
 
-    // Open each run and eagerly read its first record.
     for (run_paths, 0..) |path, i| {
-        const buf = try allocator.alloc(u8, record_size);
-        sr[i] = .{ .file = undefined, .offset = 0, .buf = buf };
-        sr[i].file = try Io.Dir.cwd().openFile(io, path, .{});
+        sr[i] = try StreamingRun.init(allocator, io, path, record_size);
         sr_open += 1;
     }
 
     var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
     defer out_file.close(io);
-    var out_buf: [65536]u8 = undefined;
+    var out_buf: [262144]u8 = undefined;
     var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
     const out = &out_writer.interface;
 
@@ -817,27 +920,15 @@ fn mergeRunGroupStreaming(
     var heap = BinaryHeap(usize, Ctx, Ctx.less).init(allocator, heap_ctx);
     defer heap.deinit(allocator);
 
-    // Prime the heap: push runs that have at least one record.
     for (sr, 0..) |*r, i| {
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
-            try heap.add(allocator, i);
-        }
-        // If n < record_size the run file is empty – leave it out of the heap.
+        if (try r.readNext(record_size)) try heap.add(allocator, i);
     }
 
     while (heap.len() > 0) {
         const idx = heap.removeMin();
         const r = &sr[idx];
-        try out.writeAll(r.buf);
-        // Advance and attempt to read the next record.
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
-            try heap.add(allocator, idx);
-        }
-        // Otherwise this run is exhausted – leave it out of the heap.
+        try out.writeAll(r.current);
+        if (try r.readNext(record_size)) try heap.add(allocator, idx);
     }
 
     try out_writer.flush();
@@ -1062,17 +1153,17 @@ test "streaming sort: property test" {
     const io = std.testing.io;
 
     const cases = .{
-        .{ .rs = 8, .count = 0,   .budget = 1024, .fanout = 64, .fo = null },
-        .{ .rs = 8, .count = 1,   .budget = 1024, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 0, .budget = 1024, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 1, .budget = 1024, .fanout = 64, .fo = null },
         .{ .rs = 8, .count = 100, .budget = 4096, .fanout = 64, .fo = null },
         .{ .rs = 16, .count = 500, .budget = 4096, .fanout = 64, .fo = null },
         .{ .rs = 32, .count = 200, .budget = 1024, .fanout = 64, .fo = null },
         // Small budget forces many runs with a tiny fanout derived automatically.
-        .{ .rs = 5,  .count = 100, .budget = 12,   .fanout = 64, .fo = null },
-        .{ .rs = 8,  .count = 400, .budget = 1600, .fanout = 64, .fo = null },
-        .{ .rs = 8,  .count = 401, .budget = 1600, .fanout = 64, .fo = null },
+        .{ .rs = 5, .count = 100, .budget = 12, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 400, .budget = 1600, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 401, .budget = 1600, .fanout = 64, .fo = null },
         // Explicit fanout = 2 forces multi-pass merge.
-        .{ .rs = 8,  .count = 100, .budget = 80,   .fanout = 2,  .fo = @as(?usize, 2) },
+        .{ .rs = 8, .count = 100, .budget = 80, .fanout = 2, .fo = @as(?usize, 2) },
     };
 
     inline for (cases) |c| {

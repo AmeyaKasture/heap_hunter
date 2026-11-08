@@ -154,7 +154,7 @@ fn writeCsrWithExtractor(
     // Prepare the adjacency output file with a larger stack buffer.
     var adj_file = try dir.createFile(io, adj_path, .{});
     defer adj_file.close(io);
-    var adj_buf: [65536]u8 = undefined;
+    var adj_buf: [262144]u8 = undefined;
     var adj_writer: Io.File.Writer = .init(adj_file, io, &adj_buf);
     const adj_out = &adj_writer.interface;
 
@@ -369,7 +369,7 @@ fn resolveRoots(
     // Prepare the resolved roots output file.
     var roots_bin_file = try dir.createFile(io, roots_path, .{});
     defer roots_bin_file.close(io);
-    var roots_buf: [65536]u8 = undefined;
+    var roots_buf: [262144]u8 = undefined;
     var roots_writer: Io.File.Writer = .init(roots_bin_file, io, &roots_buf);
     const roots_out = &roots_writer.interface;
 
@@ -465,7 +465,7 @@ fn createSyntheticResolvedFile(
     const dir = Io.Dir.cwd();
     var file = try dir.createFile(io, path, .{});
     defer file.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(file, io, &buf);
     for (edges) |edge| {
         try Join.writeResolvedRecord(&writer.interface, edge);
@@ -488,7 +488,7 @@ fn createSyntheticCatalog(
     const dir = Io.Dir.cwd();
     var file = try dir.createFile(io, path, .{});
     defer file.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(file, io, &buf);
     for (raw_ids) |id| {
         try Scanner.writeCatalogRow(&writer.interface, .{
@@ -517,7 +517,7 @@ fn createSyntheticRootsRaw(
     const dir = Io.Dir.cwd();
     var file = try dir.createFile(io, path, .{});
     defer file.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(file, io, &buf);
     for (roots) |root| {
         try Scanner.writeRootRecord(&writer.interface, root);

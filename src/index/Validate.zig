@@ -694,7 +694,7 @@ fn createSyntheticCatalog(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     for (rows) |row| {
         try Scanner.writeCatalogRow(&writer.interface, row);
@@ -715,7 +715,7 @@ fn createSyntheticOffsets(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     for (offsets) |off| {
         var bytes: [8]u8 = undefined;
@@ -738,7 +738,7 @@ fn createSyntheticAdjacency(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     for (values) |v| {
         var bytes: [4]u8 = undefined;
@@ -767,7 +767,7 @@ fn createSyntheticRoots(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     for (roots) |r| {
         try Csr.writeRootRecord(&writer.interface, .{
@@ -799,7 +799,7 @@ fn createSyntheticClasses(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     for (classes) |c| {
         var header: [24]u8 = undefined;
@@ -827,7 +827,7 @@ fn createSyntheticFields(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
 
     var i: u64 = 0;
@@ -851,7 +851,7 @@ fn createSyntheticPrimHistogram(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, 0, .little);
@@ -875,7 +875,7 @@ fn createSyntheticThreadTraces(
 
     const f = try Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
-    var buf: [65536]u8 = undefined;
+    var buf: [262144]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
     try writer.interface.writeAll(data);
     try writer.flush();

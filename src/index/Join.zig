@@ -492,7 +492,7 @@ fn resolveSourcesMapped(
     // Prepare the output file with a 64 KiB stack buffer.
     var out_file = try dir.createFile(io, output_path, .{});
     defer out_file.close(io);
-    var out_buf: [65536]u8 = undefined;
+    var out_buf: [262144]u8 = undefined;
     var out_file_writer: Io.File.Writer = .init(out_file, io, &out_buf);
     const out_writer = &out_file_writer.interface;
 
@@ -612,7 +612,7 @@ fn resolveTargetsMapped(
     // Prepare the output file.
     var out_file = try dir.createFile(io, output_path, .{});
     defer out_file.close(io);
-    var out_buf: [65536]u8 = undefined;
+    var out_buf: [262144]u8 = undefined;
     var out_file_writer: Io.File.Writer = .init(out_file, io, &out_buf);
     const out_writer = &out_file_writer.interface;
 
@@ -701,7 +701,7 @@ fn createSyntheticFiles(
     // Write catalog rows in the order provided; tests supply them sorted.
     var catalog_file = try dir.createFile(io_arg, catalog_path, .{});
     defer catalog_file.close(io_arg);
-    var catalog_buf: [65536]u8 = undefined;
+    var catalog_buf: [262144]u8 = undefined;
     var catalog_writer: Io.File.Writer = .init(catalog_file, io_arg, &catalog_buf);
     for (catalog_rows) |row| {
         try Scanner.writeCatalogRow(&catalog_writer.interface, row);
@@ -711,7 +711,7 @@ fn createSyntheticFiles(
     // Write raw edge records.
     var edges_file = try dir.createFile(io_arg, edges_path, .{});
     defer edges_file.close(io_arg);
-    var edges_buf: [65536]u8 = undefined;
+    var edges_buf: [262144]u8 = undefined;
     var edges_writer: Io.File.Writer = .init(edges_file, io_arg, &edges_buf);
     for (edges) |edge| {
         try EdgeEmitter.writeEdgeRecord(&edges_writer.interface, edge);
@@ -762,7 +762,6 @@ test "Stage 5 worked example verbatim" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
     defer result.deinit(allocator);
@@ -804,7 +803,6 @@ test "virtual root edge resolves to virtual root ordinal" {
 
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
-
 
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
@@ -848,7 +846,6 @@ test "dangling source is dropped and counted" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
     defer result.deinit(allocator);
@@ -891,7 +888,6 @@ test "dangling target is dropped and counted" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
     defer result.deinit(allocator);
@@ -929,7 +925,6 @@ test "empty edges produce empty resolved file" {
 
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
-
 
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 1, &diagnostics);
@@ -974,7 +969,6 @@ test "multiple edges from same source" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
     defer result.deinit(allocator);
@@ -1013,7 +1007,6 @@ test "fixtures produce resolved edges" {
 
         const source_data = try Io.Dir.cwd().readFileAlloc(io_arg, fixture_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source_data);
-
 
         var job = try createTestJobFromSource(allocator, io_arg, source_data, tmp_path);
         defer job.deinit(allocator);

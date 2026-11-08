@@ -236,7 +236,12 @@ pub fn runIndexCommand(
                     &scan_result.diagnostics,
                 ) catch |err| {
                     if (err == error.DominatorBudgetExceeded) {
-                        try Cli.printError(stderr, "dominator computation needs more memory than the budget allows; raise with --dominator-budget-mb or disable with --no-dominators", .{});
+                        const nodes = catalog_result.n_objects + 1;
+                        const needed_mb: u64 = (nodes * 56 + 1024 * 1024 - 1) / (1024 * 1024);
+                        const budget_mb: u64 = @as(u64, dominator_budget_mb);
+                        try Cli.printError(stderr, "dominator computation needs ~{d} MiB (est.) for {d} nodes but budget is {d} MiB; raise with --dominator-budget-mb {d} or disable with --no-dominators", .{ needed_mb, nodes, budget_mb, if (needed_mb > budget_mb) needed_mb else budget_mb + 512 });
+                    } else if (err == error.DominatorDidNotConverge) {
+                        try Cli.printError(stderr, "dominator computation (CHK) did not converge; graph may be pathological or too large for the iteration limit", .{});
                     }
                     return @as(anyerror!void, err);
                 });

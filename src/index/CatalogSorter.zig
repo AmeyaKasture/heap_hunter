@@ -65,7 +65,7 @@ pub fn sortAndDedupe(
 
     var catalog_file = try dir.createFile(io, catalog_path, .{});
     defer catalog_file.close(io);
-    var catalog_buf: [65536]u8 = undefined;
+    var catalog_buf: [262144]u8 = undefined;
     var catalog_file_writer: Io.File.Writer = .init(catalog_file, io, &catalog_buf);
     const catalog_writer = &catalog_file_writer.interface;
 
@@ -144,7 +144,7 @@ pub fn writeClasses(
     const dir = Io.Dir.cwd();
     var classes_file = try dir.createFile(io, classes_path, .{});
     defer classes_file.close(io);
-    var classes_buf: [65536]u8 = undefined;
+    var classes_buf: [262144]u8 = undefined;
     var classes_file_writer: Io.File.Writer = .init(classes_file, io, &classes_buf);
     const classes_writer = &classes_file_writer.interface;
 
@@ -398,7 +398,7 @@ test "fixture catalog count stable after sort and dedupe" {
         defer scan_result.deinit(allocator);
 
         var diagnostics: Manifest.Diagnostics = .{};
-    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
         defer result.deinit(allocator);
 
         const expected = analysis_index.total_objects + analysis_index.classes.count();

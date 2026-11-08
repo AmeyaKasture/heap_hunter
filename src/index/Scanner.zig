@@ -337,19 +337,19 @@ pub fn run(
     const dir = Io.Dir.cwd();
     var catalog_file = try dir.createFile(io, catalog_path, .{});
     defer catalog_file.close(io);
-    var catalog_buf: [65536]u8 = undefined;
+    var catalog_buf: [262144]u8 = undefined;
     var catalog_file_writer: Io.File.Writer = .init(catalog_file, io, &catalog_buf);
     const catalog_writer = &catalog_file_writer.interface;
 
     var roots_file = try dir.createFile(io, roots_path, .{});
     defer roots_file.close(io);
-    var roots_buf: [65536]u8 = undefined;
+    var roots_buf: [262144]u8 = undefined;
     var roots_file_writer: Io.File.Writer = .init(roots_file, io, &roots_buf);
     const roots_writer = &roots_file_writer.interface;
 
     var prim_histogram_file = try dir.createFile(io, prim_histogram_path, .{});
     defer prim_histogram_file.close(io);
-    var prim_histogram_buf: [65536]u8 = undefined;
+    var prim_histogram_buf: [262144]u8 = undefined;
     var prim_histogram_file_writer: Io.File.Writer = .init(prim_histogram_file, io, &prim_histogram_buf);
     const prim_histogram_writer = &prim_histogram_file_writer.interface;
 
@@ -486,7 +486,7 @@ fn writeThreadTraces(
     const dir = Io.Dir.cwd();
     var file = try dir.createFile(io, path, .{});
     defer file.close(io);
-    var write_buf: [65536]u8 = undefined;
+    var write_buf: [262144]u8 = undefined;
     var file_writer: Io.File.Writer = .init(file, io, &write_buf);
     const writer = &file_writer.interface;
 
