@@ -167,7 +167,7 @@ test "preflight reuse path with matching manifest" {
     const index_dir = try std.fs.path.join(allocator, &.{ tmp_path_z[0..tmp_path_z.len], "index" });
     defer allocator.free(index_dir);
 
-    const source_path = "test_hprofs/heapforge.hprof";
+    const source_path = "fixtures/heapforge.hprof";
 
     var stderr_buf: [1024]u8 = undefined;
     var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);

@@ -601,13 +601,13 @@ The test suite covers the HPROF parser, every index stage, and every
 query command. Most tests build synthetic HPROF dumps in memory and
 exercise the full `index → overview → query` pipeline. A handful of
 tests in `src/index/` and `src/tests/integration.zig` additionally
-read real HPROF dumps placed under `test_hprofs/` to exercise the
-end-to-end pipeline. The directory is gitignored; the file names
+read real HPROF dumps placed under `fixtures/` to exercise the
+end-to-end pipeline. The directory is tracked; the file names
 referenced by the tests are:
 
-- `test_hprofs/heapforge.hprof` — mixed object, array, and root graph.
-- `test_hprofs/heapforge_classloaders.hprof` — ClassLoader-heavy layout.
-- `test_hprofs/heapforge_threads.hprof` — thread metadata and stacks.
+- `fixtures/heapforge.hprof` — mixed object, array, and root graph.
+- `fixtures/heapforge_classloaders.hprof` — ClassLoader-heavy layout.
+- `fixtures/heapforge_threads.hprof` — thread metadata and stacks.
 
 ## Project layout
 
@@ -647,7 +647,7 @@ src/
   tests/                Synthetic HPROF builder and integration tests
     HprofBuilder.zig
     integration.zig
-test_hprofs/            (gitignored) sample HPROFs used by the test suite
+fixtures/               (tracked) sample HPROFs used by the test suite
 agent-skills/           Project-local agent skills (git-commit, pr-review)
 install.sh              Installer script (download, local build, uninstall)
 .github/                CLA bot workflow
