@@ -49,6 +49,7 @@ pub const Diagnostics = struct {
     unknown_root_kind: u64 = 0,
     missing_layout: u64 = 0,
     dangling_root_targets: u64 = 0,
+    unreachable_objects: u64 = 0,
 };
 
 pub const FileEntry = struct {
@@ -57,7 +58,7 @@ pub const FileEntry = struct {
 };
 
 pub const IndexManifest = struct {
-    format_version: u32 = 1,
+    format_version: u32 = 2,
     fingerprint: Fingerprint,
     n_objects: u64 = 0,
     n_edges: u64 = 0,
@@ -68,6 +69,12 @@ pub const IndexManifest = struct {
     /// index. Stored to support query commands that need to decode raw object
     /// records from the dump.
     source_path: ?[]const u8 = null,
+    /// True when the index was built with dominator data.
+    has_dominators: bool = false,
+    /// Number of nodes reachable from the virtual root when dominators were computed.
+    n_dominator_nodes: u64 = 0,
+    /// Total retained bytes for the reachable heap when dominators were computed.
+    retained_total_bytes: u64 = 0,
 
     pub fn deinit(self: *const IndexManifest, allocator: std.mem.Allocator) void {
         self.fingerprint.deinit(allocator);
@@ -96,6 +103,9 @@ pub const IndexManifest = struct {
             .diagnostics = self.diagnostics,
             .files = files,
             .source_path = if (self.source_path) |p| try allocator.dupe(u8, p) else null,
+            .has_dominators = self.has_dominators,
+            .n_dominator_nodes = self.n_dominator_nodes,
+            .retained_total_bytes = self.retained_total_bytes,
         };
     }
 
@@ -239,6 +249,19 @@ test "manifest JSON roundtrip" {
     try std.testing.expectEqual(@as(u64, 3200), parsed.files[0].size);
     try std.testing.expectEqualStrings("out_targets.bin", parsed.files[1].name);
     try std.testing.expectEqual(@as(u64, 200), parsed.files[1].size);
+}
+
+test "manifest default format version is 2" {
+    const fp = Fingerprint{
+        .file_length = 1,
+        .hprof_timestamp = 1,
+        .id_size = 8,
+        .hash_algorithm = hash_algorithm_name,
+        .hash_value = "0000000000000000",
+        .source_mtime = 0,
+    };
+    const manifest = IndexManifest{ .fingerprint = fp };
+    try std.testing.expectEqual(@as(u32, 2), manifest.format_version);
 }
 
 test "fingerprint mismatch detection" {

@@ -116,7 +116,9 @@ pub fn runCli(
         std.mem.eql(u8, command, "refs-from") or
         std.mem.eql(u8, command, "refs-to") or
         std.mem.eql(u8, command, "roots") or
-        std.mem.eql(u8, command, "tree"))
+        std.mem.eql(u8, command, "tree") or
+        std.mem.eql(u8, command, "dominator") or
+        std.mem.eql(u8, command, "dominator-tree"))
     {
         log.debug("dispatching to runQueryCommand ({s})", .{command});
         return runQueryCommand(allocator, io, command, shifted, stdout, stderr, config_load);
@@ -420,6 +422,10 @@ fn runQueryCommand(
         try IndexReader.writeRoots(&reader, stdout, raw_id, roots_opts);
     } else if (std.mem.eql(u8, command, "tree")) {
         try IndexReader.writeTree(&reader, stdout, raw_id, tree_opts);
+    } else if (std.mem.eql(u8, command, "dominator")) {
+        try Commands.runDominatorCommand(allocator, io, index_dir, source_override, raw_id, stdout, stderr);
+    } else if (std.mem.eql(u8, command, "dominator-tree")) {
+        try Commands.runDominatorTreeCommand(allocator, io, index_dir, source_override, raw_id, stdout, stderr);
     } else {
         unreachable;
     }
@@ -1944,6 +1950,11 @@ test {
     _ = @import("index/EdgeEmitter.zig");
     _ = @import("index/Join.zig");
     _ = @import("index/Csr.zig");
+    _ = @import("index/Dominator.zig");
+    _ = @import("index/dominator/Chk.zig");
+    _ = @import("index/dominator/Backend.zig");
+    _ = @import("index/dominator/CsrView.zig");
+    _ = @import("index/dominator/Numbering.zig");
     _ = @import("index/Validate.zig");
     _ = @import("index/Publish.zig");
     _ = @import("index/IndexReader.zig");

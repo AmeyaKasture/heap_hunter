@@ -22,10 +22,8 @@ pub const Error = error{
     WriteFailed,
 };
 
-/// The set of staged files that are moved into the final index directory.
-/// These names match the files produced by earlier stages and checked by
-/// `Validate.zig`.
-pub const final_files = &[_][]const u8{
+/// Required files that are always present in a published index.
+pub const required_files = &[_][]const u8{
     "catalog.bin",
     "classes.bin",
     "fields.bin",
@@ -37,6 +35,16 @@ pub const final_files = &[_][]const u8{
     "prim_histogram.bin",
     "thread_traces.bin",
 };
+
+/// Optional files that are published when present and deleted when absent.
+pub const optional_files = &[_][]const u8{
+    "dom_parent.bin",
+    "dom_order.bin",
+    "retained.bin",
+};
+
+/// Keep the old name working for callers that expect a flat list.
+pub const final_files = required_files;
 
 /// Result of Stage 8 publication. Holds the total byte size of the published
 /// index files and the manifest file entries.
@@ -90,7 +98,7 @@ pub fn publish(
     };
     defer index_dir_handle.close(io);
 
-    for (final_files) |name| {
+    for (required_files) |name| {
         staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| {
             try stderr.print("error: failed to publish {s}: {}\n", .{ name, err });
             return error.PublishFailed;
@@ -107,7 +115,7 @@ pub fn publish(
     }
 
     var index_bytes: u64 = 0;
-    for (final_files) |name| {
+    for (required_files) |name| {
         const new_path = try std.fs.path.join(allocator, &.{ index_dir, name });
         defer allocator.free(new_path);
 
@@ -120,6 +128,50 @@ pub fn publish(
         errdefer allocator.free(owned_name);
         try files.append(allocator, .{ .name = owned_name, .size = stat.size });
         index_bytes += stat.size;
+    }
+
+    // Publish optional files that exist in staging, and remove stale ones from
+    // the index directory when they are absent.
+    for (optional_files) |name| {
+        const staged_path = try std.fs.path.join(allocator, &.{ staging_dir, name });
+        defer allocator.free(staged_path);
+        const published_path = try std.fs.path.join(allocator, &.{ index_dir, name });
+        defer allocator.free(published_path);
+
+        const exists_in_staging = blk: {
+            var file = staging_dir_handle.openFile(io, name, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => |e| {
+                    try stderr.print("error: failed to stat staged optional file {s}: {}\n", .{ name, e });
+                    return error.PublishFailed;
+                },
+            };
+            file.close(io);
+            break :blk true;
+        };
+
+        if (exists_in_staging) {
+            staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| {
+                try stderr.print("error: failed to publish optional file {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            };
+            const stat = dir.statFile(io, published_path, .{}) catch |err| {
+                try stderr.print("error: failed to stat published optional file {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            };
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
+            try files.append(allocator, .{ .name = owned_name, .size = stat.size });
+            index_bytes += stat.size;
+        } else {
+            dir.deleteFile(io, published_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => |e| {
+                    try stderr.print("error: failed to remove stale optional file {s}: {}\n", .{ name, e });
+                    return error.PublishFailed;
+                },
+            };
+        }
     }
 
     manifest.files = try files.toOwnedSlice(allocator);
@@ -298,6 +350,99 @@ test "publish computes total index bytes" {
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, final_files.len * 4), result.index_bytes);
+}
+
+// Required and optional file lists keep dominator files out of the required set.
+test "publish required files are unchanged and dominator files are optional" {
+    for (optional_files) |opt_name| {
+        var found = false;
+        for (required_files) |req_name| {
+            if (std.mem.eql(u8, opt_name, req_name)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(!found);
+    }
+    try std.testing.expectEqual(@as(usize, 10), required_files.len);
+    try std.testing.expectEqual(@as(usize, 3), optional_files.len);
+}
+
+// Optional files published in one build are removed when the next build does
+// not produce them.
+test "dominator optional files are removed when dominators are disabled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const staging_dir = try std.fs.path.join(allocator, &.{ tmp_path, "staging" });
+    defer allocator.free(staging_dir);
+    const index_dir = try std.fs.path.join(allocator, &.{ tmp_path, "index" });
+    defer allocator.free(index_dir);
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+
+    const fingerprint = Manifest.Fingerprint{
+        .file_length = 1,
+        .hprof_timestamp = 2,
+        .id_size = 8,
+        .hash_algorithm = "fnv1a64",
+        .hash_value = "0000000000000000",
+        .source_mtime = 0,
+    };
+
+    // First publish: include optional dominator files.
+    try Io.Dir.cwd().createDirPath(io, staging_dir);
+    try Io.Dir.cwd().createDirPath(io, index_dir);
+    for (required_files) |name| {
+        try createSyntheticFile(allocator, io, staging_dir, name, "x");
+    }
+    for (optional_files) |name| {
+        try createSyntheticFile(allocator, io, staging_dir, name, "x");
+    }
+    var manifest1 = Manifest.IndexManifest{
+        .format_version = 2,
+        .fingerprint = fingerprint,
+        .n_objects = 3,
+        .n_edges = 2,
+        .virtual_root_ordinal = 3,
+        .has_dominators = true,
+    };
+    const result1 = try publish(allocator, io, staging_dir, index_dir, &manifest1, &stderr_writer.interface);
+    defer result1.deinit(allocator);
+
+    for (optional_files) |name| {
+        const path = try std.fs.path.join(allocator, &.{ index_dir, name });
+        defer allocator.free(path);
+        try std.testing.expect(fileExists(io, path));
+    }
+
+    // Second publish: no optional files in staging.
+    try Io.Dir.cwd().createDirPath(io, staging_dir);
+    for (required_files) |name| {
+        try createSyntheticFile(allocator, io, staging_dir, name, "y");
+    }
+    var manifest2 = Manifest.IndexManifest{
+        .format_version = 2,
+        .fingerprint = fingerprint,
+        .n_objects = 3,
+        .n_edges = 2,
+        .virtual_root_ordinal = 3,
+        .has_dominators = false,
+    };
+    const result2 = try publish(allocator, io, staging_dir, index_dir, &manifest2, &stderr_writer.interface);
+    defer result2.deinit(allocator);
+
+    for (optional_files) |name| {
+        const path = try std.fs.path.join(allocator, &.{ index_dir, name });
+        defer allocator.free(path);
+        try std.testing.expect(!fileExists(io, path));
+    }
 }
 
 const hprof = @import("../hprof.zig");

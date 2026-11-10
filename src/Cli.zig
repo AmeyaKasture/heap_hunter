@@ -64,7 +64,9 @@ pub fn isUserError(err: anyerror) bool {
         err == error.CacheMissing or
         err == error.CacheCorrupt or
         err == error.CacheVersionMismatch or
-        err == error.CacheFingerprintMismatch;
+        err == error.CacheFingerprintMismatch or
+        err == error.DominatorBudgetExceeded or
+        err == error.NoRetainedData;
 }
 
 fn writeStyled(writer: *Io.Writer, comptime color: []const u8, text: []const u8) !void {
@@ -228,13 +230,15 @@ pub const commands = [_]Command{
             "consisting of a sorted object catalog, class metadata, field layouts, " ++
             "thread stack-trace metadata, and a bidirectional reference graph. Once built, " ++
             "the index can be queried with objects, sample, object, threads, refs-from, " ++
-            "refs-to, roots, and tree. " ++
+            "refs-to, roots, tree, dominator, and dominator-tree. " ++
             "If an up-to-date index already exists for the same dump, the command " ++
             "reports reuse instead of rebuilding.",
         .usage = "hunt index <file.hprof> [options]",
         .options = &.{
             .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory where the index will be written. Defaults to the config value, or <base>/<stem>.idx/ when the config is a base directory." },
             .{ .flags = "--sorting-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for external sorting.", .default_value = "4096" },
+            .{ .flags = "--dominator-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for dominator computation.", .default_value = "4096" },
+            .{ .flags = "--no-dominators", .argument = null, .description = "Skip dominator computation and do not publish dom_parent.bin, dom_order.bin, or retained.bin." },
             .{ .flags = "--force", .argument = null, .description = "Rebuild the index even if a matching index already exists." },
             .{ .flags = "--no-progress", .argument = null, .description = "Suppress the progress spinner and checkpoint output." },
         },
@@ -551,6 +555,51 @@ pub const commands = [_]Command{
         },
         .see_also = &.{ "refs-from", "roots" },
     },
+    .{
+        .name = "dominator",
+        .description = "Show the immediate dominator and retained size of an object.",
+        .long_description = "Looks up the immediate dominator (the nearest object whose removal " ++
+            "would make the target unreachable) and the retained byte size for the " ++
+            "object with the given raw ID. Requires an index built with dominators " ++
+            "(the default for hunt index).",
+        .usage = "hunt dominator [file.hprof] <id> [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
+            .{ .flags = "--source", .argument = "<file.hprof>", .description = "Override the HPROF source path stored in the index." },
+        },
+        .examples = &.{
+            "hunt dominator heapdump.hprof 0x3000",
+            "hunt dominator 0x3000 --index-dir ./idx",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Dominator information printed successfully." },
+            .{ .code = 1, .description = "Invalid argument, object not found, missing index, or no dominator data." },
+        },
+        .see_also = &.{ "dominator-tree", "refs-to", "roots" },
+    },
+    .{
+        .name = "dominator-tree",
+        .description = "Print the dominator chain from an object up to the virtual root.",
+        .long_description = "Walks the immediate-dominator links from the given object up to the " ++
+            "virtual GC root and prints each node with its retained byte size. " ++
+            "Requires an index built with dominators (the default for hunt index).",
+        .usage = "hunt dominator-tree [file.hprof] <id> [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
+            .{ .flags = "--source", .argument = "<file.hprof>", .description = "Override the HPROF source path stored in the index." },
+        },
+        .examples = &.{
+            "hunt dominator-tree heapdump.hprof 0x3000",
+            "hunt dominator-tree 0x3000 --index-dir ./idx",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Dominator tree printed successfully." },
+            .{ .code = 1, .description = "Invalid argument, object not found, missing index, or no dominator data." },
+        },
+        .see_also = &.{ "dominator", "refs-to", "roots" },
+    },
 };
 
 pub fn findCommand(name: []const u8) ?Command {
@@ -591,7 +640,7 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Query commands:\n");
-    try printCommandGroup(writer, &.{ "objects", "sample", "object", "threads", "refs-from", "refs-to", "roots", "tree" });
+    try printCommandGroup(writer, &.{ "objects", "sample", "object", "threads", "refs-from", "refs-to", "roots", "tree", "dominator", "dominator-tree" });
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Global options:\n");

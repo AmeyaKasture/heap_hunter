@@ -16,6 +16,7 @@ INSTALL_DIR="${HEAP_HUNTER_INSTALL_DIR:-$HOME/.local/bin}"
 ENV_FILE="${HEAP_HUNTER_ENV_FILE:-$HOME/.heap_hunter_env}"
 INDEX_DIR_VALUE="${HEAP_HUNTER_INDEX_DIR:-index}"
 SORTING_BUDGET_MB="${HEAP_HUNTER_SORTING_BUDGET_MB:-4096}"
+DOMINATOR_BUDGET_MB="${HEAP_HUNTER_DOMINATOR_BUDGET_MB:-4096}"
 OPTIMIZE_MODE="ReleaseFast"
 API_URL="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
 MODE="release"
@@ -66,6 +67,9 @@ Environment:
                             (default: index)
   HEAP_HUNTER_SORTING_BUDGET_MB
                             sorting-budget-mb written to the config
+                            (default: 4096)
+  HEAP_HUNTER_DOMINATOR_BUDGET_MB
+                            dominator-budget-mb written to the config
                             (default: 4096)
 EOF
 }
@@ -293,7 +297,8 @@ create_config() {
     cat >"$CONFIG_FILE" <<EOF
 {
   "index-dir": "${index_escaped}",
-  "sorting-budget-mb": ${SORTING_BUDGET_MB}
+  "sorting-budget-mb": ${SORTING_BUDGET_MB},
+  "dominator-budget-mb": ${DOMINATOR_BUDGET_MB}
 }
 EOF
     chmod 0644 "$CONFIG_FILE"
@@ -308,6 +313,7 @@ print_summary() {
     printf '    %s\n' "$CONFIG_FILE"
     printf '    index-dir:          %s\n' "$INDEX_DIR_VALUE"
     printf '    sorting-budget-mb:  %s\n' "$SORTING_BUDGET_MB"
+    printf '    dominator-budget-mb: %s\n' "$DOMINATOR_BUDGET_MB"
     printf '\n'
     printf 'Index location (index-dir "%s" is resolved relative to the current directory):\n' "$INDEX_DIR_VALUE"
     printf '    hunt index <dump.hprof>     ->  ./%s/<dump-name>.idx/\n' "$INDEX_DIR_VALUE"

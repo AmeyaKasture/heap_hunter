@@ -135,6 +135,7 @@ pub fn validate(
     n_edges: u64,
     n_roots: u64,
     n_classes: u64,
+    has_dominators: bool,
     stderr: *Io.Writer,
 ) Error!void {
     // 1. Every expected file exists and is readable.
@@ -199,6 +200,145 @@ pub fn validate(
     const thread_traces_path = try std.fs.path.join(allocator, &.{ staging_dir, "thread_traces.bin" });
     defer allocator.free(thread_traces_path);
     try validateThreadTraces(allocator, io, thread_traces_path, stderr);
+
+    // 9. Dominator files are internally consistent when present.
+    if (has_dominators) {
+        try validateDominators(io, staging_dir, n_nodes, n_objects, stderr);
+    }
+}
+
+/// Validate the three optional dominator files.
+///
+/// Checks:
+///   * All three files exist.
+///   * `dom_parent.bin` size == n_nodes * 4.
+///   * `retained.bin` size == n_nodes * 8.
+///   * `dom_order.bin` size % 4 == 0 and n_reachable = size / 4.
+///   * Every dom_parent entry is NONE or < V, and no self-domination except root.
+///   * retained[v] >= shallow[v] for every real object.
+///   * retained[root] == sum of shallow over reachable real objects.
+///   * dom_order entries are distinct, in range, and dom_order[0] is the virtual root.
+fn validateDominators(
+    io: Io,
+    staging_dir: []const u8,
+    n_nodes: u64,
+    n_objects: u64,
+    stderr: *Io.Writer,
+) Error!void {
+    const allocator = std.heap.page_allocator;
+    const dom_parent_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_parent.bin" });
+    defer allocator.free(dom_parent_path);
+    const dom_order_path = try std.fs.path.join(allocator, &.{ staging_dir, "dom_order.bin" });
+    defer allocator.free(dom_order_path);
+    const retained_path = try std.fs.path.join(allocator, &.{ staging_dir, "retained.bin" });
+    defer allocator.free(retained_path);
+    const catalog_path = try std.fs.path.join(allocator, &.{ staging_dir, "catalog.bin" });
+    defer allocator.free(catalog_path);
+
+    var dom_parent_data = try mapFileReadOnly(io, dom_parent_path, "dom_parent.bin", stderr, error.MissingFile);
+    defer if (dom_parent_data) |*m| {
+        m.mm.destroy(io);
+        m.file.close(io);
+    };
+    var dom_order_data = try mapFileReadOnly(io, dom_order_path, "dom_order.bin", stderr, error.MissingFile);
+    defer if (dom_order_data) |*m| {
+        m.mm.destroy(io);
+        m.file.close(io);
+    };
+    var retained_data = try mapFileReadOnly(io, retained_path, "retained.bin", stderr, error.MissingFile);
+    defer if (retained_data) |*m| {
+        m.mm.destroy(io);
+        m.file.close(io);
+    };
+
+    if (dom_parent_data == null or dom_order_data == null or retained_data == null) {
+        try Cli.printError(stderr, "index validation failed: missing dominator file", .{});
+        return error.MissingFile;
+    }
+
+    const dp = dom_parent_data.?.data;
+    const dor = dom_order_data.?.data;
+    const ret = retained_data.?.data;
+
+    if (dp.len != n_nodes * 4) {
+        try Cli.printError(stderr, "index validation failed: dom_parent.bin has unexpected size", .{});
+        return error.InvariantViolation;
+    }
+    if (ret.len != n_nodes * 8) {
+        try Cli.printError(stderr, "index validation failed: retained.bin has unexpected size", .{});
+        return error.InvariantViolation;
+    }
+    if (dor.len % 4 != 0) {
+        try Cli.printError(stderr, "index validation failed: dom_order.bin has unexpected size", .{});
+        return error.InvariantViolation;
+    }
+    const n_reachable = dor.len / 4;
+    const virtual_root = n_nodes - 1;
+
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+
+    var i: usize = 0;
+    while (i < n_nodes) : (i += 1) {
+        const parent = std.mem.readInt(u32, dp[i * 4 ..][0..4], .little);
+        if (parent == std.math.maxInt(u32)) continue;
+        if (parent >= n_nodes) {
+            try Cli.printError(stderr, "index validation failed: dom_parent.bin contains an out-of-range ordinal", .{});
+            return error.InvariantViolation;
+        }
+        if (parent == i) {
+            try Cli.printError(stderr, "index validation failed: dom_parent.bin contains a self-domination", .{});
+            return error.InvariantViolation;
+        }
+    }
+
+    i = 0;
+    while (i < n_reachable) : (i += 1) {
+        const ord = std.mem.readInt(u32, dor[i * 4 ..][0..4], .little);
+        if (ord >= n_nodes) {
+            try Cli.printError(stderr, "index validation failed: dom_order.bin contains an out-of-range ordinal", .{});
+            return error.InvariantViolation;
+        }
+        if (i == 0 and ord != virtual_root) {
+            try Cli.printError(stderr, "index validation failed: dom_order.bin does not start with the virtual root", .{});
+            return error.InvariantViolation;
+        }
+        const gop = try seen.getOrPut(@intCast(ord));
+        if (gop.found_existing) {
+            try Cli.printError(stderr, "index validation failed: dom_order.bin contains a duplicate ordinal", .{});
+            return error.InvariantViolation;
+        }
+    }
+
+    var catalog_mapped = try mapFileReadOnly(io, catalog_path, "catalog.bin", stderr, error.InvalidCatalogFile);
+    defer if (catalog_mapped) |*m| {
+        m.mm.destroy(io);
+        m.file.close(io);
+    };
+    const catalog_data = if (catalog_mapped) |m| m.data else &[_]u8{};
+
+    var reachable_shallow_sum: u64 = 0;
+    i = 0;
+    while (i < n_objects) : (i += 1) {
+        const row = Scanner.readCatalogRow(catalog_data[i * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch {
+            try Cli.printError(stderr, "index validation failed: catalog.bin row is malformed", .{});
+            return error.InvalidCatalogFile;
+        };
+        const retained = std.mem.readInt(u64, ret[i * 8 ..][0..8], .little);
+        if (retained < row.shallow_size) {
+            try Cli.printError(stderr, "index validation failed: retained.bin entry is smaller than shallow size", .{});
+            return error.InvariantViolation;
+        }
+        if (seen.contains(@intCast(i))) {
+            reachable_shallow_sum += row.shallow_size;
+        }
+    }
+
+    const root_retained = std.mem.readInt(u64, ret[virtual_root * 8 ..][0..8], .little);
+    if (root_retained != reachable_shallow_sum) {
+        try Cli.printError(stderr, "index validation failed: retained[root] does not reconcile with reachable shallow total", .{});
+        return error.InvariantViolation;
+    }
 }
 
 /// Validate `thread_traces.bin` by parsing it; the parser performs full
@@ -756,7 +896,21 @@ fn runValidate(
 ) !void {
     var stderr_buf: [4096]u8 = undefined;
     var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
-    try validate(allocator, io, dir, n_objects, n_edges, n_roots, n_classes, &stderr_writer.interface);
+    try validate(allocator, io, dir, n_objects, n_edges, n_roots, n_classes, false, &stderr_writer.interface);
+}
+
+fn runValidateWithDominators(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+    n_objects: u64,
+    n_edges: u64,
+    n_roots: u64,
+    n_classes: u64,
+) !void {
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+    try validate(allocator, io, dir, n_objects, n_edges, n_roots, n_classes, true, &stderr_writer.interface);
 }
 
 // A complete, valid staged directory passes all checks.
@@ -1015,4 +1169,134 @@ test "validate detects missing staged file" {
     defer allocator.free(tmp_path);
 
     try std.testing.expectError(error.MissingFile, runValidate(allocator, io, tmp_path, 0, 0, 0, 0));
+}
+
+fn createSyntheticDomParent(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+    values: []const u32,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir, "dom_parent.bin" });
+    defer allocator.free(path);
+
+    const f = try Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [65536]u8 = undefined;
+    var writer: Io.File.Writer = .init(f, io, &buf);
+    for (values) |v| {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .little);
+        try writer.interface.writeAll(&b);
+    }
+    try writer.flush();
+}
+
+fn createSyntheticDomOrder(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+    values: []const u32,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir, "dom_order.bin" });
+    defer allocator.free(path);
+
+    const f = try Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [65536]u8 = undefined;
+    var writer: Io.File.Writer = .init(f, io, &buf);
+    for (values) |v| {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .little);
+        try writer.interface.writeAll(&b);
+    }
+    try writer.flush();
+}
+
+fn createSyntheticRetained(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: []const u8,
+    values: []const u64,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir, "retained.bin" });
+    defer allocator.free(path);
+
+    const f = try Io.Dir.cwd().createFile(io, path, .{});
+    defer f.close(io);
+    var buf: [65536]u8 = undefined;
+    var writer: Io.File.Writer = .init(f, io, &buf);
+    for (values) |v| {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, v, .little);
+        try writer.interface.writeAll(&b);
+    }
+    try writer.flush();
+}
+
+// A consistent set of dominator files passes validation.
+test "validate accepts consistent dominator files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // 2 real objects + virtual root = 3 nodes.
+    try createSyntheticCatalog(allocator, io, tmp_path, &[_]Scanner.CatalogRow{
+        .{ .raw_id = 0x1000, .source_offset = 0, .class_raw_id = 0, .shallow_size = 8, .kind = .instance },
+        .{ .raw_id = 0x2000, .source_offset = 0, .class_raw_id = 0, .shallow_size = 8, .kind = .instance },
+    });
+    try createSyntheticClasses(allocator, io, tmp_path, &[_]SyntheticClass{});
+    try createSyntheticFields(allocator, io, tmp_path, 0);
+    try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
+
+    try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
+    try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0, 0 });
+    try createSyntheticAdjacency(allocator, io, tmp_path, "out_targets.bin", &[_]u32{});
+    try createSyntheticAdjacency(allocator, io, tmp_path, "in_sources.bin", &[_]u32{});
+    try createSyntheticRoots(allocator, io, tmp_path, &[_]SyntheticRoot{});
+
+    // Virtual root = 2, dom_order = [2, 0, 1], dom_parent = [NONE, NONE, NONE].
+    const NONE_U32 = std.math.maxInt(u32);
+    try createSyntheticDomParent(allocator, io, tmp_path, &[_]u32{ NONE_U32, NONE_U32, NONE_U32 });
+    try createSyntheticDomOrder(allocator, io, tmp_path, &[_]u32{ 2, 0, 1 });
+    try createSyntheticRetained(allocator, io, tmp_path, &[_]u64{ 8, 8, 16 });
+
+    try runValidateWithDominators(allocator, io, tmp_path, 2, 0, 0, 0);
+}
+
+// dom_parent entries must not self-dominate.
+test "validate rejects self-domination" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    try createSyntheticCatalog(allocator, io, tmp_path, &[_]Scanner.CatalogRow{
+        .{ .raw_id = 0x1000, .source_offset = 0, .class_raw_id = 0, .shallow_size = 8, .kind = .instance },
+    });
+    try createSyntheticClasses(allocator, io, tmp_path, &[_]SyntheticClass{});
+    try createSyntheticFields(allocator, io, tmp_path, 0);
+    try createSyntheticPrimHistogram(allocator, io, tmp_path);
+    try createSyntheticThreadTraces(allocator, io, tmp_path);
+
+    try createSyntheticOffsets(allocator, io, tmp_path, "out_offsets.bin", &[_]u64{ 0, 0, 0 });
+    try createSyntheticOffsets(allocator, io, tmp_path, "in_offsets.bin", &[_]u64{ 0, 0, 0 });
+    try createSyntheticAdjacency(allocator, io, tmp_path, "out_targets.bin", &[_]u32{});
+    try createSyntheticAdjacency(allocator, io, tmp_path, "in_sources.bin", &[_]u32{});
+    try createSyntheticRoots(allocator, io, tmp_path, &[_]SyntheticRoot{});
+
+    const NONE_U32 = std.math.maxInt(u32);
+    try createSyntheticDomParent(allocator, io, tmp_path, &[_]u32{ 0, NONE_U32, NONE_U32 });
+    try createSyntheticDomOrder(allocator, io, tmp_path, &[_]u32{ 1, 0 });
+    try createSyntheticRetained(allocator, io, tmp_path, &[_]u64{ 8, 8, 8 });
+
+    try std.testing.expectError(error.InvariantViolation, runValidateWithDominators(allocator, io, tmp_path, 1, 0, 0, 0));
 }

@@ -65,6 +65,10 @@ the size of the source dump.
 - **Class histogram** (`histogram`): aggregate instances and shallow
   bytes per class, with regex match, exclude, and minimum-size filters.
 - **Loaded classes** (`classes`): class name, superclass, instance size.
+- **Dominator tree and retained sizes** (`index --dominators`): immediate
+  dominator tree, dominator order, and retained bytes per object. Stored
+  in `dom_parent.bin`, `dom_order.bin`, and `retained.bin`; can be skipped
+  with `--no-dominators`.
 
 ### Object queries
 
@@ -336,7 +340,17 @@ JSON error payload inside the content block.
 | Command | Description |
 |---------|-------------|
 | `index <dump> --index-dir <dir>` | Build the persistent heap-graph index. |
+| `index <dump> --index-dir <dir> --no-dominators` | Build the index without computing dominators (smaller, faster). |
 | `overview <dump> --index-dir <dir>` | Build the cached overview used by summary queries. |
+
+#### Indexer options
+
+| Option | Description |
+|--------|-------------|
+| `--no-dominators` | Skip the CHK dominator computation. Stale `dom_parent.bin`, `dom_order.bin`, and `retained.bin` files are removed on rebuild. |
+| `--dominator-budget-mb <n>` | Memory budget for the dominator stage in MiB. Raises a user error if the stage cannot fit. |
+| `--sorting-budget-mb <n>` | Memory budget for the external-sort catalog stage. |
+| `--force` | Rebuild the index even if a matching one already exists. |
 
 ### Summary (require `overview`)
 
@@ -369,6 +383,13 @@ JSON error payload inside the content block.
 | `roots <id> --index-dir <dir>` | Shortest path from an object to a GC root. |
 | `tree <id> --index-dir <dir>` | Bounded subtree expansion from an object. |
 
+### Dominator queries (require `index` with dominators)
+
+| Command | Description |
+|---------|-------------|
+| `dominator <id> --index-dir <dir>` | Immediate dominator and retained size of an object. |
+| `dominator-tree <id> --index-dir <dir>` | Dominator chain from an object up to the virtual root. |
+
 ### Common options
 
 | Option | Applies to | Description |
@@ -387,6 +408,8 @@ JSON error payload inside the content block.
 | `--max-nodes <n>` | `tree` | Maximum number of nodes in the tree. |
 | `--max-visited <n>` | `roots` | BFS visit budget for the root search. |
 | `--source <path>` | query commands | Override the path to the original HPROF dump. |
+| `--no-dominators` | `index` | Skip dominator computation and delete stale dominator files. |
+| `--dominator-budget-mb <n>` | `index` | Memory budget (MiB) for the dominator tree computation. |
 
 ### Server
 
@@ -498,6 +521,78 @@ java.lang.String,892103,178420600
 }
 ```
 
+### `hunt index fixtures/heapforge.hprof --index-dir ./idx` (JSON)
+
+```json
+{
+  "status": "complete",
+  "index_dir": "./idx",
+  "n_objects": 170877,
+  "n_classes": 1844,
+  "n_edges": 262839,
+  "n_roots": 1851,
+  "virtual_root_ordinal": 170877,
+  "has_dominators": true,
+  "n_dominator_nodes": 168319,
+  "retained_total_bytes": 10078703,
+  "diagnostics": {
+    "duplicate_object_ids": 0,
+    "skipped_constant_pool_refs": 0,
+    "dangling_source_edges": 0,
+    "dangling_target_edges": 361,
+    "missing_superclass": 0,
+    "superclass_cycle": 0,
+    "unknown_root_kind": 0,
+    "missing_layout": 0,
+    "dangling_root_targets": 0,
+    "unreachable_objects": 2559
+  },
+  "elapsed_ms": {
+    "scan": 0,
+    "sort_catalog": 0,
+    "layouts": 0,
+    "emit_edges": 0,
+    "join": 0,
+    "csr": 0,
+    "dominators": 0,
+    "validate": 0,
+    "publish": 0
+  },
+  "index_bytes": 13302793
+}
+```
+
+Pass `--no-dominators` to omit the dominator stage; the resulting index
+will report `"has_dominators": false` and will not contain
+`dom_parent.bin`, `dom_order.bin`, or `retained.bin`.
+
+### `hunt dominator 0x3000` (JSON)
+
+```json
+{
+  "id": "0x0000000000003000",
+  "ordinal": 4218,
+  "dominator": "0x0000000000002fc0",
+  "retained_bytes": 18432
+}
+```
+
+If the object is the virtual root or unreachable, `dominator` is `null`.
+
+### `hunt dominator-tree 0x3000` (JSON, abbreviated)
+
+```json
+{
+  "id": "0x0000000000003000",
+  "ordinal": 4218,
+  "path": [
+    { "ordinal": 4218, "id": "0x0000000000003000", "retained_bytes": 18432 },
+    { "ordinal": 4088, "id": "0x0000000000002fc0", "retained_bytes": 65536 },
+    { "ordinal": 170877, "id": null, "retained_bytes": 10078703 }
+  ]
+}
+```
+
 ### `hunt threads` (plain text, excerpt)
 
 ```
@@ -583,6 +678,10 @@ Typical measurements on a single modern core:
 
 - Index build throughput: 60–120 MB/s of source HPROF.
 - 20 GB dump indexed end-to-end in under 3 minutes.
+- The dominator stage uses a per-node memory model (~29 B/node plus the
+  DFS stack) and is bounded by `--dominator-budget-mb`. On the
+  `fixtures/heapforge.hprof` sample it rounds to 0 ms in the coarse
+  timing output.
 - Subsequent `histogram`, `classes`, and `info` queries return in
   milliseconds (served from the overview cache).
 - `roots` and `tree` queries run as BFS over the CSR graph; latency
@@ -637,6 +736,12 @@ src/
     Csr.zig             CSR graph construction
     Layouts.zig         On-disk record layouts
     Join.zig            Catalog/edge/CSR join
+    Dominator.zig       Dominator-tree stage orchestrator
+    dominator/          Dominator algorithm modules
+      Backend.zig       Backend interface and options
+      Chk.zig           Cooper-Harvey-Kennedy (CHK) algorithm
+      CsrView.zig       CSR read-only view
+      Numbering.zig     Iterative DFS / reverse postorder
     Preflight.zig       Pre-index validation
     Publish.zig         Index publication
     Validate.zig        Post-build validation
