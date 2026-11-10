@@ -580,19 +580,25 @@ pub const commands = [_]Command{
     },
     .{
         .name = "dominator-tree",
-        .description = "Print the dominator chain from an object up to the top of the reachable graph.",
+        .description = "Print the bounded dominator chain from an object up to the top of the reachable graph.",
         .long_description = "Walks the immediate-dominator links from the given object up to the " ++
             "top of the reachable graph and prints each node with its retained byte size. " ++
-            "Requires an index built with dominators (the default for hunt index).",
+            "The chain is fully determined at index time, so the walk can be bounded with " ++
+            "--depth and --max-nodes exactly like hunt tree; when a bound cuts the chain " ++
+            "short, the output reports \"truncated\": true. Requires an index built " ++
+            "with dominators (the default for hunt index).",
         .usage = "hunt dominator-tree [file.hprof] <id> [options]",
         .options = &.{
             .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
             .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
             .{ .flags = "--source", .argument = "<file.hprof>", .description = "Override the HPROF source path stored in the index." },
+            .{ .flags = "--depth", .argument = "<n>", .description = "Maximum number of dominator links to follow from the starting object. The chain has one more node than this when it is not truncated." },
+            .{ .flags = "--max-nodes", .argument = "<n>", .description = "Maximum number of nodes to include in the output path." },
         },
         .examples = &.{
             "hunt dominator-tree heapdump.hprof 0x3000",
             "hunt dominator-tree 0x3000 --index-dir ./idx",
+            "hunt dominator-tree 0x3000 --index-dir ./idx --depth 5",
         },
         .exit_codes = &.{
             .{ .code = 0, .description = "Dominator tree printed successfully." },

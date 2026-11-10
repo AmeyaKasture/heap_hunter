@@ -54,10 +54,10 @@ the class pattern.
 | `objects`, `sample` | `hunt <cmd> '<class-regex>' <dump.hprof> [options]` |
 | `object`, `refs-from`, `refs-to`, `roots`, `tree`, `dominator`, `dominator-tree` | `hunt <cmd> <object-id> <dump.hprof> [options]` |
 
-`dominator` and `dominator-tree` take only `--index-dir` and `--source`. They have no
-`--max-visited`, `--depth`, or `--max-nodes` flags — the dominator chain is computed
-eagerly at index time, so a lookup is a constant-time read (measured at ~30 ms on a
-12.7 M-object heap).
+`dominator` takes only `--index-dir` and `--source`. `dominator-tree` also accepts
+`--depth` and `--max-nodes` to bound the chain, exactly like `hunt tree` bounds a graph
+walk. Neither has `--max-visited` — the dominator chain is computed eagerly at index
+time, so a lookup is a constant-time read (measured at ~30 ms on a 12.7 M-object heap).
 
 To point at a different config for one run, use `--config <file>` **before** the
 command:
@@ -316,7 +316,7 @@ hunt dominator-tree 0x0000000708800840 /dumps/heap.hprof
 ```
 
 ```json
-{"id":"0x0000000708800840","ordinal":58,
+{"id":"0x0000000708800840","ordinal":58,"truncated":false,
  "path":[{"ordinal":58,"id":"0x0000000708800840","retained_bytes":4134},
          {"ordinal":358,"id":"0x0000000708803d78","retained_bytes":8402},
          {"ordinal":359,"id":"0x0000000708803f88","retained_bytes":4195549725}]}
@@ -335,6 +335,11 @@ to the top of the reachable graph. Each step is the unique unavoidable holder.
   to their own shallow size and a **one-node** `dominator-tree` path. Distinguish the two
   cases by the tree length: `path` with a single element ⇒ unreachable garbage; a long
   `path` ending in a `null` dominator ⇒ top of the reachable graph.
+- **`truncated` tells you whether a bound cut the chain short.** `hunt dominator-tree`
+  accepts `--depth` and `--max-nodes`; when a bound actually hides part of the chain the
+  output reports `"truncated": true`. A chain that ends naturally reports
+  `"truncated": false`. **Always check it before quoting a chain length** — a truncated
+  chain is not the whole story, and the top holder is exactly what a bound hid.
 - **`retained_bytes` is non-decreasing** as you walk up the chain. If you ever see a
   parent with a *smaller* retained size than its child, the dominator data is corrupt.
 - **`retained_bytes` ≥ `shallow_bytes`** always.
@@ -508,9 +513,11 @@ Other traps:
   by default; `--no-dominators` skips the stage and deletes `dom_parent.bin`,
   `dom_order.bin`, and `retained.bin`. The stage is bounded by
   `--dominator-budget-mb` (default 4096) and fails with a user error if it cannot fit.
-- **`hunt dominator` and `hunt dominator-tree` have no `--max-visited`/`--depth`
-  flags.** A lookup is a constant-time read, so there is nothing to tune. Use
-  `hunt tree` for bounded graph expansion.
+- **Neither dominator command has a `--max-visited` flag.** The chain is precomputed, so
+  a lookup is a constant-time read and there is nothing to bound. `hunt dominator-tree`
+  does accept `--depth` and `--max-nodes` to cap how much of the chain is printed; when
+  they hide part of the chain, the output reports `"truncated": true`. Use `hunt tree`
+  for bounded *graph* expansion.
 
 ## Example
 
@@ -540,6 +547,7 @@ Phase 6  hunt roots 0x0000000708800840 after.hprof
 Phase 6b hunt dominator 0x0000000708800840 after.hprof
         -> dominator 0x0000000708803d78, retained_bytes 4134
         hunt dominator-tree 0x0000000708800840 after.hprof
+        -> truncated: false
         -> CartSnapshot 4,134 -> SessionRegistry 8,402 -> AppClassLoader 5,828,392,925
         (the registry entry retains the whole heap; that is the fix target)
 

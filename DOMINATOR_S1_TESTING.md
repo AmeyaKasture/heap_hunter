@@ -17,6 +17,9 @@ zig build test
 
 # ReleaseSafe
 zig build test -Doptimize=ReleaseSafe
+
+# Run a subset by test-name substring (much faster while iterating)
+zig build test -Dtest-filter="dominator chain"
 ```
 
 ## 3. End-to-end index with dominators
@@ -99,11 +102,15 @@ Requires an index built **with** dominators.
 # Immediate dominator and retained size of a single object.
 ./zig-out/bin/hunt dominator 0x3000 --index-dir /tmp/idx_dominators
 
-# Dominator chain from an object up to the virtual root.
+# Dominator chain from an object up to the top of the reachable graph.
 ./zig-out/bin/hunt dominator-tree 0x3000 --index-dir /tmp/idx_dominators
+
+# Bounded dominator chain (same semantics as hunt tree).
+./zig-out/bin/hunt dominator-tree 0x3000 --index-dir /tmp/idx_dominators --depth 5 --max-nodes 10
 ```
 
-Both commands print JSON. `dominator-tree` is useful for understanding what keeps an object alive.
+All commands print JSON. `dominator-tree` is useful for understanding what keeps an object alive.
+When a bound cuts the chain short, the output reports `"truncated": true`.
 
 ## 9. Retained reconciliation (sanity)
 

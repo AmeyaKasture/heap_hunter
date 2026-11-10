@@ -387,8 +387,14 @@ JSON error payload inside the content block.
 
 | Command | Description |
 |---------|-------------|
-| `dominator <id> --index-dir <dir>` | Immediate dominator and retained size of an object. |
-| `dominator-tree <id> --index-dir <dir>` | Dominator chain from an object up to the top of the reachable graph. |
+| `dominator [file.hprof] <id> [options]` | Immediate dominator and retained size of an object. |
+| `dominator-tree [file.hprof] <id> [options]` | Dominator chain from an object up to the top of the reachable graph. |
+
+`dominator` accepts `--index-dir` and `--source`. `dominator-tree` additionally accepts `--depth` and `--max-nodes` to bound the pre-computed dominator chain exactly like `hunt tree` bounds a graph walk.
+
+`--depth N` follows at most `N` dominator links, yielding at most `N + 1` nodes. `--max-nodes N` yields at most `N` nodes. When both are given, the tighter bound wins.
+
+When a bound cuts the chain short, the output carries `"truncated": true`, matching the convention used by `hunt roots`. A chain that ends naturally — because the object has no dominator, or because it reached the top of the reachable graph — reports `"truncated": false`, so a caller can tell a bounded walk from a genuinely short chain.
 
 ### Common options
 
@@ -404,8 +410,8 @@ JSON error payload inside the content block.
 | `--limit <n>` | list and tracing commands | Maximum items to emit. |
 | `--offset <n>` | list and tracing commands | Skip the first `n` items. |
 | `--reverse` | `objects`, `sample` | Emit items in reverse ordinal order. |
-| `--depth <n>` | `tree` | Maximum depth of the expanded tree. |
-| `--max-nodes <n>` | `tree` | Maximum number of nodes in the tree. |
+| `--depth <n>` | `tree`, `dominator-tree` | Maximum depth of the expanded tree or dominator chain. |
+| `--max-nodes <n>` | `tree`, `dominator-tree` | Maximum number of nodes in the tree or dominator chain. |
 | `--max-visited <n>` | `roots` | BFS visit budget for the root search. |
 | `--source <path>` | query commands | Override the path to the original HPROF dump. |
 | `--no-dominators` | `index` | Skip dominator computation and delete stale dominator files. |
@@ -589,6 +595,7 @@ single-node `path`, while the top of the reachable graph yields a longer chain.
 {
   "id": "0x0000000708800840",
   "ordinal": 58,
+  "truncated": false,
   "path": [
     { "ordinal": 58,    "id": "0x0000000708800840", "retained_bytes": 1770 },
     { "ordinal": 358,   "id": "0x0000000708803d78", "retained_bytes": 37413 },
@@ -603,6 +610,23 @@ The chain runs bottom-up, from the object to the top of the reachable graph, and
 `retained_bytes` never decreases as you walk up it. The virtual root is a synthetic
 construct of the tool and is not emitted as a node, so the chain ends at a real
 object — usually a `ClassLoader` or a `Thread`.
+
+Use `--depth` and `--max-nodes` to cap the output. A bounded walk reports
+`"truncated": true` when the bound actually cut the chain short:
+
+```console
+$ hunt dominator-tree 0x0000000708800840 --depth 2
+{
+  "id": "0x708800840",
+  "ordinal": 58,
+  "truncated": true,
+  "path": [
+    { "ordinal": 58,    "id": "0x0000000708800840", "retained_bytes": 1770 },
+    { "ordinal": 358,   "id": "0x0000000708803d78", "retained_bytes": 37413 },
+    { "ordinal": 57734, "id": "0x0000000708c2c430", "retained_bytes": 37461 }
+  ]
+}
+```
 
 ### `hunt threads` (plain text, excerpt)
 

@@ -650,16 +650,86 @@ pub fn runDominatorCommand(
     try stdout.flush();
 }
 
+pub const DominatorTreeOptions = struct {
+    depth: ?u32 = null,
+    max_nodes: ?u32 = null,
+};
+
+/// Walk the immediate-dominator chain starting at `start`, appending each
+/// ordinal to `chain` until the top of the reachable graph is reached or a
+/// bound cuts the walk short.
+///
+/// `parent` returns the immediate dominator of an ordinal, or `null` when the
+/// ordinal has none (the top of the reachable graph, or an unreachable node).
+///
+/// Returns true when a bound cut the chain short. A chain that ends naturally
+/// is not truncated, so a caller can distinguish "the bound stopped the walk"
+/// from "the chain really was this short".
+///
+/// The bound semantics match `hunt tree`: `--depth N` follows at most N
+/// dominator links, yielding at most N + 1 nodes, and `--max-nodes N` yields
+/// at most N nodes. When both are given, the tighter bound wins.
+fn collectDominatorChain(
+    allocator: std.mem.Allocator,
+    chain: *std.ArrayList(u32),
+    start: u32,
+    options: DominatorTreeOptions,
+    context: anytype,
+) !bool {
+    const parent = struct {
+        fn get(ctx: @TypeOf(context), ordinal: u32) ?u32 {
+            return ctx.parent(ordinal);
+        }
+    }.get;
+
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+
+    var current: ?u32 = start;
+    var depth_remaining: ?u32 = options.depth;
+
+    while (current) |node| {
+        if (seen.contains(node)) break; // safety break on cycles
+        try seen.put(node, {});
+
+        if (options.max_nodes) |max| {
+            if (chain.items.len >= max) {
+                // The chain continues past the bound, so it is truncated.
+                return true;
+            }
+        }
+        try chain.append(allocator, node);
+
+        const parent_ordinal = parent(context, node);
+        if (depth_remaining) |dr| {
+            if (dr == 0) {
+                // The chain continues past the bound, so it is truncated.
+                return parent_ordinal != null;
+            }
+            depth_remaining = dr - 1;
+        }
+
+        current = parent_ordinal;
+    }
+
+    return false;
+}
+
 /// Print the dominator chain from an object up to the top of the reachable graph.
 /// The chain ends at a real object (the dominator tree is rooted at the virtual
 /// root, but the virtual root itself carries no retained size and is not
 /// emitted as a node).
+///
+/// The chain may be shortened by `--depth` or `--max-nodes`. When that happens
+/// the output carries `"truncated": true`, matching the convention used by
+/// `hunt roots`, so a caller can tell a cut chain from a naturally short one.
 pub fn runDominatorTreeCommand(
     allocator: std.mem.Allocator,
     io: Io,
     index_dir: []const u8,
     source_override: ?[]const u8,
     raw_id: u64,
+    options: DominatorTreeOptions,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !void {
@@ -680,24 +750,30 @@ pub fn runDominatorTreeCommand(
     };
 
     // Collect the chain from start up to the top of the reachable graph
-    // (or an unreachable node, which has no dominator).
+    // (or an unreachable node, which has no dominator), honouring depth and
+    // max_nodes bounds exactly like hunt tree.
     var chain = std.ArrayList(u32).empty;
     defer chain.deinit(allocator);
 
-    var current: ?u32 = start_ordinal;
-    var seen = std.AutoHashMap(u32, void).init(allocator);
-    defer seen.deinit();
+    const lookup = struct {
+        reader: *const IndexReader.Reader,
 
-    while (current) |node| {
-        if (seen.contains(node)) break; // safety break on cycles
-        try seen.put(node, {});
-        try chain.append(allocator, node);
-        current = reader.domParent(node);
-    }
+        fn parent(self: @This(), ordinal: u32) ?u32 {
+            return self.reader.domParent(ordinal);
+        }
+    }{ .reader = &reader };
+    const truncated = try collectDominatorChain(
+        allocator,
+        &chain,
+        start_ordinal,
+        options,
+        lookup,
+    );
 
     try stdout.writeAll("{\n");
     try stdout.print("  \"id\": \"{s}\",\n", .{id_str});
     try stdout.print("  \"ordinal\": {d},\n", .{start_ordinal});
+    try stdout.print("  \"truncated\": {},\n", .{truncated});
     try stdout.writeAll("  \"path\": [\n");
 
     for (chain.items, 0..) |node, i| {
@@ -782,4 +858,117 @@ fn jsonEscapeString(writer: anytype, s: []const u8) !void {
             else => try writer.writeByte(c),
         }
     }
+}
+
+/// A dominator chain fixture: node `i` is dominated by node `i + 1`, and the
+/// last node has no dominator (it is the top of the reachable graph).
+const ChainFixture = struct {
+    /// The immediate dominator of `ordinal`, or null at the top of the chain.
+    fn parent(ordinal: u32) ?u32 {
+        return if (ordinal >= 4) null else ordinal + 1;
+    }
+};
+
+/// Collect a chain into `chain` and report whether a bound truncated it.
+fn collectForTest(
+    allocator: std.mem.Allocator,
+    chain: *std.ArrayList(u32),
+    start: u32,
+    options: DominatorTreeOptions,
+) !bool {
+    return collectDominatorChain(allocator, chain, start, options, ChainFixture);
+}
+
+test "dominator chain without bounds reaches the top of the graph" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{});
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expectEqual(@as(u32, 0), chain.items[0]);
+    try std.testing.expectEqual(@as(u32, 4), chain.items[4]);
+    // The chain ended naturally, so it was not truncated.
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain depth bound cuts the chain and reports truncation" {
+    const allocator = std.testing.allocator;
+
+    // Depth 2 follows two links, yielding three nodes out of five.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 2 });
+
+    try std.testing.expectEqual(@as(usize, 3), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain depth bound that reaches the top is not truncated" {
+    const allocator = std.testing.allocator;
+
+    // Depth 4 reaches the last node of a five-node chain, so nothing is hidden.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 4 });
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain max-nodes bound cuts the chain and reports truncation" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain max-nodes bound that covers the chain is not truncated" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 5 });
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain max-nodes of zero yields an empty chain" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 0 });
+
+    try std.testing.expectEqual(@as(usize, 0), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain starting at the top is a single node and is not truncated" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 4, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain applies the tighter of the two bounds" {
+    const allocator = std.testing.allocator;
+
+    // Depth 2 allows three nodes, max-nodes 2 allows two; the tighter wins.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 2, .max_nodes = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), chain.items.len);
+    try std.testing.expect(truncated);
 }
