@@ -1,11 +1,10 @@
 # S1 Dominator CHK Engine — Manual Test Checklist
 
-Run these from `/Users/ameyakasture/heap_hunter`.
+Run these from the repository root.
 
 ## 1. Formatting / compile sanity
 
 ```bash
-cd /Users/ameyakasture/heap_hunter
 zig fmt --check src/root.zig src/index/Dominator.zig src/index/dominator/*.zig src/Commands.zig src/index/Publish.zig src/index/Manifest.zig src/index/Preflight.zig src/index/Validate.zig src/index/IndexReader.zig src/Cli.zig src/Config.zig
 zig build
 ```
