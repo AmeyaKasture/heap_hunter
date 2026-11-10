@@ -580,9 +580,9 @@ pub const commands = [_]Command{
     },
     .{
         .name = "dominator-tree",
-        .description = "Print the dominator chain from an object up to the virtual root.",
+        .description = "Print the dominator chain from an object up to the top of the reachable graph.",
         .long_description = "Walks the immediate-dominator links from the given object up to the " ++
-            "virtual GC root and prints each node with its retained byte size. " ++
+            "top of the reachable graph and prints each node with its retained byte size. " ++
             "Requires an index built with dominators (the default for hunt index).",
         .usage = "hunt dominator-tree [file.hprof] <id> [options]",
         .options = &.{

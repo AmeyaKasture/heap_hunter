@@ -65,10 +65,10 @@ the size of the source dump.
 - **Class histogram** (`histogram`): aggregate instances and shallow
   bytes per class, with regex match, exclude, and minimum-size filters.
 - **Loaded classes** (`classes`): class name, superclass, instance size.
-- **Dominator tree and retained sizes** (`index --dominators`): immediate
-  dominator tree, dominator order, and retained bytes per object. Stored
-  in `dom_parent.bin`, `dom_order.bin`, and `retained.bin`; can be skipped
-  with `--no-dominators`.
+- **Dominator tree and retained sizes** (`index`): immediate dominator
+  tree, dominator order, and retained bytes per object. Stored in
+  `dom_parent.bin`, `dom_order.bin`, and `retained.bin`; computed by
+  default and can be skipped with `--no-dominators`.
 
 ### Object queries
 
@@ -388,7 +388,7 @@ JSON error payload inside the content block.
 | Command | Description |
 |---------|-------------|
 | `dominator <id> --index-dir <dir>` | Immediate dominator and retained size of an object. |
-| `dominator-tree <id> --index-dir <dir>` | Dominator chain from an object up to the virtual root. |
+| `dominator-tree <id> --index-dir <dir>` | Dominator chain from an object up to the top of the reachable graph. |
 
 ### Common options
 
@@ -570,28 +570,39 @@ will report `"has_dominators": false` and will not contain
 
 ```json
 {
-  "id": "0x0000000000003000",
-  "ordinal": 4218,
-  "dominator": "0x0000000000002fc0",
-  "retained_bytes": 18432
+  "id": "0x708800840",
+  "ordinal": 58,
+  "dominator": "0x0000000708803d78",
+  "retained_bytes": 1770
 }
 ```
 
-If the object is the virtual root or unreachable, `dominator` is `null`.
+`retained_bytes` is how many bytes would be freed if this object became garbage.
+
+If the object is unreachable, or is at the top of the reachable graph, `dominator` is
+`null`. Use `dominator-tree` to tell the two apart: an unreachable object yields a
+single-node `path`, while the top of the reachable graph yields a longer chain.
 
 ### `hunt dominator-tree 0x3000` (JSON, abbreviated)
 
 ```json
 {
-  "id": "0x0000000000003000",
-  "ordinal": 4218,
+  "id": "0x0000000708800840",
+  "ordinal": 58,
   "path": [
-    { "ordinal": 4218, "id": "0x0000000000003000", "retained_bytes": 18432 },
-    { "ordinal": 4088, "id": "0x0000000000002fc0", "retained_bytes": 65536 },
-    { "ordinal": 170877, "id": null, "retained_bytes": 10078703 }
+    { "ordinal": 58,    "id": "0x0000000708800840", "retained_bytes": 1770 },
+    { "ordinal": 358,   "id": "0x0000000708803d78", "retained_bytes": 37413 },
+    { "ordinal": 57734, "id": "0x0000000708c2c430", "retained_bytes": 37461 },
+    { "ordinal": 359,   "id": "0x0000000708803f88", "retained_bytes": 37493 },
+    { "ordinal": 89294, "id": "0x0000000708ec4800", "retained_bytes": 37583 }
   ]
 }
 ```
+
+The chain runs bottom-up, from the object to the top of the reachable graph, and
+`retained_bytes` never decreases as you walk up it. The virtual root is a synthetic
+construct of the tool and is not emitted as a node, so the chain ends at a real
+object — usually a `ClassLoader` or a `Thread`.
 
 ### `hunt threads` (plain text, excerpt)
 

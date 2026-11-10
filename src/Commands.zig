@@ -650,7 +650,10 @@ pub fn runDominatorCommand(
     try stdout.flush();
 }
 
-/// Print the dominator chain from an object up to the virtual root.
+/// Print the dominator chain from an object up to the top of the reachable graph.
+/// The chain ends at a real object (the dominator tree is rooted at the virtual
+/// root, but the virtual root itself carries no retained size and is not
+/// emitted as a node).
 pub fn runDominatorTreeCommand(
     allocator: std.mem.Allocator,
     io: Io,
@@ -676,7 +679,8 @@ pub fn runDominatorTreeCommand(
         return error.ObjectNotFound;
     };
 
-    // Collect the chain from start up to the virtual root (or an unreachable node).
+    // Collect the chain from start up to the top of the reachable graph
+    // (or an unreachable node, which has no dominator).
     var chain = std.ArrayList(u32).empty;
     defer chain.deinit(allocator);
 
