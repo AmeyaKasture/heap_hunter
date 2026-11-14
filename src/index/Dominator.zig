@@ -4,11 +4,13 @@ const Io = std.Io;
 
 const Backend = @import("dominator/Backend.zig");
 const CsrView = @import("dominator/CsrView.zig").CsrView;
+const Graphs = @import("dominator/Graphs.zig");
 const Numbering = @import("dominator/Numbering.zig");
 const Chk = @import("dominator/Chk.zig");
 const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
+const TestSupport = @import("dominator/TestSupport.zig");
 
 pub const NONE = std.math.maxInt(u32);
 
@@ -247,8 +249,9 @@ fn writeU64File(io: Io, path: []const u8, values: []const u64) !void {
     try writer.flush();
 }
 
-/// Writes a minimal CSR + catalog into `dir` for the given edges.
-/// out_offsets/out_targets and in_offsets/in_sources, u64/u32 LE.
+/// Converts the test's edge pairs into a `Graphs.Graph` and delegates to the
+/// shared `TestSupport.writeCsrAndCatalog`, so CSR and catalog bytes are
+/// produced by exactly one implementation in tests.
 fn writeTestCsr(
     allocator: std.mem.Allocator,
     io: Io,
@@ -259,142 +262,22 @@ fn writeTestCsr(
 ) !void {
     std.debug.assert(shallow.len == n_nodes - 1);
 
-    const out_offsets_path = try std.fs.path.join(allocator, &.{ dir, "out_offsets.bin" });
-    defer allocator.free(out_offsets_path);
-    const out_targets_path = try std.fs.path.join(allocator, &.{ dir, "out_targets.bin" });
-    defer allocator.free(out_targets_path);
-    const in_offsets_path = try std.fs.path.join(allocator, &.{ dir, "in_offsets.bin" });
-    defer allocator.free(in_offsets_path);
-    const in_sources_path = try std.fs.path.join(allocator, &.{ dir, "in_sources.bin" });
-    defer allocator.free(in_sources_path);
-    const catalog_path = try std.fs.path.join(allocator, &.{ dir, "catalog.bin" });
-    defer allocator.free(catalog_path);
-
-    var out_degrees = try allocator.alloc(u32, n_nodes);
-    defer allocator.free(out_degrees);
-    @memset(out_degrees, 0);
-    var in_degrees = try allocator.alloc(u32, n_nodes);
-    defer allocator.free(in_degrees);
-    @memset(in_degrees, 0);
-
-    for (edges) |edge| {
-        out_degrees[edge[0]] += 1;
-        in_degrees[edge[1]] += 1;
+    const graph_edges = try allocator.alloc(Graphs.Edge, edges.len);
+    defer allocator.free(graph_edges);
+    for (edges, 0..) |edge, i| {
+        graph_edges[i] = .{ .source = edge[0], .target = edge[1] };
     }
 
-    var out_offsets = try allocator.alloc(u64, n_nodes + 1);
-    defer allocator.free(out_offsets);
-    var in_offsets = try allocator.alloc(u64, n_nodes + 1);
-    defer allocator.free(in_offsets);
+    const shallow_copy = try allocator.alloc(u32, shallow.len);
+    defer allocator.free(shallow_copy);
+    @memcpy(shallow_copy, shallow);
 
-    out_offsets[0] = 0;
-    in_offsets[0] = 0;
-    for (0..n_nodes) |i| {
-        out_offsets[i + 1] = out_offsets[i] + out_degrees[i];
-        in_offsets[i + 1] = in_offsets[i] + in_degrees[i];
-    }
-
-    var out_next = try allocator.alloc(u64, n_nodes);
-    defer allocator.free(out_next);
-    var in_next = try allocator.alloc(u64, n_nodes);
-    defer allocator.free(in_next);
-    for (0..n_nodes) |i| {
-        out_next[i] = out_offsets[i];
-        in_next[i] = in_offsets[i];
-    }
-
-    var out_targets = try allocator.alloc(u32, edges.len);
-    defer allocator.free(out_targets);
-    var in_sources = try allocator.alloc(u32, edges.len);
-    defer allocator.free(in_sources);
-
-    for (edges) |edge| {
-        const s = edge[0];
-        const t = edge[1];
-        const out_idx = out_next[s];
-        out_next[s] += 1;
-        out_targets[out_idx] = t;
-        const in_idx = in_next[t];
-        in_next[t] += 1;
-        in_sources[in_idx] = s;
-    }
-
-    // Sort adjacency lists by target/source respectively to match CSR writer output.
-    for (0..n_nodes) |i| {
-        const start = out_offsets[i];
-        const end = out_offsets[i + 1];
-        std.mem.sort(u32, out_targets[start..end], {}, std.sort.asc(u32));
-    }
-    for (0..n_nodes) |i| {
-        const start = in_offsets[i];
-        const end = in_offsets[i + 1];
-        std.mem.sort(u32, in_sources[start..end], {}, std.sort.asc(u32));
-    }
-
-    {
-        const f = try Io.Dir.cwd().createFile(io, out_offsets_path, .{});
-        defer f.close(io);
-        var buf: [65536]u8 = undefined;
-        var writer: Io.File.Writer = .init(f, io, &buf);
-        for (out_offsets) |off| {
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, off, .little);
-            try writer.interface.writeAll(&b);
-        }
-        try writer.flush();
-    }
-    {
-        const f = try Io.Dir.cwd().createFile(io, out_targets_path, .{});
-        defer f.close(io);
-        var buf: [65536]u8 = undefined;
-        var writer: Io.File.Writer = .init(f, io, &buf);
-        for (out_targets) |t| {
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b, t, .little);
-            try writer.interface.writeAll(&b);
-        }
-        try writer.flush();
-    }
-    {
-        const f = try Io.Dir.cwd().createFile(io, in_offsets_path, .{});
-        defer f.close(io);
-        var buf: [65536]u8 = undefined;
-        var writer: Io.File.Writer = .init(f, io, &buf);
-        for (in_offsets) |off| {
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, off, .little);
-            try writer.interface.writeAll(&b);
-        }
-        try writer.flush();
-    }
-    {
-        const f = try Io.Dir.cwd().createFile(io, in_sources_path, .{});
-        defer f.close(io);
-        var buf: [65536]u8 = undefined;
-        var writer: Io.File.Writer = .init(f, io, &buf);
-        for (in_sources) |s| {
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b, s, .little);
-            try writer.interface.writeAll(&b);
-        }
-        try writer.flush();
-    }
-    {
-        const f = try Io.Dir.cwd().createFile(io, catalog_path, .{});
-        defer f.close(io);
-        var buf: [65536]u8 = undefined;
-        var writer: Io.File.Writer = .init(f, io, &buf);
-        for (shallow, 0..) |sz, ord| {
-            try Scanner.writeCatalogRow(&writer.interface, .{
-                .raw_id = @intCast(ord + 1),
-                .source_offset = 0,
-                .class_raw_id = 0,
-                .shallow_size = sz,
-                .kind = .instance,
-            });
-        }
-        try writer.flush();
-    }
+    const graph = Graphs.Graph{
+        .n_nodes = n_nodes,
+        .edges = graph_edges,
+        .shallow = shallow_copy,
+    };
+    try TestSupport.writeCsrAndCatalog(allocator, io, dir, graph);
 }
 
 fn runDominatorTest(
