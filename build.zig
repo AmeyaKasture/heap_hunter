@@ -70,4 +70,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "log", .module = log_mod },
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-dominator",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_step = b.step("bench", "Run developer benchmarks");
+    const run_bench = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench.step);
+    if (b.args) |bench_args| {
+        run_bench.addArgs(bench_args);
+    }
 }

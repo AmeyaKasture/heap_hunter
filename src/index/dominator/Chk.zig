@@ -78,34 +78,33 @@ fn sweep(
     var rpo_slot: u32 = 1;
     while (rpo_slot < n_reachable) : (rpo_slot += 1) {
         const v = ctx.rpo_vertex[rpo_slot];
-        if (idom[v] != NONE) continue;
 
+        var candidate: u32 = NONE;
         const shortcut = sole_pred[v];
         if (shortcut != NONE) {
-            idom[v] = shortcut;
-            stats.shortcut_nodes += 1;
-            changed = true;
-            continue;
-        }
-
-        const preds = ctx.in_edges.edges(v);
-        var candidate: u32 = NONE;
-        for (preds) |p| {
-            if (p == v) continue;
-            if (!ctx.reachable[p]) continue;
-            if (ctx.rpo_num[p] >= ctx.rpo_num[v]) continue;
-            if (idom[p] == NONE) continue;
-            if (candidate == NONE) {
-                candidate = p;
-            } else {
-                candidate = intersect(ctx, idom, p, candidate, stats);
+            candidate = shortcut;
+        } else {
+            const preds = ctx.in_edges.edges(v);
+            for (preds) |p| {
+                if (p == v) continue;
+                if (!ctx.reachable[p]) continue;
+                if (idom[p] == NONE) continue;
+                if (candidate == NONE) {
+                    candidate = p;
+                } else {
+                    candidate = intersect(ctx, idom, p, candidate, stats);
+                }
             }
         }
         if (candidate == NONE) continue;
         if (idom[v] != candidate) {
             idom[v] = candidate;
             changed = true;
-            stats.nodes_changed += 1;
+            if (shortcut != NONE) {
+                stats.shortcut_nodes += 1;
+            } else {
+                stats.nodes_changed += 1;
+            }
         }
     }
     return changed;
