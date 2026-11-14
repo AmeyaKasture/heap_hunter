@@ -216,6 +216,10 @@ pub const Reader = struct {
     in_sources: []const u8,
     roots_data: []const u8,
 
+    dom_parent: []const u8,
+    dom_order: []const u8,
+    retained: []const u8,
+
     classes_data: []const u8,
     fields_data: []const u8,
     thread_traces: ThreadTraces.Parsed,
@@ -266,7 +270,10 @@ pub const Reader = struct {
             .in_offsets = &.{},
             .in_sources = &.{},
             .roots_data = &.{},
-            .classes_data = &.{},
+            .dom_parent = &.{},
+            .dom_order = &.{},
+            .retained = &.{},
+            .classes_data = &[_]u8{},
             .fields_data = &.{},
             .thread_traces = ThreadTraces.Parsed.empty(allocator),
             .classes = &.{},
@@ -292,6 +299,13 @@ pub const Reader = struct {
         self.in_offsets = try self.mapFile("in_offsets.bin");
         self.in_sources = try self.mapFile("in_sources.bin");
         self.roots_data = try self.mapFile("roots.bin");
+
+        // Map optional dominator files if the manifest says they exist.
+        if (self.manifest.has_dominators) {
+            self.dom_parent = try self.mapFile("dom_parent.bin");
+            self.dom_order = try self.mapFile("dom_order.bin");
+            self.retained = try self.mapFile("retained.bin");
+        }
 
         try self.validateSizes();
 
@@ -404,6 +418,14 @@ pub const Reader = struct {
         if (self.manifest.n_edges * 4 != self.out_targets.len) return error.CorruptIndexFile;
         if (self.manifest.n_edges * 4 != self.in_sources.len) return error.CorruptIndexFile;
         if (self.roots_data.len % Csr.roots_bin_record_size != 0) return error.CorruptIndexFile;
+
+        if (self.manifest.has_dominators) {
+            const expected_nodes = self.n_objects + 1;
+            if (self.dom_parent.len != expected_nodes * 4) return error.CorruptIndexFile;
+            if (self.retained.len != expected_nodes * 8) return error.CorruptIndexFile;
+            if (self.dom_order.len % 4 != 0) return error.CorruptIndexFile;
+            if (self.dom_order.len / 4 != self.manifest.n_dominator_nodes) return error.CorruptIndexFile;
+        }
     }
 
     fn parseClasses(self: *Reader) !void {
@@ -586,6 +608,26 @@ pub const Reader = struct {
 
     pub fn inEdges(self: *const Reader, ordinal: u32) []align(1) const u32 {
         return self.csrRange(self.in_offsets, self.in_sources, ordinal);
+    }
+
+    /// Immediate dominator of `ordinal`, or `null` if the node is the virtual
+    /// root or unreachable. Returns `null` when the index has no dominator data.
+    pub fn domParent(self: *const Reader, ordinal: u32) ?u32 {
+        if (!self.manifest.has_dominators) return null;
+        if (ordinal > self.n_objects) return null;
+        const off = ordinal * 4;
+        const value = std.mem.readInt(u32, self.dom_parent[off..][0..4], .little);
+        const NONE = std.math.maxInt(u32);
+        return if (value == NONE) null else value;
+    }
+
+    /// Retained bytes for `ordinal`. Returns 0 when the index has no dominator
+    /// data or when `ordinal` is out of range.
+    pub fn retainedBytes(self: *const Reader, ordinal: u32) u64 {
+        if (!self.manifest.has_dominators) return 0;
+        if (ordinal > self.n_objects) return 0;
+        const off = ordinal * 8;
+        return std.mem.readInt(u64, self.retained[off..][0..8], .little);
     }
 
     fn csrRange(self: *const Reader, offsets: []const u8, adjacency: []const u8, ordinal: u32) []align(1) const u32 {
@@ -922,11 +964,11 @@ pub fn parseRawId(s: []const u8) !hprof.Id {
 // JSON output helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn writeId(writer: *Io.Writer, id: hprof.Id) !void {
+pub fn writeId(writer: *Io.Writer, id: hprof.Id) !void {
     try writer.print("\"0x{x:0>16}\"", .{id});
 }
 
-fn writeRawIdOrNull(writer: *Io.Writer, id: hprof.Id) !void {
+pub fn writeRawIdOrNull(writer: *Io.Writer, id: hprof.Id) !void {
     if (id == 0) {
         try writer.writeAll("null");
     } else {

@@ -11,6 +11,7 @@ pub const Job = struct {
     index_dir: []const u8,
     staging_dir: []const u8,
     budget_bytes: usize,
+    dominator_budget_bytes: usize,
     fingerprint: Manifest.Fingerprint,
     header: hprof.Header.Header,
 
@@ -27,6 +28,8 @@ pub const Result = union(enum) {
 
 pub const Options = struct {
     sorting_budget_mb: u32 = 512,
+    dominator_budget_mb: u32 = 512,
+    compute_dominators: bool = true,
     force: bool = false,
 };
 
@@ -94,6 +97,7 @@ pub fn run(
         .index_dir = index_dir,
         .staging_dir = staging_dir,
         .budget_bytes = @as(usize, options.sorting_budget_mb) * 1024 * 1024,
+        .dominator_budget_bytes = @as(usize, options.dominator_budget_mb) * 1024 * 1024,
         .fingerprint = fingerprint,
         .header = header,
     } };
@@ -101,7 +105,7 @@ pub fn run(
 
 fn hasAllIndexFiles(io: Io, index_dir: []const u8) bool {
     const dir = Io.Dir.cwd();
-    for (Publish.final_files) |name| {
+    for (Publish.required_files) |name| {
         const path = std.fs.path.join(std.heap.page_allocator, &.{ index_dir, name }) catch return false;
         defer std.heap.page_allocator.free(path);
         var file = dir.openFile(io, path, .{}) catch return false;

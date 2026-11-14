@@ -49,6 +49,7 @@ $InstallDir = if ($env:HEAP_HUNTER_INSTALL_DIR) { $env:HEAP_HUNTER_INSTALL_DIR }
 $EnvFile = if ($env:HEAP_HUNTER_ENV_FILE) { $env:HEAP_HUNTER_ENV_FILE } else { Join-Path $env:USERPROFILE ".heap_hunter_env.ps1" }
 $IndexDirValue = if ($env:HEAP_HUNTER_INDEX_DIR) { $env:HEAP_HUNTER_INDEX_DIR } else { "index" }
 $SortingBudgetMb = if ($env:HEAP_HUNTER_SORTING_BUDGET_MB) { [int]$env:HEAP_HUNTER_SORTING_BUDGET_MB } else { 4096 }
+$DominatorBudgetMb = if ($env:HEAP_HUNTER_DOMINATOR_BUDGET_MB) { [int]$env:HEAP_HUNTER_DOMINATOR_BUDGET_MB } else { 4096 }
 $OptimizeMode = "ReleaseFast"
 $ApiUrl = "https://api.github.com/repos/$RepoSlug/releases/latest"
 $BinFile = "hunt.exe"
@@ -101,6 +102,7 @@ Environment:
   HEAP_HUNTER_CONFIG_FILE      Config file location
   HEAP_HUNTER_INDEX_DIR        index-dir value in config (default: index)
   HEAP_HUNTER_SORTING_BUDGET_MB sorting-budget-mb in config (default: 4096)
+  HEAP_HUNTER_DOMINATOR_BUDGET_MB dominator-budget-mb in config (default: 4096)
 "@
 }
 
@@ -389,7 +391,8 @@ function Create-Config {
     $configJson = @"
 {
   "index-dir": "$indexEscaped",
-  "sorting-budget-mb": $SortingBudgetMb
+  "sorting-budget-mb": $SortingBudgetMb,
+  "dominator-budget-mb": $DominatorBudgetMb
 }
 "@
     Set-Content -Path $script:ConfigFile -Value $configJson -Encoding UTF8
@@ -415,6 +418,7 @@ function Show-Summary {
     Write-Host "    $($script:ConfigFile)"
     Write-Host "    index-dir:          $IndexDirValue"
     Write-Host "    sorting-budget-mb:  $SortingBudgetMb"
+    Write-Host "    dominator-budget-mb: $DominatorBudgetMb"
     Write-Host ""
     Write-Host "Index location (index-dir `"$IndexDirValue`" is resolved relative to the current directory):"
     Write-Host "    hunt index <dump.hprof>     ->  .\$IndexDirValue\<dump-name>.idx\"

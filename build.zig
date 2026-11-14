@@ -61,8 +61,10 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose name contains this substring");
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 

@@ -572,6 +572,7 @@ fn createTestJob(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8) !Pre
         .staging_dir = staging_dir,
 
         .budget_bytes = 1024 * 1024,
+        .dominator_budget_bytes = 1024 * 1024,
         .fingerprint = fingerprint,
         .header = header,
     };
@@ -1023,6 +1024,7 @@ fn createTestJobFromSource(
         .staging_dir = staging_dir,
 
         .budget_bytes = 1024 * 1024,
+        .dominator_budget_bytes = 1024 * 1024,
         .fingerprint = fingerprint,
         .header = header,
     };

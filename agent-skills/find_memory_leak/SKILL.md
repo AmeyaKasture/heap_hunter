@@ -1,6 +1,6 @@
 ---
 name: findmemoryleak
-description: Use ONLY when the user asks to find a memory leak, analyse a Java heap dump for growth, or work out what is holding memory. Drives the `hunt` CLI end to end — class histogram, candidate objects, reference tracing, root path — against an already-indexed dump whose index location comes from the config file. Not about the HPROF file format or the index internals.
+description: Use ONLY when the user asks to find a memory leak, analyse a Java heap dump for growth, or work out what is holding memory. Drives the `hunt` CLI end to end — class histogram, candidate objects, reference tracing, dominator tree and retained sizes — against an already-indexed dump whose index location comes from the config file. Not about the HPROF file format or the index internals.
 ---
 
 # Find a memory leak with `hunt`
@@ -29,6 +29,11 @@ question — every question below is answered by running `hunt`.
 This skill assumes the dump is **already indexed** and that the index location comes
 from the config file. Do not re-index, and do not pass `--index-dir`.
 
+The index must have been built **with dominators** (the default for `hunt index`; only
+`--no-dominators` skips them). If `hunt dominator` reports that the index was built
+without dominators, you cannot re-index under this skill — fall back to `hunt roots` and
+report the retained size as unknown.
+
 Because of that, **every query command takes the dump path as a positional argument**.
 Passing the dump tells the tool which `.idx` directory under the base to use; omitting it
 makes the tool look for an index directly inside the base directory, which fails.
@@ -47,7 +52,12 @@ the class pattern.
 | --- | --- |
 | `info`, `histogram`, `classes` | `hunt <cmd> <dump.hprof> [options]` |
 | `objects`, `sample` | `hunt <cmd> '<class-regex>' <dump.hprof> [options]` |
-| `object`, `refs-from`, `refs-to`, `roots`, `tree` | `hunt <cmd> <object-id> <dump.hprof> [options]` |
+| `object`, `refs-from`, `refs-to`, `roots`, `tree`, `dominator`, `dominator-tree` | `hunt <cmd> <object-id> <dump.hprof> [options]` |
+
+`dominator` takes only `--index-dir` and `--source`. `dominator-tree` also accepts
+`--depth` and `--max-nodes` to bound the chain, exactly like `hunt tree` bounds a graph
+walk. Neither has `--max-visited` — the dominator chain is computed eagerly at index
+time, so a lookup is a constant-time read (measured at ~30 ms on a 12.7 M-object heap).
 
 To point at a different config for one run, use `--config <file>` **before** the
 command:
@@ -105,9 +115,12 @@ Summary:
 ```
 
 Note `heap bytes` — that is the *shallow* total. Every number the tool reports is a
-shallow size unless the command name says otherwise. **The tool does not compute
-retained size yet**, so "this object is holding 8 MB" cannot be answered directly; see
-Phase 6 for the closest available substitute.
+shallow size unless the command name says otherwise.
+
+**Retained size IS available.** Use `hunt dominator` / `hunt dominator-tree` to answer
+"how much does this object hold?" — see Phase 6. The index must have been built with
+dominators (the default); if it was not, the query fails with
+`error: index was built without dominators; re-index with dominators enabled`.
 
 ### Phase 2 — Shortlist suspects at class level
 
@@ -256,8 +269,10 @@ Interpretation rules:
   collector cannot see. Either way it is not the leak you are looking for.
 - `truncated: true` → the search hit `--max-visited` (default 1,000,000). Raise it with
   `--max-visited 5000000`.
-- This is **one** path found by BFS, not proof of what retains the object. A retained
-  size is not available, so treat the path as a strong hint, not a proof.
+- This is **one** path found by BFS, not proof of what retains the object. An object with
+  several referrers has several root paths, and BFS returns an arbitrary one. Use
+  **Phase 6b** (`hunt dominator-tree`) for the *unique* unavoidable holder and the
+  retained size.
 
 For the shape of the subgraph below an object:
 
@@ -274,6 +289,91 @@ hunt tree 0x0000000708800840 /dumps/heap.hprof --depth 2 --max-nodes 20
 `tree` expands **outgoing** references by default; `--direction to` expands incoming
 ones. `"marker":"repeat"` marks an object already shown; `"marker":"truncated"` marks
 where `--max-nodes` cut the expansion.
+
+### Phase 6b — Who actually *holds* the memory? (dominator + retained size)
+
+This is the phase that turns "this class is big" into "this object is what is keeping
+it alive". Run it on the suspect object from Phase 3–5.
+
+```bash
+hunt dominator 0x0000000708800840 /dumps/heap.hprof
+```
+
+```json
+{"id":"0x0000000708800840","ordinal":58,
+ "dominator":"0x0000000708803d78","retained_bytes":4134}
+```
+
+- `dominator` — the **immediate dominator**: the nearest object whose removal would make
+  the target unreachable. Every path from a GC root to the target goes through it.
+- `retained_bytes` — how many bytes would be freed if this object became garbage. This
+  is the number that quantifies the leak.
+
+For the whole chain up to the top of the reachable graph:
+
+```bash
+hunt dominator-tree 0x0000000708800840 /dumps/heap.hprof
+```
+
+```json
+{"id":"0x0000000708800840","ordinal":58,"truncated":false,
+ "path":[{"ordinal":58,"id":"0x0000000708800840","retained_bytes":4134},
+         {"ordinal":358,"id":"0x0000000708803d78","retained_bytes":8402},
+         {"ordinal":359,"id":"0x0000000708803f88","retained_bytes":4195549725}]}
+```
+
+The path runs **bottom-up**: the object first, then its immediate dominator, and so on
+to the top of the reachable graph. Each step is the unique unavoidable holder.
+
+**Interpretation rules (all verified):**
+
+- **`dominator: null` means top-of-the-reachable-graph, not "unreachable".** The chain
+  ends at a real object (often the `ClassLoader` or a `Thread`), not at the synthetic
+  virtual root. The virtual root is a construct of the tool, so it never appears as a
+  node with a retained size.
+- **Unreachable objects also report `dominator: null`**, but with `retained_bytes` equal
+  to their own shallow size and a **one-node** `dominator-tree` path. Distinguish the two
+  cases by the tree length: `path` with a single element ⇒ unreachable garbage; a long
+  `path` ending in a `null` dominator ⇒ top of the reachable graph.
+- **`truncated` tells you whether a bound cut the chain short.** `hunt dominator-tree`
+  accepts `--depth` and `--max-nodes`; when a bound actually hides part of the chain the
+  output reports `"truncated": true`. A chain that ends naturally reports
+  `"truncated": false`. **Always check it before quoting a chain length** — a truncated
+  chain is not the whole story, and the top holder is exactly what a bound hid.
+- **`retained_bytes` is non-decreasing** as you walk up the chain. If you ever see a
+  parent with a *smaller* retained size than its child, the dominator data is corrupt.
+- **`retained_bytes` ≥ `shallow_bytes`** always.
+- **`dominator` is `null` and `retained_bytes` is `0` for class objects and other
+  zero-length placeholders** (e.g. a `[B` class object with `shallow_bytes: 0`).
+
+**How to use it — the dominant-retainer technique:**
+
+Run `hunt dominator-tree` on the *container* you suspect (not the leaf) and read the
+retained sizes off the chain. The node with the large jump in retained size is the
+culprit. A real example from a 7.6 GB heap:
+
+```
+ProductView (994,709 instances)     retained           4,134
+  → ConcurrentHashMap$Node           retained           8,402
+  → ConcurrentHashMap$Node[]         retained   4,195,549,725   <- the 16 MB table holding 4.19 GB
+  → ConcurrentHashMap                retained   4,195,549,841
+  → ProductCache                     retained   4,195,550,930   <- the cache entry that owns it
+  → Object[]                         retained   5,828,368,763
+  → ArrayList                        retained   5,828,368,779
+  → AppClassLoader                   retained   5,828,392,925   <- top of the reachable graph
+```
+
+The huge jump at `ConcurrentHashMap$Node[]` and the fact that `ProductCache` retains
+4.19 GB proves the cache entry is what holds the memory — something the histogram
+cannot show you.
+
+**Cross-check the dominator against `refs-to` before trusting it.** If an object has
+several referrers, only one of them can dominate it. Example: `ProductCache` had two
+referrers — `Object[][2]` (its dominator) and `MemberName.clazz` (a non-dominating
+referrer). `hunt dominator-tree` on the `MemberName` showed a *different* branch that
+reconverges on `ProductCache`. If a referrer appears in `refs-to` but does **not** appear
+in the dominator chain of the target, it does not dominate it — the object is reachable
+by more than one route.
 
 ### Phase 7 — Prove the growth (needs two dumps)
 
@@ -313,8 +413,18 @@ java.lang.reflect.Method                               +167       +21710  659->8
 java.util.concurrent.ConcurrentHashMap$Node[]           +89       -9984  49->138
 ```
 
-The class with the largest growth is the suspect. Then go back to Phase 3–6 **in the
+The class with the largest growth is the suspect. Then go back to Phase 3–6b **in the
 newer dump** and find the objects of that class and trace who holds them.
+
+Run the dominator phase on the container you suspect to size the damage:
+
+```bash
+hunt dominator-tree <container-id> /dumps/after.hprof
+```
+
+A growing class whose dominator retains most of the heap is an unbounded cache. A
+growing class whose dominator retains only its own subtree is a per-request object
+that is being dropped somewhere it should not be.
 
 Sort by instance count instead when the leak is many small objects rather than a few
 large ones:
@@ -335,6 +445,7 @@ Report in this order, with the evidence attached to each claim:
 - Growth: <class> +N instances (+M bytes) between <before> and <after>   [histogram diff]
 - Instances: <count> × <shallow size> bytes                                [histogram]
 - Holder: <id> <class>.<field> -> <id> <class>                            [refs-to]
+- Retained: <id> <class> retains N bytes (dominator <id> <class>)         [dominator]
 - Path to GC root: virtual root -> ... -> <id>                            [roots]
 
 ## Suspect
@@ -345,13 +456,17 @@ Report in this order, with the evidence attached to each claim:
 ```
 
 Rules:
-- **Never claim a retained size.** The tool does not compute one. Say "this object holds
-  N references to X" (countable with `refs-from`) or "this class accounts for N bytes of
-  the heap" (from the histogram) instead.
+- **Quote retained sizes verbatim from `hunt dominator`.** A retained size is a real,
+  tool-computed number — cite the command that produced it. Do not estimate it from
+  instance counts.
 - **Always cite the command** that produced each number.
 - **Distinguish "big" from "leaking".** Without two dumps, say the class *dominates the
-  heap*, not that it *is leaking*.
+  heap*, not that it *is leaking*. Retained size shows what is *held*, not what is
+  *growing* — only the two-dump diff proves growth.
 - If the object is unreachable (`found: false`), say so — it changes the conclusion.
+- **Name the dominant retainer, not just the class.** "The heap is dominated by
+  `byte[]`" is weaker than "`ProductCache` retains 4.19 GB through one
+  `ConcurrentHashMap`". The first names a symptom; the second names a fix.
 
 ## Pitfalls
 
@@ -362,6 +477,8 @@ Verified error messages and what they mean:
 | `error: failed to read manifest: FileNotFound` | The dump path was omitted, so the tool looked for an index directly inside the config's base directory | Pass the dump path: `hunt info heap.hprof` |
 | `error: overview cache not found; run 'hunt overview <file.hprof> ...'` | Summary command without the overview cache | Run `hunt overview <dump.hprof>` once |
 | `error: object id not found in index: 0x...` | The id is not in this dump | Copy the id from a `hunt objects` / `hunt sample` result — never retype it |
+| `error: index was built without dominators; re-index with dominators enabled` | The index was built with `--no-dominators` | Re-run `hunt index <dump.hprof>` without `--no-dominators` (or use `hunt roots` instead) |
+| `error: invalid value '42a003088' for option '<id>': expected an object id such as 0x3000` | The id was passed without the `0x` prefix | Prefix with `0x` — `0x42a003088`. `0X` and zero-padded forms are also accepted |
 | `error: source file not found` / fingerprint mismatch | The dump moved or changed | Pass `--source /new/path.hprof` to the query command |
 | `error: failed to open index: FileNotFound` | No index for that dump | Run `hunt index <dump.hprof>` |
 | `no configuration file found` + the sample config | No `index-dir` configured | Create `~/.config/hunt/config.json` with an `index-dir` |
@@ -381,6 +498,26 @@ Other traps:
   `hunt objects ... | jq` works even though the progress bar is being printed.
 - **`hunt info` counts objects, not bytes.** `total objects` excludes the arrays counted
   separately in `arrays`.
+- **A `null` dominator is ambiguous — always check the `dominator-tree` length.** It
+  means either "top of the reachable graph" or "unreachable garbage". A one-node `path`
+  means unreachable; a multi-node `path` ending in a `null` dominator means the top of
+  the reachable graph.
+- **The dominator chain does not end at the virtual root.** The virtual root is
+  synthetic; the chain tops out at a real object (usually a `ClassLoader` or a
+  `Thread`). Do not expect a `virtual root` node in `dominator-tree` output.
+- **Retained sizes cover only the reachable graph.** Objects the collector considers
+  unreachable get `retained_bytes` equal to their own shallow size. The index manifest
+  reports the count under `diagnostics.unreachable_objects`; on a real dump this can be
+  in the millions, so the sum of retained sizes is *less* than the total heap.
+- **Dominator queries need an index built with dominators.** `hunt index` computes them
+  by default; `--no-dominators` skips the stage and deletes `dom_parent.bin`,
+  `dom_order.bin`, and `retained.bin`. The stage is bounded by
+  `--dominator-budget-mb` (default 4096) and fails with a user error if it cannot fit.
+- **Neither dominator command has a `--max-visited` flag.** The chain is precomputed, so
+  a lookup is a constant-time read and there is nothing to bound. `hunt dominator-tree`
+  does accept `--depth` and `--max-nodes` to cap how much of the chain is printed; when
+  they hide part of the chain, the output reports `"truncated": true`. Use `hunt tree`
+  for bounded *graph* expansion.
 
 ## Example
 
@@ -406,6 +543,13 @@ Phase 5  hunt refs-to 0x0000000708800840 after.hprof
 Phase 6  hunt roots 0x0000000708800840 after.hprof
         -> virtual root -> com.shop.checkout.SessionRegistry -> CheckoutSession -> CartSnapshot
         -> found: true
+
+Phase 6b hunt dominator 0x0000000708800840 after.hprof
+        -> dominator 0x0000000708803d78, retained_bytes 4134
+        hunt dominator-tree 0x0000000708800840 after.hprof
+        -> truncated: false
+        -> CartSnapshot 4,134 -> SessionRegistry 8,402 -> AppClassLoader 5,828,392,925
+        (the registry entry retains the whole heap; that is the fix target)
 
 Phase 7  hunt histogram before.hprof > /tmp/before.csv
         hunt histogram after.hprof  > /tmp/after.csv

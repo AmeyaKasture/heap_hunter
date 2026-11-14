@@ -17,8 +17,10 @@ const Join = @import("index/Join.zig");
 const Csr = @import("index/Csr.zig");
 const Validate = @import("index/Validate.zig");
 const Publish = @import("index/Publish.zig");
+const Dominator = @import("index/Dominator.zig");
 const Manifest = @import("index/Manifest.zig");
 const Overview = @import("Overview.zig");
+const IndexReader = @import("index/IndexReader.zig");
 
 pub const IndexOptions = struct {
     hprof_path: []const u8,
@@ -26,6 +28,8 @@ pub const IndexOptions = struct {
     sorting_budget_mb: ?u32 = null,
     force: bool = false,
     no_progress: bool = false,
+    compute_dominators: bool = true,
+    dominator_budget_mb: ?u32 = null,
 };
 
 pub const OverviewOptions = struct {
@@ -55,6 +59,8 @@ pub fn runIndexCommand(
     const path = options.hprof_path;
     const index_dir_opt = options.index_dir;
     const sorting_budget_mb = options.sorting_budget_mb orelse config.sortingBudgetMb();
+    const compute_dominators = options.compute_dominators;
+    const dominator_budget_mb = options.dominator_budget_mb orelse config.dominatorBudgetMb();
     const force = options.force;
     const no_progress = options.no_progress;
 
@@ -78,6 +84,8 @@ pub fn runIndexCommand(
     log.debug("running preflight", .{});
     const preflight_result = try Preflight.run(allocator, io, path, index_dir, .{
         .sorting_budget_mb = sorting_budget_mb,
+        .dominator_budget_mb = dominator_budget_mb,
+        .compute_dominators = compute_dominators,
         .force = force,
     }, stderr);
 
@@ -86,7 +94,8 @@ pub fn runIndexCommand(
     try jsonEscapeString(&escaped_index_dir_buf.writer, index_dir);
     const escaped_index_dir = escaped_index_dir_buf.writer.buffer[0..escaped_index_dir_buf.writer.end];
 
-    var progress = Progress.createEx(stderr, io, 9, no_progress, on_progress, on_progress_ctx);
+    const n_progress_steps: u32 = if (compute_dominators) 10 else 9;
+    var progress = Progress.createEx(stderr, io, n_progress_steps, no_progress, on_progress, on_progress_ctx);
     defer progress.stop(null);
 
     switch (preflight_result) {
@@ -211,6 +220,38 @@ pub fn runIndexCommand(
             const n_roots = csr_result.n_roots;
             const virtual_root_ordinal = n_objects;
 
+            var dominator_n_reachable: u64 = 0;
+            var dominator_total_retained: u64 = 0;
+            if (compute_dominators) {
+                progress.nextStep("computing dominators");
+                log.debug("stage: computing dominators", .{});
+                const V = catalog_result.n_objects + 1;
+                const required_conservative: u64 = @intCast(@as(u128, Dominator.chkBytesPerNode()) * V + 8 * V);
+                var dominator_result = stageTimed(io, "dominators", &elapsed, Dominator.run(
+                    allocator,
+                    io,
+                    job,
+                    csr_result.out_offsets_path,
+                    csr_result.out_targets_path,
+                    csr_result.in_offsets_path,
+                    csr_result.in_sources_path,
+                    catalog_result.catalog_path,
+                    catalog_result.n_objects,
+                    join_result.n_edges,
+                    &scan_result.diagnostics,
+                    .{},
+                ) catch |err| {
+                    if (err == error.DominatorBudgetExceeded) {
+                        Dominator.formatBudgetError(V, required_conservative, job.dominator_budget_bytes, stderr) catch {};
+                        try stderr.flush();
+                    }
+                    return @as(anyerror!void, err);
+                });
+                defer dominator_result.deinit(allocator);
+                dominator_n_reachable = dominator_result.n_reachable;
+                dominator_total_retained = dominator_result.total_retained_bytes;
+            }
+
             progress.nextStep("validating index");
             log.debug("stage: validating index", .{});
             stageTimed(io, "validate", &elapsed, try Validate.validate(
@@ -221,6 +262,7 @@ pub fn runIndexCommand(
                 n_edges,
                 n_roots,
                 n_classes,
+                compute_dominators,
                 stderr,
             ));
             log.debug("stage: validate complete", .{});
@@ -233,6 +275,9 @@ pub fn runIndexCommand(
                 .virtual_root_ordinal = @intCast(virtual_root_ordinal),
                 .diagnostics = scan_result.diagnostics,
                 .source_path = try allocator.dupe(u8, path),
+                .has_dominators = compute_dominators,
+                .n_dominator_nodes = dominator_n_reachable,
+                .retained_total_bytes = dominator_total_retained,
             };
             defer manifest.deinit(allocator);
 
@@ -250,13 +295,16 @@ pub fn runIndexCommand(
 
             progress.stop("index complete");
             log.debug("index complete: n_objects={d}, n_classes={d}, n_edges={d}, n_roots={d}", .{ n_objects, n_classes, n_edges, n_roots });
-            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
+            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
                 escaped_index_dir,
                 n_objects,
                 n_classes,
                 n_edges,
                 n_roots,
                 virtual_root_ordinal,
+                compute_dominators,
+                dominator_n_reachable,
+                dominator_total_retained,
                 scan_result.diagnostics.duplicate_object_ids,
                 scan_result.diagnostics.skipped_constant_pool_refs,
                 scan_result.diagnostics.dangling_source_edges,
@@ -266,12 +314,14 @@ pub fn runIndexCommand(
                 scan_result.diagnostics.unknown_root_kind,
                 scan_result.diagnostics.missing_layout,
                 scan_result.diagnostics.dangling_root_targets,
+                scan_result.diagnostics.unreachable_objects,
                 elapsed.scan,
                 elapsed.sort_catalog,
                 elapsed.layouts,
                 elapsed.emit_edges,
                 elapsed.join,
                 elapsed.csr,
+                elapsed.dominators,
                 elapsed.validate,
                 elapsed.publish,
                 publish_result.index_bytes,
@@ -411,6 +461,8 @@ pub fn parseIndexArgs(
     var path_opt: ?[]const u8 = null;
     var index_dir_opt: ?[]const u8 = null;
     var sorting_budget_mb: ?u32 = null;
+    var dominator_budget_mb: ?u32 = null;
+    var compute_dominators = true;
     var force = false;
     var no_progress = false;
 
@@ -428,6 +480,12 @@ pub fn parseIndexArgs(
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
             sorting_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--dominator-budget-mb")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            dominator_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--no-dominators")) {
+            compute_dominators = false;
         } else if (std.mem.eql(u8, arg, "--force")) {
             force = true;
         } else if (std.mem.eql(u8, arg, "--no-progress")) {
@@ -455,6 +513,8 @@ pub fn parseIndexArgs(
         .sorting_budget_mb = sorting_budget_mb,
         .force = force,
         .no_progress = no_progress,
+        .compute_dominators = compute_dominators,
+        .dominator_budget_mb = dominator_budget_mb,
     };
 }
 
@@ -545,6 +605,196 @@ pub fn resolveIndexDir(
     return null;
 }
 
+/// Print the immediate dominator and retained size for a single object.
+pub fn runDominatorCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    index_dir: []const u8,
+    source_override: ?[]const u8,
+    raw_id: u64,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    var reader = try IndexReader.open(allocator, io, index_dir, source_override);
+    defer reader.deinit();
+
+    if (!reader.manifest.has_dominators) {
+        try Cli.printError(stderr, "index was built without dominators; re-index with dominators enabled", .{});
+        return error.NoRetainedData;
+    }
+
+    const id_str = try std.fmt.allocPrint(allocator, "0x{x}", .{raw_id});
+    defer allocator.free(id_str);
+
+    const ordinal = reader.ordinalForRawId(raw_id) orelse {
+        try Cli.printError(stderr, "object id not found in index: {s}", .{id_str});
+        return error.ObjectNotFound;
+    };
+
+    const dom_parent = reader.domParent(ordinal);
+    const retained = reader.retainedBytes(ordinal);
+
+    try stdout.writeAll("{\n");
+    try stdout.print("  \"id\": \"{s}\",\n", .{id_str});
+    try stdout.print("  \"ordinal\": {d},\n", .{ordinal});
+    try stdout.writeAll("  \"dominator\": ");
+    if (dom_parent) |p| {
+        const parent_raw_id = reader.rawIdForOrdinal(p) orelse 0;
+        try IndexReader.writeRawIdOrNull(stdout, parent_raw_id);
+    } else {
+        try stdout.writeAll("null");
+    }
+    try stdout.writeAll(",\n");
+    try stdout.print("  \"retained_bytes\": {d}\n", .{retained});
+    try stdout.writeAll("}\n");
+    try stdout.flush();
+}
+
+pub const DominatorTreeOptions = struct {
+    depth: ?u32 = null,
+    max_nodes: ?u32 = null,
+};
+
+/// Walk the immediate-dominator chain starting at `start`, appending each
+/// ordinal to `chain` until the top of the reachable graph is reached or a
+/// bound cuts the walk short.
+///
+/// `parent` returns the immediate dominator of an ordinal, or `null` when the
+/// ordinal has none (the top of the reachable graph, or an unreachable node).
+///
+/// Returns true when a bound cut the chain short. A chain that ends naturally
+/// is not truncated, so a caller can distinguish "the bound stopped the walk"
+/// from "the chain really was this short".
+///
+/// The bound semantics match `hunt tree`: `--depth N` follows at most N
+/// dominator links, yielding at most N + 1 nodes, and `--max-nodes N` yields
+/// at most N nodes. When both are given, the tighter bound wins.
+fn collectDominatorChain(
+    allocator: std.mem.Allocator,
+    chain: *std.ArrayList(u32),
+    start: u32,
+    options: DominatorTreeOptions,
+    context: anytype,
+) !bool {
+    const parent = struct {
+        fn get(ctx: @TypeOf(context), ordinal: u32) ?u32 {
+            return ctx.parent(ordinal);
+        }
+    }.get;
+
+    var seen = std.AutoHashMap(u32, void).init(allocator);
+    defer seen.deinit();
+
+    var current: ?u32 = start;
+    var depth_remaining: ?u32 = options.depth;
+
+    while (current) |node| {
+        if (seen.contains(node)) break; // safety break on cycles
+        try seen.put(node, {});
+
+        if (options.max_nodes) |max| {
+            if (chain.items.len >= max) {
+                // The chain continues past the bound, so it is truncated.
+                return true;
+            }
+        }
+        try chain.append(allocator, node);
+
+        const parent_ordinal = parent(context, node);
+        if (depth_remaining) |dr| {
+            if (dr == 0) {
+                // The chain continues past the bound, so it is truncated.
+                return parent_ordinal != null;
+            }
+            depth_remaining = dr - 1;
+        }
+
+        current = parent_ordinal;
+    }
+
+    return false;
+}
+
+/// Print the dominator chain from an object up to the top of the reachable graph.
+/// The chain ends at a real object (the dominator tree is rooted at the virtual
+/// root, but the virtual root itself carries no retained size and is not
+/// emitted as a node).
+///
+/// The chain may be shortened by `--depth` or `--max-nodes`. When that happens
+/// the output carries `"truncated": true`, matching the convention used by
+/// `hunt roots`, so a caller can tell a cut chain from a naturally short one.
+pub fn runDominatorTreeCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    index_dir: []const u8,
+    source_override: ?[]const u8,
+    raw_id: u64,
+    options: DominatorTreeOptions,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !void {
+    var reader = try IndexReader.open(allocator, io, index_dir, source_override);
+    defer reader.deinit();
+
+    if (!reader.manifest.has_dominators) {
+        try Cli.printError(stderr, "index was built without dominators; re-index with dominators enabled", .{});
+        return error.NoRetainedData;
+    }
+
+    const id_str = try std.fmt.allocPrint(allocator, "0x{x}", .{raw_id});
+    defer allocator.free(id_str);
+
+    const start_ordinal = reader.ordinalForRawId(raw_id) orelse {
+        try Cli.printError(stderr, "object id not found in index: {s}", .{id_str});
+        return error.ObjectNotFound;
+    };
+
+    // Collect the chain from start up to the top of the reachable graph
+    // (or an unreachable node, which has no dominator), honouring depth and
+    // max_nodes bounds exactly like hunt tree.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+
+    const lookup = struct {
+        reader: *const IndexReader.Reader,
+
+        fn parent(self: @This(), ordinal: u32) ?u32 {
+            return self.reader.domParent(ordinal);
+        }
+    }{ .reader = &reader };
+    const truncated = try collectDominatorChain(
+        allocator,
+        &chain,
+        start_ordinal,
+        options,
+        lookup,
+    );
+
+    try stdout.writeAll("{\n");
+    try stdout.print("  \"id\": \"{s}\",\n", .{id_str});
+    try stdout.print("  \"ordinal\": {d},\n", .{start_ordinal});
+    try stdout.print("  \"truncated\": {},\n", .{truncated});
+    try stdout.writeAll("  \"path\": [\n");
+
+    for (chain.items, 0..) |node, i| {
+        const node_raw_id = reader.rawIdForOrdinal(node) orelse 0;
+        const retained = reader.retainedBytes(node);
+        try stdout.writeAll("    {\n");
+        try stdout.print("      \"ordinal\": {d},\n", .{node});
+        try stdout.writeAll("      \"id\": ");
+        try IndexReader.writeRawIdOrNull(stdout, node_raw_id);
+        try stdout.writeAll(",\n");
+        try stdout.print("      \"retained_bytes\": {d}\n", .{retained});
+        try stdout.writeAll("    }");
+        if (i + 1 < chain.items.len) try stdout.writeAll(",");
+        try stdout.writeAll("\n");
+    }
+
+    try stdout.writeAll("  ]\n");
+    try stdout.writeAll("}\n");
+    try stdout.flush();
+}
+
 fn deleteOldStagingDirs(
     allocator: std.mem.Allocator,
     io: Io,
@@ -578,6 +828,7 @@ const StageTimings = struct {
     emit_edges: i64 = 0,
     join: i64 = 0,
     csr: i64 = 0,
+    dominators: i64 = 0,
     validate: i64 = 0,
     publish: i64 = 0,
 };
@@ -607,4 +858,117 @@ fn jsonEscapeString(writer: anytype, s: []const u8) !void {
             else => try writer.writeByte(c),
         }
     }
+}
+
+/// A dominator chain fixture: node `i` is dominated by node `i + 1`, and the
+/// last node has no dominator (it is the top of the reachable graph).
+const ChainFixture = struct {
+    /// The immediate dominator of `ordinal`, or null at the top of the chain.
+    fn parent(ordinal: u32) ?u32 {
+        return if (ordinal >= 4) null else ordinal + 1;
+    }
+};
+
+/// Collect a chain into `chain` and report whether a bound truncated it.
+fn collectForTest(
+    allocator: std.mem.Allocator,
+    chain: *std.ArrayList(u32),
+    start: u32,
+    options: DominatorTreeOptions,
+) !bool {
+    return collectDominatorChain(allocator, chain, start, options, ChainFixture);
+}
+
+test "dominator chain without bounds reaches the top of the graph" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{});
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expectEqual(@as(u32, 0), chain.items[0]);
+    try std.testing.expectEqual(@as(u32, 4), chain.items[4]);
+    // The chain ended naturally, so it was not truncated.
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain depth bound cuts the chain and reports truncation" {
+    const allocator = std.testing.allocator;
+
+    // Depth 2 follows two links, yielding three nodes out of five.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 2 });
+
+    try std.testing.expectEqual(@as(usize, 3), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain depth bound that reaches the top is not truncated" {
+    const allocator = std.testing.allocator;
+
+    // Depth 4 reaches the last node of a five-node chain, so nothing is hidden.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 4 });
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain max-nodes bound cuts the chain and reports truncation" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain max-nodes bound that covers the chain is not truncated" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 5 });
+
+    try std.testing.expectEqual(@as(usize, 5), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain max-nodes of zero yields an empty chain" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .max_nodes = 0 });
+
+    try std.testing.expectEqual(@as(usize, 0), chain.items.len);
+    try std.testing.expect(truncated);
+}
+
+test "dominator chain starting at the top is a single node and is not truncated" {
+    const allocator = std.testing.allocator;
+
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 4, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), chain.items.len);
+    try std.testing.expect(!truncated);
+}
+
+test "dominator chain applies the tighter of the two bounds" {
+    const allocator = std.testing.allocator;
+
+    // Depth 2 allows three nodes, max-nodes 2 allows two; the tighter wins.
+    var chain = std.ArrayList(u32).empty;
+    defer chain.deinit(allocator);
+    const truncated = try collectForTest(allocator, &chain, 0, .{ .depth = 2, .max_nodes = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), chain.items.len);
+    try std.testing.expect(truncated);
 }

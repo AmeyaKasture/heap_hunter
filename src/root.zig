@@ -116,7 +116,9 @@ pub fn runCli(
         std.mem.eql(u8, command, "refs-from") or
         std.mem.eql(u8, command, "refs-to") or
         std.mem.eql(u8, command, "roots") or
-        std.mem.eql(u8, command, "tree"))
+        std.mem.eql(u8, command, "tree") or
+        std.mem.eql(u8, command, "dominator") or
+        std.mem.eql(u8, command, "dominator-tree"))
     {
         log.debug("dispatching to runQueryCommand ({s})", .{command});
         return runQueryCommand(allocator, io, command, shifted, stdout, stderr, config_load);
@@ -318,6 +320,7 @@ fn runQueryCommand(
     var refs_opts: IndexReader.RefsOptions = .{};
     var roots_opts: IndexReader.RootsOptions = .{};
     var tree_opts: IndexReader.TreeOptions = .{};
+    var dom_tree_opts: Commands.DominatorTreeOptions = .{};
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -352,11 +355,15 @@ fn runQueryCommand(
         } else if (std.mem.eql(u8, arg, "--depth")) {
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
-            tree_opts.depth = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+            const n = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+            tree_opts.depth = n;
+            dom_tree_opts.depth = n;
         } else if (std.mem.eql(u8, arg, "--max-nodes")) {
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
-            tree_opts.max_nodes = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+            const n = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+            tree_opts.max_nodes = n;
+            dom_tree_opts.max_nodes = n;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try Cli.printUnknownOption(stderr, command, usage, arg);
             return error.InvalidArgument;
@@ -404,7 +411,13 @@ fn runQueryCommand(
     log.debug("query: index loaded", .{});
     defer reader.deinit();
 
-    if (std.mem.eql(u8, command, "object")) {
+    if (std.mem.eql(u8, command, "dominator")) {
+        if (dom_tree_opts.depth != null or dom_tree_opts.max_nodes != null) {
+            try Cli.printError(stderr, "dominator does not support --depth or --max-nodes; use hunt dominator-tree", .{});
+            return error.InvalidArgument;
+        }
+        try Commands.runDominatorCommand(allocator, io, index_dir, source_override, raw_id, stdout, stderr);
+    } else if (std.mem.eql(u8, command, "object")) {
         const ordinal = reader.ordinalForRawId(raw_id) orelse {
             try Cli.printError(stderr, "object id not found in index: {s}", .{id_str});
             return error.ObjectNotFound;
@@ -420,6 +433,8 @@ fn runQueryCommand(
         try IndexReader.writeRoots(&reader, stdout, raw_id, roots_opts);
     } else if (std.mem.eql(u8, command, "tree")) {
         try IndexReader.writeTree(&reader, stdout, raw_id, tree_opts);
+    } else if (std.mem.eql(u8, command, "dominator-tree")) {
+        try Commands.runDominatorTreeCommand(allocator, io, index_dir, source_override, raw_id, dom_tree_opts, stdout, stderr);
     } else {
         unreachable;
     }
@@ -1944,6 +1959,11 @@ test {
     _ = @import("index/EdgeEmitter.zig");
     _ = @import("index/Join.zig");
     _ = @import("index/Csr.zig");
+    _ = @import("index/Dominator.zig");
+    _ = @import("index/dominator/Chk.zig");
+    _ = @import("index/dominator/Backend.zig");
+    _ = @import("index/dominator/CsrView.zig");
+    _ = @import("index/dominator/Numbering.zig");
     _ = @import("index/Validate.zig");
     _ = @import("index/Publish.zig");
     _ = @import("index/IndexReader.zig");
@@ -1964,6 +1984,7 @@ test {
     _ = @import("index/Join.zig");
     _ = @import("index/Csr.zig");
     _ = @import("Overview.zig");
+    _ = @import("Commands.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
 }

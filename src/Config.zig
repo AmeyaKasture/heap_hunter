@@ -36,7 +36,11 @@ pub const Config = struct {
     /// object catalog; it is not the total RSS of the process.
     @"sorting-budget-mb": ?u32 = null,
 
+    /// Default dominator computation budget in megabytes.
+    @"dominator-budget-mb": ?u32 = null,
+
     pub const default_sorting_budget_mb: u32 = 4096;
+    pub const default_dominator_budget_mb: u32 = 4096;
 
     pub fn indexDir(self: Config) ?[]const u8 {
         return self.@"index-dir";
@@ -44,6 +48,10 @@ pub const Config = struct {
 
     pub fn sortingBudgetMb(self: Config) u32 {
         return self.@"sorting-budget-mb" orelse default_sorting_budget_mb;
+    }
+
+    pub fn dominatorBudgetMb(self: Config) u32 {
+        return self.@"dominator-budget-mb" orelse default_dominator_budget_mb;
     }
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
@@ -139,6 +147,9 @@ pub const Config = struct {
         }
         if (parsed.value.@"sorting-budget-mb") |mb| {
             config.@"sorting-budget-mb" = mb;
+        }
+        if (parsed.value.@"dominator-budget-mb") |mb| {
+            config.@"dominator-budget-mb" = mb;
         }
         result.config = config;
         return result;
