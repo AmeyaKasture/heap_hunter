@@ -7,6 +7,7 @@ const HeapDump = @import("../hprof/HeapDump.zig");
 const Scanner = @import("Scanner.zig");
 const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
+const profiling = @import("profiling");
 
 pub const Field = struct {
     name: []const u8,
@@ -71,12 +72,16 @@ pub fn writeFields(
     var class_ids = std.ArrayList(hprof.Id).empty;
     defer class_ids.deinit(allocator);
 
-    var class_it = class_table.classes.iterator();
-    while (class_it.next()) |entry| {
-        try class_ids.append(allocator, entry.key_ptr.*);
-    }
+    {
+        var span = profiling.begin(io, "collect");
+        defer span.end(io);
+        var class_it = class_table.classes.iterator();
+        while (class_it.next()) |entry| {
+            try class_ids.append(allocator, entry.key_ptr.*);
+        }
 
-    std.mem.sort(hprof.Id, class_ids.items, {}, std.sort.asc(hprof.Id));
+        std.mem.sort(hprof.Id, class_ids.items, {}, std.sort.asc(hprof.Id));
+    }
 
     var layouts = std.ArrayList(Layout).empty;
     errdefer {
@@ -95,18 +100,22 @@ pub fn writeFields(
 
     // Build in-memory layouts first; they are small and we need them for the
     // caller and for the reference-offset mask.
-    for (class_ids.items) |class_id| {
-        const layout = try buildLayout(
-            allocator,
-            class_table,
-            class_id,
-            id_size,
-            diagnostics,
-            &cyclic_classes,
-        );
-        errdefer layout.deinit(allocator);
-        try layouts.append(allocator, layout);
-        try by_id.put(class_id, layouts.items.len - 1);
+    {
+        var span = profiling.begin(io, "build");
+        defer span.end(io);
+        for (class_ids.items) |class_id| {
+            const layout = try buildLayout(
+                allocator,
+                class_table,
+                class_id,
+                id_size,
+                diagnostics,
+                &cyclic_classes,
+            );
+            errdefer layout.deinit(allocator);
+            try layouts.append(allocator, layout);
+            try by_id.put(class_id, layouts.items.len - 1);
+        }
     }
 
     const fields_path = try std.fs.path.join(allocator, &.{ staging_dir, "fields.bin" });
@@ -119,30 +128,34 @@ pub fn writeFields(
     var file_writer: Io.File.Writer = .init(fields_file, io, &file_buf);
     const writer = &file_writer.interface;
 
-    for (layouts.items) |layout| {
-        var header: [12]u8 = undefined;
-        std.mem.writeInt(u64, header[0..8], layout.class_raw_id, .little);
-        std.mem.writeInt(u32, header[8..12], @intCast(layout.fields.len), .little);
-        try writer.writeAll(&header);
+    {
+        var span = profiling.begin(io, "write");
+        defer span.end(io);
+        for (layouts.items) |layout| {
+            var header: [12]u8 = undefined;
+            std.mem.writeInt(u64, header[0..8], layout.class_raw_id, .little);
+            std.mem.writeInt(u32, header[8..12], @intCast(layout.fields.len), .little);
+            try writer.writeAll(&header);
 
-        for (layout.fields) |field| {
-            var name_len: [2]u8 = undefined;
-            const name_len_u16 = std.math.cast(u16, field.name.len) orelse return error.FieldNameTooLong;
-            std.mem.writeInt(u16, &name_len, name_len_u16, .little);
-            try writer.writeAll(&name_len);
-            if (field.name.len > 0) {
-                try writer.writeAll(field.name);
+            for (layout.fields) |field| {
+                var name_len: [2]u8 = undefined;
+                const name_len_u16 = std.math.cast(u16, field.name.len) orelse return error.FieldNameTooLong;
+                std.mem.writeInt(u16, &name_len, name_len_u16, .little);
+                try writer.writeAll(&name_len);
+                if (field.name.len > 0) {
+                    try writer.writeAll(field.name);
+                }
+
+                var tail: [13]u8 = undefined;
+                tail[0] = @intFromEnum(field.type);
+                std.mem.writeInt(u32, tail[1..5], field.byte_offset, .little);
+                std.mem.writeInt(u64, tail[5..13], field.declaring_class_raw_id, .little);
+                try writer.writeAll(&tail);
             }
-
-            var tail: [13]u8 = undefined;
-            tail[0] = @intFromEnum(field.type);
-            std.mem.writeInt(u32, tail[1..5], field.byte_offset, .little);
-            std.mem.writeInt(u64, tail[5..13], field.declaring_class_raw_id, .little);
-            try writer.writeAll(&tail);
         }
-    }
 
-    try file_writer.flush();
+        try file_writer.flush();
+    }
 
     return .{
         .allocator = allocator,
@@ -705,14 +718,14 @@ test "fields.bin parses and matches classes.bin on fixtures" {
         defer allocator.free(classes_path);
 
         var diagnostics: Manifest.Diagnostics = .{};
-            var layout_table = try writeFields(
-                allocator,
-                io,
-                job.staging_dir,
-                &scan_result.class_table,
-                job.header.id_size,
-                &diagnostics,
-            );
+        var layout_table = try writeFields(
+            allocator,
+            io,
+            job.staging_dir,
+            &scan_result.class_table,
+            job.header.id_size,
+            &diagnostics,
+        );
         defer layout_table.deinit();
 
         // Every class dump should have a matching layout.

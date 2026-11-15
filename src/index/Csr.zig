@@ -23,6 +23,7 @@ const Scanner = @import("Scanner.zig");
 const Join = @import("Join.zig");
 const EdgeEmitter = @import("EdgeEmitter.zig");
 const ExtSort = @import("ExtSort.zig");
+const profiling = @import("profiling");
 
 /// Size in bytes of one CSR offset entry: a little-endian `u64`.
 pub const offset_entry_size = 8;
@@ -296,46 +297,62 @@ pub fn run(
     const sorted_by_source = try std.fs.path.join(allocator, &.{ job.staging_dir, "edges.resolved.by_source" });
     defer allocator.free(sorted_by_source);
 
-    try ExtSort.sortStreaming(io, allocator, resolved_path, sorted_by_source, .{
-        .record_size = Join.resolved_record_size,
-        .budget_bytes = job.budget_bytes,
-    }, null, {}, lessBySource);
+    {
+        var span = profiling.begin(io, "sort_edges");
+        defer span.end(io);
+        try ExtSort.sortStreaming(io, allocator, resolved_path, sorted_by_source, .{
+            .record_size = Join.resolved_record_size,
+            .budget_bytes = job.budget_bytes,
+        }, null, {}, lessBySource);
+    }
 
-    try writeCsrWithExtractor(
-        io,
-        sorted_by_source,
-        out_offsets_path,
-        out_targets_path,
-        n_nodes,
-        n_edges,
-        sourceKey,
-        targetKey,
-    );
+    {
+        var span = profiling.begin(io, "csr_forward");
+        defer span.end(io);
+        try writeCsrWithExtractor(
+            io,
+            sorted_by_source,
+            out_offsets_path,
+            out_targets_path,
+            n_nodes,
+            n_edges,
+            sourceKey,
+            targetKey,
+        );
+    }
 
     // `edges.resolved` is already sorted by target ordinal after Stage 5's
     // second merge-join pass, so the reverse CSR can be written directly
     // without another external sort.
-    try writeCsrWithExtractor(
-        io,
-        resolved_path,
-        in_offsets_path,
-        in_sources_path,
-        n_nodes,
-        n_edges,
-        targetKey,
-        sourceKey,
-    );
+    {
+        var span = profiling.begin(io, "csr_reverse");
+        defer span.end(io);
+        try writeCsrWithExtractor(
+            io,
+            resolved_path,
+            in_offsets_path,
+            in_sources_path,
+            n_nodes,
+            n_edges,
+            targetKey,
+            sourceKey,
+        );
+    }
 
     // Resolve GC root targets to ordinals.
-    const n_roots_resolved = try resolveRoots(
-        io,
-        roots_raw_path,
-        catalog_path,
-        roots_path,
-        n_objects,
-        n_roots,
-        diagnostics,
-    );
+    const n_roots_resolved = blk: {
+        var span = profiling.begin(io, "roots_resolve");
+        defer span.end(io);
+        break :blk try resolveRoots(
+            io,
+            roots_raw_path,
+            catalog_path,
+            roots_path,
+            n_objects,
+            n_roots,
+            diagnostics,
+        );
+    };
 
     return .{
         .out_offsets_path = out_offsets_path,

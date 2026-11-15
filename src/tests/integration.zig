@@ -1,8 +1,11 @@
 //! Integration tests that exercise the full parse -> index -> analysis flow
 //! against real HPROF fixture files.
 const std = @import("std");
+const Io = std.Io;
 const hprof = @import("../hprof.zig");
 const Analysis = @import("../Analysis.zig");
+const Commands = @import("../Commands.zig");
+const Config = @import("../Config.zig").Config;
 
 fn loadIndex(allocator: std.mem.Allocator, relative_path: []const u8) !Analysis.Index {
     const io = std.testing.io;
@@ -25,4 +28,139 @@ test "buildIndex finds heap-derived threads in real Java 21 dump" {
     const allocator = std.heap.page_allocator;
     var index = try loadIndex(allocator, "fixtures/heapforge.hprof");
     defer index.deinit();
+}
+
+test "index --profile emits timing tree to stderr" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: Io.Writer = Io.Writer.fixed(&stdout_buf);
+    var stderr_buf: [8192]u8 = undefined;
+    var stderr_writer: Io.Writer = Io.Writer.fixed(&stderr_buf);
+
+    const config_load: Config.LoadResult = .{};
+
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = true,
+        .profile = true,
+    }, &stdout_writer, &stderr_writer, config_load, null, null);
+
+    try stdout_writer.flush();
+    try stderr_writer.flush();
+
+    const stderr_text = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "timings:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "scan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "total:") != null);
+}
+
+test "index without --profile does not emit timing tree" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: Io.Writer = Io.Writer.fixed(&stdout_buf);
+    var stderr_buf: [8192]u8 = undefined;
+    var stderr_writer: Io.Writer = Io.Writer.fixed(&stderr_buf);
+
+    const config_load: Config.LoadResult = .{};
+
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = true,
+        .profile = false,
+    }, &stdout_writer, &stderr_writer, config_load, null, null);
+
+    try stderr_writer.flush();
+
+    const stderr_text = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "timings:") == null);
+}
+
+test "index --profile keeps timings out of stdout" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: Io.Writer = Io.Writer.fixed(&stdout_buf);
+    var stderr_buf: [8192]u8 = undefined;
+    var stderr_writer: Io.Writer = Io.Writer.fixed(&stderr_buf);
+
+    const config_load: Config.LoadResult = .{};
+
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = true,
+        .profile = true,
+    }, &stdout_writer, &stderr_writer, config_load, null, null);
+
+    try stdout_writer.flush();
+
+    const stdout_text = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "\"status\":\"complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_text, "timings:") == null);
+}
+
+test "overview --profile emits timing tree to stderr" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    const config_load: Config.LoadResult = .{};
+
+    // Build an index first.
+    var index_stdout_buf: [4096]u8 = undefined;
+    var index_stdout: Io.Writer = Io.Writer.fixed(&index_stdout_buf);
+    var index_stderr_buf: [8192]u8 = undefined;
+    var index_stderr: Io.Writer = Io.Writer.fixed(&index_stderr_buf);
+
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = true,
+        .profile = false,
+    }, &index_stdout, &index_stderr, config_load, null, null);
+
+    // Now run overview with profiling.
+    var overview_stdout_buf: [4096]u8 = undefined;
+    var overview_stdout: Io.Writer = Io.Writer.fixed(&overview_stdout_buf);
+    var overview_stderr_buf: [8192]u8 = undefined;
+    var overview_stderr: Io.Writer = Io.Writer.fixed(&overview_stderr_buf);
+
+    try Commands.runOverviewCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = true,
+        .profile = true,
+    }, &overview_stdout, &overview_stderr, config_load, null, null);
+
+    try overview_stdout.flush();
+    try overview_stderr.flush();
+
+    const stderr_text = overview_stderr.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "timings:") != null);
 }

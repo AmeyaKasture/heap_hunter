@@ -8,6 +8,7 @@ const Manifest = @import("index/Manifest.zig");
 const Scanner = @import("index/Scanner.zig");
 const Csr = @import("index/Csr.zig");
 const log = @import("log");
+const profiling = @import("profiling");
 
 pub const HistogramOptions = struct {
     limit: usize = 15,
@@ -153,7 +154,11 @@ pub fn buildFromIndex(
     };
     defer allocator.free(classes_data);
 
-    var class_table = try parseClassesBin(allocator, classes_data);
+    var class_table = blk: {
+        var span = profiling.begin(io, "parse_classes");
+        defer span.end(io);
+        break :blk try parseClassesBin(allocator, classes_data);
+    };
     defer {
         allocator.free(class_table.ids);
         for (class_table.names) |name| allocator.free(name);
@@ -190,33 +195,37 @@ pub fn buildFromIndex(
 
     const n_rows = catalog_data.len / Scanner.catalog_row_size;
     var row_idx: usize = 0;
-    while (row_idx < n_rows) : (row_idx += 1) {
-        const row = Scanner.readCatalogRow(catalog_data[row_idx * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch {
-            return error.CorruptIndexFile;
-        };
+    {
+        var span = profiling.begin(io, "aggregate");
+        defer span.end(io);
+        while (row_idx < n_rows) : (row_idx += 1) {
+            const row = Scanner.readCatalogRow(catalog_data[row_idx * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch {
+                return error.CorruptIndexFile;
+            };
 
-        switch (row.kind) {
-            .instance, .object_array => {
-                const result = try hist_map.getOrPut(row.class_raw_id);
-                if (result.found_existing) {
-                    result.value_ptr.*.count += 1;
-                    result.value_ptr.*.bytes += row.shallow_size;
-                } else {
-                    result.value_ptr.* = .{ .count = 1, .bytes = row.shallow_size };
-                }
-                total_objects += 1;
-                total_heap_bytes += row.shallow_size;
-                if (row.kind == .object_array) {
+            switch (row.kind) {
+                .instance, .object_array => {
+                    const result = try hist_map.getOrPut(row.class_raw_id);
+                    if (result.found_existing) {
+                        result.value_ptr.*.count += 1;
+                        result.value_ptr.*.bytes += row.shallow_size;
+                    } else {
+                        result.value_ptr.* = .{ .count = 1, .bytes = row.shallow_size };
+                    }
+                    total_objects += 1;
+                    total_heap_bytes += row.shallow_size;
+                    if (row.kind == .object_array) {
+                        total_arrays += 1;
+                    }
+                },
+                .primitive_array => {
+                    // Aggregated from prim_histogram.bin; just count summary totals.
+                    total_objects += 1;
                     total_arrays += 1;
-                }
-            },
-            .primitive_array => {
-                // Aggregated from prim_histogram.bin; just count summary totals.
-                total_objects += 1;
-                total_arrays += 1;
-                total_heap_bytes += row.shallow_size;
-            },
-            .class => {},
+                    total_heap_bytes += row.shallow_size;
+                },
+                .class => {},
+            }
         }
     }
 
@@ -226,17 +235,21 @@ pub fn buildFromIndex(
         hist_items.deinit(allocator);
     }
 
-    var it = hist_map.iterator();
-    while (it.next()) |entry| {
-        const name = try classNameForId(allocator, class_table, entry.key_ptr.*);
-        errdefer allocator.free(name);
-        try hist_items.append(allocator, .{
-            .name = name,
-            .count = entry.value_ptr.*.count,
-            .bytes = entry.value_ptr.*.bytes,
-        });
+    {
+        var span = profiling.begin(io, "name_resolve");
+        defer span.end(io);
+        var it = hist_map.iterator();
+        while (it.next()) |entry| {
+            const name = try classNameForId(allocator, class_table, entry.key_ptr.*);
+            errdefer allocator.free(name);
+            try hist_items.append(allocator, .{
+                .name = name,
+                .count = entry.value_ptr.*.count,
+                .bytes = entry.value_ptr.*.bytes,
+            });
+        }
+        std.mem.sort(HistogramEntry, hist_items.items, {}, compareHistByBytes);
     }
-    std.mem.sort(HistogramEntry, hist_items.items, {}, compareHistByBytes);
 
     var class_items = std.ArrayList(ClassEntry).empty;
     defer {
@@ -247,23 +260,31 @@ pub fn buildFromIndex(
         class_items.deinit(allocator);
     }
 
-    for (class_table.ids, class_table.names, class_table.super_ids, class_table.instance_sizes) |_, name, super_id, size| {
-        const class_name = try decodeDescriptor(allocator, name);
-        errdefer allocator.free(class_name);
-        const super_name = if (super_id == 0)
-            try allocator.dupe(u8, "(none)")
-        else
-            try classNameForId(allocator, class_table, super_id);
-        errdefer allocator.free(super_name);
-        try class_items.append(allocator, .{
-            .name = class_name,
-            .superclass = super_name,
-            .instance_size = size,
-        });
+    {
+        var span = profiling.begin(io, "class_list");
+        defer span.end(io);
+        for (class_table.ids, class_table.names, class_table.super_ids, class_table.instance_sizes) |_, name, super_id, size| {
+            const class_name = try decodeDescriptor(allocator, name);
+            errdefer allocator.free(class_name);
+            const super_name = if (super_id == 0)
+                try allocator.dupe(u8, "(none)")
+            else
+                try classNameForId(allocator, class_table, super_id);
+            errdefer allocator.free(super_name);
+            try class_items.append(allocator, .{
+                .name = class_name,
+                .superclass = super_name,
+                .instance_size = size,
+            });
+        }
+        std.mem.sort(ClassEntry, class_items.items, {}, compareClassBySize);
     }
-    std.mem.sort(ClassEntry, class_items.items, {}, compareClassBySize);
 
-    const classloader_count = try computeClassloaderCount(allocator, class_table, catalog_data);
+    const classloader_count = blk: {
+        var span = profiling.begin(io, "classloader_count");
+        defer span.end(io);
+        break :blk try computeClassloaderCount(allocator, class_table, catalog_data);
+    };
 
     // Thread count comes from the GC roots: one `gc_root_thread_object`
     // record per live thread object in the dump.
@@ -282,13 +303,17 @@ pub fn buildFromIndex(
     var seen_ordinals = std.AutoHashMap(u32, void).init(allocator);
     defer seen_ordinals.deinit();
     const thread_object_root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object);
-    var roots_i: usize = 0;
-    while (roots_i < roots_data.len) : (roots_i += Csr.roots_bin_record_size) {
-        const rec = Csr.readRootRecord(roots_data[roots_i..][0..Csr.roots_bin_record_size]);
-        if (rec.root_kind != thread_object_root_kind) continue;
-        const gop = try seen_ordinals.getOrPut(rec.target_ordinal);
-        if (gop.found_existing) continue;
-        thread_count += 1;
+    {
+        var span = profiling.begin(io, "threads");
+        defer span.end(io);
+        var roots_i: usize = 0;
+        while (roots_i < roots_data.len) : (roots_i += Csr.roots_bin_record_size) {
+            const rec = Csr.readRootRecord(roots_data[roots_i..][0..Csr.roots_bin_record_size]);
+            if (rec.root_kind != thread_object_root_kind) continue;
+            const gop = try seen_ordinals.getOrPut(rec.target_ordinal);
+            if (gop.found_existing) continue;
+            thread_count += 1;
+        }
     }
 
     return .{
@@ -1051,8 +1076,7 @@ const CacheCursor = struct {
         }
         return try items.toOwnedSlice(allocator);
     }
-
-};// ─────────────────────────────────────────────────────────────────────────────
+}; // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

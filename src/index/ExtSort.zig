@@ -5,6 +5,7 @@
 //! comparator over `[]const u8` record slices.
 const std = @import("std");
 const Io = std.Io;
+const profiling = @import("profiling");
 
 pub const Options = struct {
     /// Size of each record in bytes. Must be greater than zero.
@@ -373,8 +374,6 @@ fn mergeRunGroup(
         runs[i] = .{ .data = mmaps[i].memory, .cursor = 0 };
     }
 
-
-
     var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
     defer out_file.close(io);
     var out_buf: [65536]u8 = undefined;
@@ -741,7 +740,6 @@ test "external sort removes multi-pass merge intermediates" {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming merge implementation (memory-bounded alternative to mergeRuns)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -985,14 +983,22 @@ pub fn sortStreaming(
     });
     defer input_mm.destroy(io);
 
-    const runs = try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan);
+    const runs = blk: {
+        var span = profiling.begin(io, "runs");
+        defer span.end(io);
+        break :blk try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan);
+    };
     defer {
         for (runs) |run_path| allocator.free(run_path);
         allocator.free(runs);
     }
 
     // Merge with bounded streaming reads.
-    try mergeRunsStreaming(io, allocator, runs, output_path, record_size, fanout, context, lessThan);
+    {
+        var span = profiling.begin(io, "merge");
+        defer span.end(io);
+        try mergeRunsStreaming(io, allocator, runs, output_path, record_size, fanout, context, lessThan);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1062,17 +1068,17 @@ test "streaming sort: property test" {
     const io = std.testing.io;
 
     const cases = .{
-        .{ .rs = 8, .count = 0,   .budget = 1024, .fanout = 64, .fo = null },
-        .{ .rs = 8, .count = 1,   .budget = 1024, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 0, .budget = 1024, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 1, .budget = 1024, .fanout = 64, .fo = null },
         .{ .rs = 8, .count = 100, .budget = 4096, .fanout = 64, .fo = null },
         .{ .rs = 16, .count = 500, .budget = 4096, .fanout = 64, .fo = null },
         .{ .rs = 32, .count = 200, .budget = 1024, .fanout = 64, .fo = null },
         // Small budget forces many runs with a tiny fanout derived automatically.
-        .{ .rs = 5,  .count = 100, .budget = 12,   .fanout = 64, .fo = null },
-        .{ .rs = 8,  .count = 400, .budget = 1600, .fanout = 64, .fo = null },
-        .{ .rs = 8,  .count = 401, .budget = 1600, .fanout = 64, .fo = null },
+        .{ .rs = 5, .count = 100, .budget = 12, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 400, .budget = 1600, .fanout = 64, .fo = null },
+        .{ .rs = 8, .count = 401, .budget = 1600, .fanout = 64, .fo = null },
         // Explicit fanout = 2 forces multi-pass merge.
-        .{ .rs = 8,  .count = 100, .budget = 80,   .fanout = 2,  .fo = @as(?usize, 2) },
+        .{ .rs = 8, .count = 100, .budget = 80, .fanout = 2, .fo = @as(?usize, 2) },
     };
 
     inline for (cases) |c| {
