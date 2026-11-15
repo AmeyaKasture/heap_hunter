@@ -15,13 +15,24 @@ pub fn build(b: *std.Build) void {
         .ReleaseSafe, .ReleaseFast, .ReleaseSmall => false,
     };
 
+    const profile = b.option(bool, "profile", "Enable --profile timing instrumentation (development only)") orelse (optimize == .Debug);
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "log_level", log_level);
     build_options.addOption(bool, "stack_traces", stack_traces);
+    build_options.addOption(bool, "profile", profile);
     const build_options_mod = build_options.createModule();
 
     const log_mod = b.addModule("log", .{
         .root_source_file = b.path("src/log.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+
+    const profiling_mod = b.addModule("profiling", .{
+        .root_source_file = b.path("src/Profiling.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
@@ -34,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
             .{ .name = "log", .module = log_mod },
+            .{ .name = "profiling", .module = profiling_mod },
         },
     });
 
@@ -47,6 +59,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "heaphunter", .module = mod },
                 .{ .name = "build_options", .module = build_options_mod },
                 .{ .name = "log", .module = log_mod },
+                .{ .name = "profiling", .module = profiling_mod },
             },
         }),
     });

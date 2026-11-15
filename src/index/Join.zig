@@ -25,6 +25,7 @@ const CatalogSorter = @import("CatalogSorter.zig");
 const EdgeEmitter = @import("EdgeEmitter.zig");
 const Scanner = @import("Scanner.zig");
 const ExtSort = @import("ExtSort.zig");
+const profiling = @import("profiling");
 
 /// Size in bytes of one source-resolved intermediate record:
 /// `source_ordinal u32` + `target_raw_id u64`.
@@ -164,48 +165,64 @@ pub fn run(
     const edges_by_source_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "edges.by_source" });
     defer allocator.free(edges_by_source_path);
 
-    try ExtSort.sortStreaming(io, allocator, edges_path, edges_by_source_path, .{
-        .record_size = EdgeEmitter.edge_record_size,
-        .budget_bytes = job.budget_bytes,
-    }, null, {}, edgeLessBySource);
+    {
+        var span = profiling.begin(io, "sort_source");
+        defer span.end(io);
+        try ExtSort.sortStreaming(io, allocator, edges_path, edges_by_source_path, .{
+            .record_size = EdgeEmitter.edge_record_size,
+            .budget_bytes = job.budget_bytes,
+        }, null, {}, edgeLessBySource);
+    }
 
     // Resolve source IDs: merge-join sorted edges with the catalog.
     const source_resolved_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "edges.source_resolved" });
     defer allocator.free(source_resolved_path);
 
-    try resolveSourcesStreaming(
-        allocator,
-        io,
-        edges_by_source_path,
-        catalog_path,
-        source_resolved_path,
-        virtual_root_ordinal,
-        diagnostics,
-        job.budget_bytes,
-    );
+    {
+        var span = profiling.begin(io, "join_source");
+        defer span.end(io);
+        try resolveSourcesStreaming(
+            allocator,
+            io,
+            edges_by_source_path,
+            catalog_path,
+            source_resolved_path,
+            virtual_root_ordinal,
+            diagnostics,
+            job.budget_bytes,
+        );
+    }
 
     // Sort intermediate records by target raw ID.
     const edges_by_target_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "edges.by_target" });
     defer allocator.free(edges_by_target_path);
 
-    try ExtSort.sortStreaming(io, allocator, source_resolved_path, edges_by_target_path, .{
-        .record_size = source_resolved_record_size,
-        .budget_bytes = job.budget_bytes,
-    }, null, {}, sourceResolvedLessByTarget);
+    {
+        var span = profiling.begin(io, "sort_target");
+        defer span.end(io);
+        try ExtSort.sortStreaming(io, allocator, source_resolved_path, edges_by_target_path, .{
+            .record_size = source_resolved_record_size,
+            .budget_bytes = job.budget_bytes,
+        }, null, {}, sourceResolvedLessByTarget);
+    }
 
     // Resolve target IDs: merge-join sorted intermediate records with the catalog.
     const resolved_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "edges.resolved" });
     errdefer allocator.free(resolved_path);
 
-    const n_edges = try resolveTargetsStreaming(
-        allocator,
-        io,
-        edges_by_target_path,
-        catalog_path,
-        resolved_path,
-        diagnostics,
-        job.budget_bytes,
-    );
+    const n_edges = blk: {
+        var span = profiling.begin(io, "join_target");
+        defer span.end(io);
+        break :blk try resolveTargetsStreaming(
+            allocator,
+            io,
+            edges_by_target_path,
+            catalog_path,
+            resolved_path,
+            diagnostics,
+            job.budget_bytes,
+        );
+    };
 
     return .{
         .resolved_path = resolved_path,
@@ -763,7 +780,6 @@ test "Stage 5 worked example verbatim" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
     defer result.deinit(allocator);
@@ -805,7 +821,6 @@ test "virtual root edge resolves to virtual root ordinal" {
 
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
-
 
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
@@ -849,7 +864,6 @@ test "dangling source is dropped and counted" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
     defer result.deinit(allocator);
@@ -892,7 +906,6 @@ test "dangling target is dropped and counted" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
     defer result.deinit(allocator);
@@ -930,7 +943,6 @@ test "empty edges produce empty resolved file" {
 
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
-
 
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 1, &diagnostics);
@@ -975,7 +987,6 @@ test "multiple edges from same source" {
     var job = try createTestJob(allocator, io_arg, tmp_path);
     defer job.deinit(allocator);
 
-
     var diagnostics: Manifest.Diagnostics = .{};
     var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
     defer result.deinit(allocator);
@@ -1014,7 +1025,6 @@ test "fixtures produce resolved edges" {
 
         const source_data = try Io.Dir.cwd().readFileAlloc(io_arg, fixture_path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(source_data);
-
 
         var job = try createTestJobFromSource(allocator, io_arg, source_data, tmp_path);
         defer job.deinit(allocator);

@@ -11,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Manifest = @import("Manifest.zig");
+const profiling = @import("profiling");
 
 /// Errors that can be returned by the publication pipeline.
 pub const Error = error{
@@ -98,11 +99,15 @@ pub fn publish(
     };
     defer index_dir_handle.close(io);
 
-    for (required_files) |name| {
-        staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| {
-            try stderr.print("error: failed to publish {s}: {}\n", .{ name, err });
-            return error.PublishFailed;
-        };
+    {
+        var span = profiling.begin(io, "renames");
+        defer span.end(io);
+        for (required_files) |name| {
+            staging_dir_handle.rename(name, index_dir_handle, name, io) catch |err| {
+                try stderr.print("error: failed to publish {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            };
+        }
     }
 
     // Collect file sizes from the published files for the manifest.
@@ -115,19 +120,23 @@ pub fn publish(
     }
 
     var index_bytes: u64 = 0;
-    for (required_files) |name| {
-        const new_path = try std.fs.path.join(allocator, &.{ index_dir, name });
-        defer allocator.free(new_path);
+    {
+        var span = profiling.begin(io, "manifest");
+        defer span.end(io);
+        for (required_files) |name| {
+            const new_path = try std.fs.path.join(allocator, &.{ index_dir, name });
+            defer allocator.free(new_path);
 
-        const stat = dir.statFile(io, new_path, .{}) catch |err| {
-            try stderr.print("error: failed to stat published file {s}: {}\n", .{ name, err });
-            return error.PublishFailed;
-        };
+            const stat = dir.statFile(io, new_path, .{}) catch |err| {
+                try stderr.print("error: failed to stat published file {s}: {}\n", .{ name, err });
+                return error.PublishFailed;
+            };
 
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-        try files.append(allocator, .{ .name = owned_name, .size = stat.size });
-        index_bytes += stat.size;
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
+            try files.append(allocator, .{ .name = owned_name, .size = stat.size });
+            index_bytes += stat.size;
+        }
     }
 
     // Publish optional files that exist in staging, and remove stale ones from
@@ -187,10 +196,14 @@ pub fn publish(
     };
 
     // Remove the (now empty) staging directory.
-    dir.deleteTree(io, staging_dir) catch |err| {
-        try stderr.print("error: failed to remove staging directory {s}: {}\n", .{ staging_dir, err });
-        return error.PublishFailed;
-    };
+    {
+        var span = profiling.begin(io, "cleanup");
+        defer span.end(io);
+        dir.deleteTree(io, staging_dir) catch |err| {
+            try stderr.print("error: failed to remove staging directory {s}: {}\n", .{ staging_dir, err });
+            return error.PublishFailed;
+        };
+    }
 
     return .{
         .index_bytes = index_bytes,

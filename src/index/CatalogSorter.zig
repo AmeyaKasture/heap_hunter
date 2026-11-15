@@ -6,6 +6,7 @@ const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
 const ExtSort = @import("ExtSort.zig");
+const profiling = @import("profiling");
 
 pub const catalog_row_size = Scanner.catalog_row_size;
 
@@ -40,10 +41,14 @@ pub fn sortAndDedupe(
     const sorted_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "catalog.sorted" });
     defer allocator.free(sorted_path);
 
-    try ExtSort.sortStreaming(io, allocator, unsorted_path, sorted_path, .{
-        .record_size = catalog_row_size,
-        .budget_bytes = job.budget_bytes,
-    }, null, {}, catalogLessThan);
+    {
+        var span = profiling.begin(io, "extsort");
+        defer span.end(io);
+        try ExtSort.sortStreaming(io, allocator, unsorted_path, sorted_path, .{
+            .record_size = catalog_row_size,
+            .budget_bytes = job.budget_bytes,
+        }, null, {}, catalogLessThan);
+    }
 
     const catalog_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "catalog.bin" });
     errdefer allocator.free(catalog_path);
@@ -74,20 +79,23 @@ pub fn sortAndDedupe(
     var duplicate_count: u64 = 0;
     var last_id: u64 = 0;
 
-    var i: usize = 0;
-    while (i < n_records) : (i += 1) {
-        const record = sorted_mm.memory[i * catalog_row_size ..][0..catalog_row_size];
-        const raw_id = std.mem.readInt(u64, record[0..8], .little);
-        if (i > 0 and raw_id == last_id) {
-            duplicate_count += 1;
-            continue;
+    {
+        var span = profiling.begin(io, "dedupe");
+        defer span.end(io);
+        var i: usize = 0;
+        while (i < n_records) : (i += 1) {
+            const record = sorted_mm.memory[i * catalog_row_size ..][0..catalog_row_size];
+            const raw_id = std.mem.readInt(u64, record[0..8], .little);
+            if (i > 0 and raw_id == last_id) {
+                duplicate_count += 1;
+                continue;
+            }
+            last_id = raw_id;
+            try catalog_writer.writeAll(record);
+            n_written += 1;
         }
-        last_id = raw_id;
-        try catalog_writer.writeAll(record);
-        n_written += 1;
+        try catalog_file_writer.flush();
     }
-
-    try catalog_file_writer.flush();
 
     if (n_written >= max_object_count) {
         return error.TooManyObjects;
@@ -126,20 +134,24 @@ pub fn writeClasses(
     var list = std.ArrayList(ClassRecord).empty;
     defer list.deinit(allocator);
 
-    var it = class_table.classes.iterator();
-    while (it.next()) |entry| {
-        const class_id = entry.key_ptr.*;
-        const class_entry = entry.value_ptr.*;
-        const name = class_table.className(class_id) orelse "";
-        try list.append(allocator, .{
-            .class_id = class_id,
-            .super_class_id = class_entry.super_class_id,
-            .instance_size = class_entry.instance_size,
-            .name = name,
-        });
-    }
+    {
+        var span = profiling.begin(io, "collect_sort");
+        defer span.end(io);
+        var it = class_table.classes.iterator();
+        while (it.next()) |entry| {
+            const class_id = entry.key_ptr.*;
+            const class_entry = entry.value_ptr.*;
+            const name = class_table.className(class_id) orelse "";
+            try list.append(allocator, .{
+                .class_id = class_id,
+                .super_class_id = class_entry.super_class_id,
+                .instance_size = class_entry.instance_size,
+                .name = name,
+            });
+        }
 
-    std.mem.sort(ClassRecord, list.items, {}, ClassRecord.less);
+        std.mem.sort(ClassRecord, list.items, {}, ClassRecord.less);
+    }
 
     const dir = Io.Dir.cwd();
     var classes_file = try dir.createFile(io, classes_path, .{});
@@ -148,19 +160,22 @@ pub fn writeClasses(
     var classes_file_writer: Io.File.Writer = .init(classes_file, io, &classes_buf);
     const classes_writer = &classes_file_writer.interface;
 
-    for (list.items) |rec| {
-        var header: [24]u8 = undefined;
-        std.mem.writeInt(u64, header[0..8], rec.class_id, .little);
-        std.mem.writeInt(u64, header[8..16], rec.super_class_id, .little);
-        std.mem.writeInt(u32, header[16..20], rec.instance_size, .little);
-        std.mem.writeInt(u32, header[20..24], @intCast(rec.name.len), .little);
-        try classes_writer.writeAll(&header);
-        if (rec.name.len > 0) {
-            try classes_writer.writeAll(rec.name);
+    {
+        var span = profiling.begin(io, "write");
+        defer span.end(io);
+        for (list.items) |rec| {
+            var header: [24]u8 = undefined;
+            std.mem.writeInt(u64, header[0..8], rec.class_id, .little);
+            std.mem.writeInt(u64, header[8..16], rec.super_class_id, .little);
+            std.mem.writeInt(u32, header[16..20], rec.instance_size, .little);
+            std.mem.writeInt(u32, header[20..24], @intCast(rec.name.len), .little);
+            try classes_writer.writeAll(&header);
+            if (rec.name.len > 0) {
+                try classes_writer.writeAll(rec.name);
+            }
         }
+        try classes_file_writer.flush();
     }
-
-    try classes_file_writer.flush();
 
     return classes_path;
 }
@@ -399,7 +414,7 @@ test "fixture catalog count stable after sort and dedupe" {
         defer scan_result.deinit(allocator);
 
         var diagnostics: Manifest.Diagnostics = .{};
-    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
         defer result.deinit(allocator);
 
         const expected = analysis_index.total_objects + analysis_index.classes.count();

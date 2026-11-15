@@ -8,6 +8,7 @@ const Preflight = @import("Preflight.zig");
 const Progress = @import("../Progress.zig").Progress;
 const ThreadTraces = @import("ThreadTraces.zig");
 const log = @import("log");
+const profiling = @import("profiling");
 
 /// Fixed size of a catalog row on disk: 32 bytes, little-endian.
 pub const catalog_row_size = 32;
@@ -379,54 +380,63 @@ pub fn run(
     }
 
     var reader = try hprof.Reader.init(source_data);
-    while (try reader.next()) |record| {
-        switch (record) {
-            .utf8 => |u| {
-                try class_table.addUtf8(u.id, u.bytes);
-            },
-            .load_class => |lc| {
-                try class_table.addLoadClass(lc.serial, lc.class_id, lc.name_id);
-            },
-            .frame => |frame| {
-                try thread_traces.addFrame(frame);
-            },
-            .trace => |trace| {
-                try thread_traces.addTrace(trace, job.header.id_size);
-            },
-            // HPROF 1.0.2 uses either a single HEAP_DUMP or multiple HEAP_DUMP_SEGMENT records.
-            .heap_dump => |heap_reader| {
-                var hr = heap_reader;
-                try scanHeapDump(
-                    job,
-                    &hr,
-                    &class_table,
-                    &thread_traces,
-                    catalog_writer,
-                    roots_writer,
-                    &n_catalog_rows,
-                    &n_roots,
-                    &diagnostics,
-                    &prim_histogram,
-                );
-            },
-            .heap_dump_segment => |heap_reader| {
-                var hr = heap_reader;
-                try scanHeapDump(
-                    job,
-                    &hr,
-                    &class_table,
-                    &thread_traces,
-                    catalog_writer,
-                    roots_writer,
-                    &n_catalog_rows,
-                    &n_roots,
-                    &diagnostics,
-                    &prim_histogram,
-                );
-            },
-            else => {},
+    var accs: ScanAccs = .{};
+    {
+        var span = profiling.begin(io, "records");
+        defer span.end(io);
+        while (try reader.next()) |record| {
+            switch (record) {
+                .utf8 => |u| {
+                    try class_table.addUtf8(u.id, u.bytes);
+                },
+                .load_class => |lc| {
+                    try class_table.addLoadClass(lc.serial, lc.class_id, lc.name_id);
+                },
+                .frame => |frame| {
+                    try thread_traces.addFrame(frame);
+                },
+                .trace => |trace| {
+                    try thread_traces.addTrace(trace, job.header.id_size);
+                },
+                // HPROF 1.0.2 uses either a single HEAP_DUMP or multiple HEAP_DUMP_SEGMENT records.
+                .heap_dump => |heap_reader| {
+                    var hr = heap_reader;
+                    try scanHeapDump(
+                        io,
+                        job,
+                        &hr,
+                        &class_table,
+                        &thread_traces,
+                        catalog_writer,
+                        roots_writer,
+                        &n_catalog_rows,
+                        &n_roots,
+                        &diagnostics,
+                        &prim_histogram,
+                        &accs,
+                    );
+                },
+                .heap_dump_segment => |heap_reader| {
+                    var hr = heap_reader;
+                    try scanHeapDump(
+                        io,
+                        job,
+                        &hr,
+                        &class_table,
+                        &thread_traces,
+                        catalog_writer,
+                        roots_writer,
+                        &n_catalog_rows,
+                        &n_roots,
+                        &diagnostics,
+                        &prim_histogram,
+                        &accs,
+                    );
+                },
+                else => {},
+            }
+            if (progress) |p| p.tick();
         }
-        if (progress) |p| p.tick();
     }
 
     try catalog_file_writer.flush();
@@ -436,16 +446,24 @@ pub fn run(
     inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
         if (prim_histogram[field.value].count > 0) prim_count += 1;
     }
-    try writeU32(prim_histogram_writer, prim_count);
-    inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
-        const entry = prim_histogram[field.value];
-        if (entry.count > 0) {
-            try writePrimHistogramEntry(prim_histogram_writer, entry);
+    {
+        var span = profiling.begin(io, "histogram");
+        defer span.end(io);
+        try writeU32(prim_histogram_writer, prim_count);
+        inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
+            const entry = prim_histogram[field.value];
+            if (entry.count > 0) {
+                try writePrimHistogramEntry(prim_histogram_writer, entry);
+            }
         }
+        try prim_histogram_file_writer.flush();
     }
-    try prim_histogram_file_writer.flush();
 
-    try writeThreadTraces(allocator, io, &class_table, &thread_traces, thread_traces_path);
+    {
+        var span = profiling.begin(io, "thread_traces");
+        defer span.end(io);
+        try writeThreadTraces(allocator, io, &class_table, &thread_traces, thread_traces_path);
+    }
 
     log.debug(
         "scanner complete: n_catalog_rows={d}, n_roots={d}, n_followup_frames={d}, n_traces={d}, n_thread_roots={d}, diagnostics={any}",
@@ -612,9 +630,19 @@ fn writeU32(writer: *Io.Writer, value: u32) !void {
     try writer.writeAll(&buf);
 }
 
+/// Accumulator buckets for per-record-kind timings inside `scanHeapDump`.
+/// Lives across heap-dump segments so counts accumulate over the whole scan.
+const ScanAccs = struct {
+    classes: profiling.Acc = .{},
+    instances: profiling.Acc = .{},
+    arrays: profiling.Acc = .{},
+    roots: profiling.Acc = .{},
+};
+
 /// Scan all sub-records inside a single `HEAP_DUMP` or `HEAP_DUMP_SEGMENT`.
 /// Emits catalog rows for heap entities and root records for GC roots.
 fn scanHeapDump(
+    io: Io,
     job: *const Preflight.Job,
     hr: *hprof.HeapDumpReader,
     class_table: *ClassTable,
@@ -625,10 +653,13 @@ fn scanHeapDump(
     n_roots: *u64,
     diagnostics: *Manifest.Diagnostics,
     prim_histogram: []PrimHistogramEntry,
+    accs: *ScanAccs,
 ) !void {
     while (try hr.nextWithOffset()) |item| {
         switch (item.record) {
             .gc_class_dump => |cd| {
+                accs.classes.start(io, "classes");
+                defer accs.classes.stop(io);
                 try class_table.addClassDump(cd);
 
                 // Count non-null object-typed constant-pool references. These are intentionally
@@ -660,6 +691,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_instance_dump => |id| {
+                accs.instances.start(io, "instances");
+                defer accs.instances.stop(io);
                 const size = std.math.cast(u32, id.bytes.len) orelse return error.InstanceTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = id.object_id,
@@ -671,6 +704,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_obj_array_dump => |oa| {
+                accs.arrays.start(io, "arrays");
+                defer accs.arrays.stop(io);
                 const size = std.math.cast(u32, @as(u64, oa.element_count) * job.header.id_size) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = oa.array_id,
@@ -682,6 +717,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_prim_array_dump => |pa| {
+                accs.arrays.start(io, "arrays");
+                defer accs.arrays.stop(io);
                 const size = std.math.cast(u32, pa.bytes.len) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = pa.array_id,
@@ -703,6 +740,8 @@ fn scanHeapDump(
             // thread instance to its recorded stack trace; capture it before
             // falling through to the generic root handling.
             .gc_root_thread_object => |r| {
+                accs.roots.start(io, "roots");
+                defer accs.roots.stop(io);
                 try thread_traces.addThreadRoot(r.thread_object_id, r.thread_serial, r.stack_trace_serial);
                 try writeRootRecord(roots_writer, .{
                     .target_raw_id = r.thread_object_id,
@@ -713,6 +752,8 @@ fn scanHeapDump(
             },
             // Any remaining subtag is one of the nine GC root kinds.
             else => |root| {
+                accs.roots.start(io, "roots");
+                defer accs.roots.stop(io);
                 const info = extractRootInfo(root);
                 try writeRootRecord(roots_writer, .{
                     .target_raw_id = info.target,

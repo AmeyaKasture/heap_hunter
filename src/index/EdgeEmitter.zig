@@ -6,6 +6,7 @@ const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
 const Layouts = @import("Layouts.zig");
+const profiling = @import("profiling");
 
 pub const edge_record_size = 16;
 
@@ -82,11 +83,11 @@ pub fn run(
         switch (record) {
             .heap_dump => |heap_reader| {
                 var hr = heap_reader;
-                try scanHeapDump(job, &hr, layout_table, edges_writer, &n_edges, diagnostics);
+                try scanHeapDump(io, job, &hr, layout_table, edges_writer, &n_edges, diagnostics);
             },
             .heap_dump_segment => |heap_reader| {
                 var hr = heap_reader;
-                try scanHeapDump(job, &hr, layout_table, edges_writer, &n_edges, diagnostics);
+                try scanHeapDump(io, job, &hr, layout_table, edges_writer, &n_edges, diagnostics);
             },
             else => {},
         }
@@ -112,6 +113,7 @@ pub fn run(
 ///
 /// Primitive arrays produce no edges. Null targets are skipped.
 fn scanHeapDump(
+    io: Io,
     job: *const Preflight.Job,
     hr: *hprof.HeapDumpReader,
     layout_table: *const Layouts.LayoutTable,
@@ -119,9 +121,15 @@ fn scanHeapDump(
     n_edges: *u64,
     diagnostics: *Manifest.Diagnostics,
 ) !void {
+    var statics_acc: profiling.Acc = .{};
+    var instances_acc: profiling.Acc = .{};
+    var arrays_acc: profiling.Acc = .{};
+    var roots_acc: profiling.Acc = .{};
     while (try hr.nextWithOffset()) |item| {
         switch (item.record) {
             .gc_class_dump => |cd| {
+                statics_acc.start(io, "statics");
+                defer statics_acc.stop(io);
                 var it = cd.staticFieldIterator(job.header.id_size);
                 while (try it.next()) |field| {
                     if (field.type != .object and field.type != .array_object) continue;
@@ -139,6 +147,8 @@ fn scanHeapDump(
                 }
             },
             .gc_instance_dump => |id| {
+                instances_acc.start(io, "instances");
+                defer instances_acc.stop(io);
                 const layout = layout_table.lookup(id.class_id) orelse {
                     diagnostics.missing_layout += 1;
                     continue;
@@ -156,6 +166,8 @@ fn scanHeapDump(
                 }
             },
             .gc_obj_array_dump => |oa| {
+                arrays_acc.start(io, "arrays");
+                defer arrays_acc.stop(io);
                 var i: u32 = 0;
                 while (i < oa.element_count) : (i += 1) {
                     const target = try oa.element(i, job.header.id_size);
@@ -169,6 +181,8 @@ fn scanHeapDump(
             },
             .gc_prim_array_dump => {},
             else => |root| {
+                roots_acc.start(io, "roots");
+                defer roots_acc.stop(io);
                 const info = Scanner.extractRootInfo(root);
                 if (info.target == 0) continue;
                 try writeEdgeRecord(edges_writer, .{

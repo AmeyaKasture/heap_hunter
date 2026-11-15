@@ -29,6 +29,7 @@ const CatalogSorter = @import("CatalogSorter.zig");
 const Csr = @import("Csr.zig");
 const ThreadTraces = @import("ThreadTraces.zig");
 const Cli = @import("../Cli.zig");
+const profiling = @import("profiling");
 
 /// Errors that can be returned by the validation pipeline.
 pub const Error = error{
@@ -175,34 +176,64 @@ pub fn validate(
     const n_nodes = n_objects + 1;
 
     // 2. Catalog raw IDs are strictly sorted and unique, and kind values are valid.
-    try validateCatalog(io, catalog_path, n_objects, n_classes, stderr);
+    {
+        var span = profiling.begin(io, "catalog");
+        defer span.end(io);
+        try validateCatalog(io, catalog_path, n_objects, n_classes, stderr);
+    }
 
     // 3. classes.bin is sorted and parseable, and its record count matches n_classes.
-    try validateClasses(io, classes_path, n_classes, stderr);
+    {
+        var span = profiling.begin(io, "classes");
+        defer span.end(io);
+        try validateClasses(io, classes_path, n_classes, stderr);
+    }
 
     // 4. fields.bin is parseable (we do not fully decode names here; we just
     //    verify the per-class counts and per-field lengths are consistent).
-    try validateFields(io, fields_path, n_classes, stderr);
+    {
+        var span = profiling.begin(io, "fields");
+        defer span.end(io);
+        try validateFields(io, fields_path, n_classes, stderr);
+    }
 
     // 5. Forward and reverse CSR offsets are monotone, start at 0, end at n_edges,
     //    and have exactly n_nodes + 1 entries.
-    try validateOffsets(io, out_offsets_path, n_nodes, n_edges, "out_offsets.bin", stderr);
-    try validateOffsets(io, in_offsets_path, n_nodes, n_edges, "in_offsets.bin", stderr);
+    {
+        var span = profiling.begin(io, "offsets");
+        defer span.end(io);
+        try validateOffsets(io, out_offsets_path, n_nodes, n_edges, "out_offsets.bin", stderr);
+        try validateOffsets(io, in_offsets_path, n_nodes, n_edges, "in_offsets.bin", stderr);
+    }
 
     // 6. Every target/source ordinal in the adjacency arrays is a valid node.
-    try validateAdjacency(io, out_targets_path, n_edges, virtual_root_ordinal, "out_targets.bin", stderr);
-    try validateAdjacency(io, in_sources_path, n_edges, virtual_root_ordinal, "in_sources.bin", stderr);
+    {
+        var span = profiling.begin(io, "adjacency");
+        defer span.end(io);
+        try validateAdjacency(io, out_targets_path, n_edges, virtual_root_ordinal, "out_targets.bin", stderr);
+        try validateAdjacency(io, in_sources_path, n_edges, virtual_root_ordinal, "in_sources.bin", stderr);
+    }
 
     // 7. roots.bin target ordinals are valid and its record count matches n_roots.
-    try validateRoots(io, roots_path, n_roots, virtual_root_ordinal, stderr);
+    {
+        var span = profiling.begin(io, "roots");
+        defer span.end(io);
+        try validateRoots(io, roots_path, n_roots, virtual_root_ordinal, stderr);
+    }
 
     // 8. thread_traces.bin is parseable and structurally valid.
-    const thread_traces_path = try std.fs.path.join(allocator, &.{ staging_dir, "thread_traces.bin" });
-    defer allocator.free(thread_traces_path);
-    try validateThreadTraces(allocator, io, thread_traces_path, stderr);
+    {
+        var span = profiling.begin(io, "thread_traces");
+        defer span.end(io);
+        const thread_traces_path = try std.fs.path.join(allocator, &.{ staging_dir, "thread_traces.bin" });
+        defer allocator.free(thread_traces_path);
+        try validateThreadTraces(allocator, io, thread_traces_path, stderr);
+    }
 
     // 9. Dominator files are internally consistent when present.
     if (has_dominators) {
+        var span = profiling.begin(io, "dominators");
+        defer span.end(io);
         try validateDominators(io, staging_dir, n_nodes, n_objects, stderr);
     }
 }
