@@ -363,21 +363,10 @@ pub fn run(
     var diagnostics: Manifest.Diagnostics = .{};
     var n_catalog_rows: u64 = 0;
     var n_roots: u64 = 0;
-    var prim_histogram: [16]PrimHistogramEntry = undefined;
-    for (&prim_histogram) |*slot| {
-        slot.* = .{
-            .element_type = .byte,
-            .count = 0,
-            .bytes = 0,
-        };
-    }
-    inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
-        prim_histogram[field.value] = .{
-            .element_type = @as(hprof.PrimitiveType, @enumFromInt(field.value)),
-            .count = 0,
-            .bytes = 0,
-        };
-    }
+    var prim_histogram = initPrimHistogram();
+
+    var segments: std.ArrayList(SegmentRange) = .empty;
+    defer segments.deinit(allocator);
 
     var reader = try hprof.Reader.init(source_data);
     var accs: ScanAccs = .{};
@@ -398,45 +387,46 @@ pub fn run(
                 .trace => |trace| {
                     try thread_traces.addTrace(trace, job.header.id_size);
                 },
-                // HPROF 1.0.2 uses either a single HEAP_DUMP or multiple HEAP_DUMP_SEGMENT records.
-                .heap_dump => |heap_reader| {
-                    var hr = heap_reader;
-                    try scanHeapDump(
-                        io,
-                        job,
-                        &hr,
-                        &class_table,
-                        &thread_traces,
-                        catalog_writer,
-                        roots_writer,
-                        &n_catalog_rows,
-                        &n_roots,
-                        &diagnostics,
-                        &prim_histogram,
-                        &accs,
-                    );
-                },
-                .heap_dump_segment => |heap_reader| {
-                    var hr = heap_reader;
-                    try scanHeapDump(
-                        io,
-                        job,
-                        &hr,
-                        &class_table,
-                        &thread_traces,
-                        catalog_writer,
-                        roots_writer,
-                        &n_catalog_rows,
-                        &n_roots,
-                        &diagnostics,
-                        &prim_histogram,
-                        &accs,
-                    );
+                // HPROF 1.0.2 uses either a single HEAP_DUMP or multiple
+                // HEAP_DUMP_SEGMENT records. Defer segment bodies to the
+                // parallel phase; record their byte ranges here.
+                .heap_dump, .heap_dump_segment => {
+                    const hr = switch (record) {
+                        .heap_dump => |h| h,
+                        .heap_dump_segment => |h| h,
+                        else => unreachable,
+                    };
+                    try segments.append(allocator, .{
+                        .offset = hr.body_offset,
+                        .len = hr.cursor.remaining(),
+                    });
                 },
                 else => {},
             }
             if (progress) |p| p.tick();
         }
+    }
+
+    {
+        var span = profiling.begin(io, "segments");
+        defer span.end(io);
+        try scanSegmentsParallel(
+            allocator,
+            io,
+            job,
+            source_data,
+            segments.items,
+            &class_table,
+            &thread_traces,
+            catalog_writer,
+            roots_writer,
+            &n_catalog_rows,
+            &n_roots,
+            &diagnostics,
+            &prim_histogram,
+            progress,
+            &accs,
+        );
     }
 
     try catalog_file_writer.flush();
@@ -487,6 +477,130 @@ pub fn run(
         .n_roots = n_roots,
         .diagnostics = diagnostics,
     };
+}
+
+/// Scan the collected heap dump segment ranges. Large dumps are fanned out
+/// over worker threads (LPT-partitioned by segment length); small dumps run
+/// inline on the calling thread. Workers buffer shared-state records locally;
+/// this function merges them in deterministic worker order afterwards.
+fn scanSegmentsParallel(
+    allocator: std.mem.Allocator,
+    io: Io,
+    job: *const Preflight.Job,
+    source_data: []const u8,
+    segments: []const SegmentRange,
+    class_table: *ClassTable,
+    thread_traces: *ThreadTraces.Collector,
+    catalog_writer: *Io.Writer,
+    roots_writer: *Io.Writer,
+    n_catalog_rows: *u64,
+    n_roots: *u64,
+    diagnostics: *Manifest.Diagnostics,
+    prim_histogram: []PrimHistogramEntry,
+    progress: ?*Progress,
+    accs: *ScanAccs,
+) !void {
+    if (segments.len == 0) return;
+
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const n_workers = @min(cpu_count, @max(1, segments.len / 32));
+
+    if (n_workers <= 1) {
+        for (segments) |seg| {
+            const end: usize = @intCast(seg.offset + seg.len);
+            const body = source_data[@intCast(seg.offset)..end];
+            var hr = hprof.HeapDumpReader.initWithOffset(body, job.header.id_size, @intCast(seg.offset));
+            try scanHeapDump(
+                io,
+                .{ .sequential = .{
+                    .class_table = class_table,
+                    .thread_traces = thread_traces,
+                } },
+                job,
+                &hr,
+                catalog_writer,
+                roots_writer,
+                n_catalog_rows,
+                n_roots,
+                diagnostics,
+                prim_histogram,
+                accs,
+            );
+            if (progress) |p| p.tick();
+        }
+        return;
+    }
+
+    // Longest-processing-time-first partition: longest segments go to the
+    // currently lightest worker. Deterministic for a given segment list.
+    const workers = try allocator.alloc(WorkerState, n_workers);
+    defer allocator.free(workers);
+
+    var loads = try allocator.alloc(u64, n_workers);
+    defer allocator.free(loads);
+    @memset(loads, 0);
+
+    const order = try allocator.alloc(SegmentRange, segments.len);
+    defer allocator.free(order);
+    @memcpy(order, segments);
+    std.mem.sort(SegmentRange, order, {}, struct {
+        fn less(_: void, a: SegmentRange, b: SegmentRange) bool {
+            if (a.len != b.len) return a.len > b.len;
+            return a.offset < b.offset;
+        }
+    }.less);
+
+    var buckets = try allocator.alloc(std.ArrayList(SegmentRange), n_workers);
+    defer {
+        for (buckets) |*b| b.deinit(allocator);
+        allocator.free(buckets);
+    }
+    for (buckets) |*b| b.* = .empty;
+    for (order) |seg| {
+        var min_i: usize = 0;
+        for (1..n_workers) |i| {
+            if (loads[i] < loads[min_i]) min_i = i;
+        }
+        try buckets[min_i].append(allocator, seg);
+        loads[min_i] += seg.len;
+    }
+    for (buckets, 0..) |*b, i| {
+        workers[i] = WorkerState.init(io, job, source_data, b.items);
+    }
+
+    var threads: std.ArrayList(std.Thread) = .empty;
+    defer threads.deinit(allocator);
+    errdefer for (threads.items) |t| t.join();
+    for (workers) |*w| {
+        const t = try std.Thread.spawn(.{}, workerScan, .{w});
+        try threads.append(allocator, t);
+    }
+    for (threads.items) |t| t.join();
+
+    for (workers) |*w| {
+        if (w.err) |e| return e;
+    }
+
+    // Merge in worker order for deterministic output.
+    for (workers) |*w| {
+        try catalog_writer.writeAll(w.catalog.writer.buffer[0..w.catalog.writer.end]);
+        try roots_writer.writeAll(w.roots.writer.buffer[0..w.roots.writer.end]);
+        n_catalog_rows.* += w.n_catalog_rows;
+        n_roots.* += w.n_roots;
+        for (w.prim_histogram, 0..) |entry, i| {
+            prim_histogram[i].count += entry.count;
+            prim_histogram[i].bytes += entry.bytes;
+        }
+        mergeDiagnostics(diagnostics, &w.diagnostics);
+        for (w.class_dumps.items) |cd| {
+            try class_table.addClassDump(cd);
+        }
+        for (w.thread_roots.items) |tr| {
+            try thread_traces.addThreadRoot(tr.thread_object_id, tr.thread_serial, tr.stack_trace_serial);
+        }
+        if (progress) |p| p.tick();
+        w.deinit();
+    }
 }
 
 /// Resolve the captured FRAME/TRACE/thread-root metadata against the fully
@@ -639,28 +753,153 @@ const ScanAccs = struct {
     roots: profiling.Acc = .{},
 };
 
+/// Byte range of one heap dump segment body within the source HPROF.
+const SegmentRange = struct {
+    offset: u64,
+    len: u64,
+};
+
+/// How `scanHeapDump` routes records that touch shared state.
+const ScanMode = union(enum) {
+    /// Main-thread mode: class dumps go into the class table, thread roots
+    /// into the collector.
+    sequential: struct {
+        class_table: *ClassTable,
+        thread_traces: *ThreadTraces.Collector,
+    },
+    /// Worker mode: shared-state records are buffered locally and merged by
+    /// the main thread after the worker finishes. Profiling accs are skipped.
+    worker: struct {
+        alloc: std.mem.Allocator,
+        class_dumps: *std.ArrayList(hprof.ClassDump),
+        thread_roots: *std.ArrayList(ThreadTraces.ThreadRoot),
+    },
+};
+
+/// Per-worker scan state for the parallel heap-segment phase.
+/// All buffers live on a thread-safe allocator; the main thread merges them.
+const WorkerState = struct {
+    alloc: std.mem.Allocator,
+    io: Io,
+    job: *const Preflight.Job,
+    source: []const u8,
+    segments: []const SegmentRange,
+
+    catalog: std.Io.Writer.Allocating,
+    roots: std.Io.Writer.Allocating,
+    class_dumps: std.ArrayList(hprof.ClassDump),
+    thread_roots: std.ArrayList(ThreadTraces.ThreadRoot),
+    prim_histogram: [16]PrimHistogramEntry,
+    diagnostics: Manifest.Diagnostics = .{},
+    n_catalog_rows: u64 = 0,
+    n_roots: u64 = 0,
+    err: ?anyerror = null,
+
+    fn init(
+        io: Io,
+        job: *const Preflight.Job,
+        source: []const u8,
+        segments: []const SegmentRange,
+    ) WorkerState {
+        const alloc = std.heap.smp_allocator;
+        return .{
+            .alloc = alloc,
+            .io = io,
+            .job = job,
+            .source = source,
+            .segments = segments,
+            .catalog = .init(alloc),
+            .roots = .init(alloc),
+            .class_dumps = .empty,
+            .thread_roots = .empty,
+            .prim_histogram = initPrimHistogram(),
+        };
+    }
+
+    fn deinit(self: *WorkerState) void {
+        self.catalog.deinit();
+        self.roots.deinit();
+        self.class_dumps.deinit(self.alloc);
+        self.thread_roots.deinit(self.alloc);
+    }
+
+    fn scanAll(self: *WorkerState) !void {
+        for (self.segments) |seg| {
+            const end: usize = @intCast(seg.offset + seg.len);
+            const body = self.source[@intCast(seg.offset)..end];
+            var hr = hprof.HeapDumpReader.initWithOffset(body, self.job.header.id_size, @intCast(seg.offset));
+            try scanHeapDump(
+                self.io,
+                .{ .worker = .{
+                    .alloc = self.alloc,
+                    .class_dumps = &self.class_dumps,
+                    .thread_roots = &self.thread_roots,
+                } },
+                self.job,
+                &hr,
+                &self.catalog.writer,
+                &self.roots.writer,
+                &self.n_catalog_rows,
+                &self.n_roots,
+                &self.diagnostics,
+                &self.prim_histogram,
+                null,
+            );
+        }
+    }
+};
+
+fn workerScan(state: *WorkerState) void {
+    state.scanAll() catch |err| {
+        if (state.err == null) state.err = err;
+    };
+}
+
+fn initPrimHistogram() [16]PrimHistogramEntry {
+    var histogram: [16]PrimHistogramEntry = undefined;
+    for (&histogram) |*slot| {
+        slot.* = .{ .element_type = .byte, .count = 0, .bytes = 0 };
+    }
+    inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
+        histogram[field.value] = .{
+            .element_type = @as(hprof.PrimitiveType, @enumFromInt(field.value)),
+            .count = 0,
+            .bytes = 0,
+        };
+    }
+    return histogram;
+}
+
+fn mergeDiagnostics(dst: *Manifest.Diagnostics, src: *const Manifest.Diagnostics) void {
+    inline for (@typeInfo(Manifest.Diagnostics).@"struct".fields) |f| {
+        @field(dst, f.name) += @field(src, f.name);
+    }
+}
+
 /// Scan all sub-records inside a single `HEAP_DUMP` or `HEAP_DUMP_SEGMENT`.
 /// Emits catalog rows for heap entities and root records for GC roots.
 fn scanHeapDump(
     io: Io,
+    mode: ScanMode,
     job: *const Preflight.Job,
     hr: *hprof.HeapDumpReader,
-    class_table: *ClassTable,
-    thread_traces: *ThreadTraces.Collector,
     catalog_writer: *Io.Writer,
     roots_writer: *Io.Writer,
     n_catalog_rows: *u64,
     n_roots: *u64,
     diagnostics: *Manifest.Diagnostics,
     prim_histogram: []PrimHistogramEntry,
-    accs: *ScanAccs,
+    accs: ?*ScanAccs,
 ) !void {
     while (try hr.nextWithOffset()) |item| {
         switch (item.record) {
             .gc_class_dump => |cd| {
-                accs.classes.start(io, "classes");
-                defer accs.classes.stop(io);
-                try class_table.addClassDump(cd);
+                if (accs) |a| a.classes.start(io, "classes");
+                defer if (accs) |a| a.classes.stop(io);
+                switch (mode) {
+                    .sequential => |s| try s.class_table.addClassDump(cd),
+                    .worker => |w| try w.class_dumps.append(w.alloc, cd),
+                }
 
                 // Count non-null object-typed constant-pool references. These are intentionally
                 // skipped as edges in v1 per design correction #3.
@@ -691,8 +930,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_instance_dump => |id| {
-                accs.instances.start(io, "instances");
-                defer accs.instances.stop(io);
+                if (accs) |a| a.instances.start(io, "instances");
+                defer if (accs) |a| a.instances.stop(io);
                 const size = std.math.cast(u32, id.bytes.len) orelse return error.InstanceTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = id.object_id,
@@ -704,8 +943,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_obj_array_dump => |oa| {
-                accs.arrays.start(io, "arrays");
-                defer accs.arrays.stop(io);
+                if (accs) |a| a.arrays.start(io, "arrays");
+                defer if (accs) |a| a.arrays.stop(io);
                 const size = std.math.cast(u32, @as(u64, oa.element_count) * job.header.id_size) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = oa.array_id,
@@ -717,8 +956,8 @@ fn scanHeapDump(
                 n_catalog_rows.* += 1;
             },
             .gc_prim_array_dump => |pa| {
-                accs.arrays.start(io, "arrays");
-                defer accs.arrays.stop(io);
+                if (accs) |a| a.arrays.start(io, "arrays");
+                defer if (accs) |a| a.arrays.stop(io);
                 const size = std.math.cast(u32, pa.bytes.len) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = pa.array_id,
@@ -740,9 +979,16 @@ fn scanHeapDump(
             // thread instance to its recorded stack trace; capture it before
             // falling through to the generic root handling.
             .gc_root_thread_object => |r| {
-                accs.roots.start(io, "roots");
-                defer accs.roots.stop(io);
-                try thread_traces.addThreadRoot(r.thread_object_id, r.thread_serial, r.stack_trace_serial);
+                if (accs) |a| a.roots.start(io, "roots");
+                defer if (accs) |a| a.roots.stop(io);
+                switch (mode) {
+                    .sequential => |s| try s.thread_traces.addThreadRoot(r.thread_object_id, r.thread_serial, r.stack_trace_serial),
+                    .worker => |w| try w.thread_roots.append(w.alloc, .{
+                        .thread_object_id = r.thread_object_id,
+                        .thread_serial = r.thread_serial,
+                        .stack_trace_serial = r.stack_trace_serial,
+                    }),
+                }
                 try writeRootRecord(roots_writer, .{
                     .target_raw_id = r.thread_object_id,
                     .root_kind = @intFromEnum(hprof.HeapSubtag.gc_root_thread_object),
@@ -752,8 +998,8 @@ fn scanHeapDump(
             },
             // Any remaining subtag is one of the nine GC root kinds.
             else => |root| {
-                accs.roots.start(io, "roots");
-                defer accs.roots.stop(io);
+                if (accs) |a| a.roots.start(io, "roots");
+                defer if (accs) |a| a.roots.stop(io);
                 const info = extractRootInfo(root);
                 try writeRootRecord(roots_writer, .{
                     .target_raw_id = info.target,
