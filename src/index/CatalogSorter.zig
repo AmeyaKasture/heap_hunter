@@ -24,7 +24,12 @@ const max_object_count = @as(u64, std.math.maxInt(u32)) - 1;
 fn catalogLessThan(_: void, a: []const u8, b: []const u8) bool {
     const a_id = std.mem.readInt(u64, a[0..8], .little);
     const b_id = std.mem.readInt(u64, b[0..8], .little);
-    return a_id < b_id;
+    if (a_id != b_id) return a_id < b_id;
+    // Tiebreak on source offset so ordering is independent of the scan
+    // order in the unsorted catalog.
+    const a_off = std.mem.readInt(u64, a[8..16], .little);
+    const b_off = std.mem.readInt(u64, b[8..16], .little);
+    return a_off < b_off;
 }
 
 /// Sort `catalog.unsorted` by raw ID, remove duplicate raw IDs (keeping the
