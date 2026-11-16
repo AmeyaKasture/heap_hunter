@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("heaphunter", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
             .{ .name = "log", .module = log_mod },
