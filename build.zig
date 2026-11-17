@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "log", .module = log_mod },
             .{ .name = "build_options", .module = build_options_mod },
+            .{ .name = "profiling", .module = profiling_mod },
         },
     });
     const bench_exe = b.addExecutable(.{
