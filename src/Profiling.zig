@@ -19,7 +19,13 @@
 //!         ...
 //!     }
 //!
-//! Results are printed as an indented tree to stderr via `printTimings`.
+//! Named stat counters (values rather than time, e.g. dominator iterations)
+//! are reported once at the end of a phase:
+//!
+//!     profiling.counter("dominator_iterations", stats.iterations);
+//!
+//! Results are printed as an indented tree to stderr via `printTimings`,
+//! followed by a `counters:` section.
 const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
@@ -35,7 +41,7 @@ var enabled: bool = false;
 const max_records = 128;
 const max_depth = 16;
 
-const Kind = enum { span, acc };
+const Kind = enum { span, acc, counter };
 
 const Record = struct {
     label: []const u8,
@@ -137,6 +143,16 @@ pub const Acc = struct {
     }
 };
 
+/// Report a named stat counter (e.g. dominator iterations, shortcut nodes).
+/// Unlike spans, counters carry a value rather than time; reporting the same
+/// label again overwrites the value, so the printout shows the final total.
+/// No-op when profiling is disabled.
+pub fn counter(comptime label: []const u8, value: u64) void {
+    if (!build_enabled or !enabled) return;
+    const idx = findOrAdd(label, .counter, null) orelse return;
+    records[idx].count = value;
+}
+
 fn findOrAdd(label: []const u8, kind: Kind, parent: ?u16) ?u16 {
     for (records[0..n_records], 0..) |rec, i| {
         if (rec.kind == kind and rec.parent == parent and std.mem.eql(u8, rec.label, label)) {
@@ -170,6 +186,14 @@ pub fn printTimings(writer: *Io.Writer) !void {
     }
     if (total > 0) {
         try writer.print("  total: {d} ms\n", .{total / std.time.ns_per_ms});
+    }
+
+    var n_counters: usize = 0;
+    for (records[0..n_records]) |rec| {
+        if (rec.kind != .counter) continue;
+        if (n_counters == 0) try writer.writeAll("counters:\n");
+        n_counters += 1;
+        try writer.print("  {s}: {d}\n", .{ rec.label, rec.count });
     }
 }
 

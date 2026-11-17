@@ -291,6 +291,14 @@ pub fn runIndexCommand(
                 dominator_total_retained = dominator_result.total_retained_bytes;
                 dominator_iterations = dominator_result.stats.iterations;
                 dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
+
+                profiling.counter("dominator_iterations", dominator_result.stats.iterations);
+                profiling.counter("dominator_nodes_changed", dominator_result.stats.nodes_changed);
+                profiling.counter("dominator_shortcut_nodes", dominator_result.stats.shortcut_nodes);
+                profiling.counter("dominator_intersect_steps", dominator_result.stats.intersect_steps_total);
+                profiling.counter("dominator_intersect_steps_max", dominator_result.stats.intersect_steps_max);
+                profiling.counter("dominator_reachable_nodes", dominator_result.n_reachable);
+                profiling.counter("dominator_unreachable_objects", dominator_result.unreachable_objects);
             }
 
             progress.nextStep("validating index");
