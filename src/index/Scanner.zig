@@ -479,10 +479,15 @@ pub fn run(
     };
 }
 
+/// Minimum segments a worker must be assigned for spawning to pay off;
+/// below this the inline path is faster than thread startup.
+const min_segments_per_worker: usize = 32;
+
 /// Scan the collected heap dump segment ranges. Large dumps are fanned out
 /// over worker threads (LPT-partitioned by segment length); small dumps run
-/// inline on the calling thread. Workers buffer shared-state records locally;
-/// this function merges them in deterministic worker order afterwards.
+/// inline on the calling thread. Workers stream rows to per-worker spill
+/// files and buffer shared-state records locally; this function merges the
+/// spill files in deterministic worker order afterwards.
 fn scanSegmentsParallel(
     allocator: std.mem.Allocator,
     io: Io,
@@ -503,7 +508,51 @@ fn scanSegmentsParallel(
     if (segments.len == 0) return;
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const n_workers = @min(cpu_count, @max(1, segments.len / 32));
+    const n_workers = @min(cpu_count, @max(1, segments.len / min_segments_per_worker));
+    return scanSegmentsDispatched(
+        allocator,
+        io,
+        job,
+        source_data,
+        segments,
+        class_table,
+        thread_traces,
+        catalog_writer,
+        roots_writer,
+        n_catalog_rows,
+        n_roots,
+        diagnostics,
+        prim_histogram,
+        progress,
+        accs,
+        n_workers,
+    );
+}
+
+/// Scan the collected segment ranges with an explicit worker count: one
+/// worker (or fewer segments than the spawn threshold) runs inline on the
+/// calling thread; more workers run the LPT-partitioned thread pool. Exposed
+/// with an explicit `n_workers` so tests can exercise the parallel path
+/// deterministically regardless of host CPU count.
+fn scanSegmentsDispatched(
+    allocator: std.mem.Allocator,
+    io: Io,
+    job: *const Preflight.Job,
+    source_data: []const u8,
+    segments: []const SegmentRange,
+    class_table: *ClassTable,
+    thread_traces: *ThreadTraces.Collector,
+    catalog_writer: *Io.Writer,
+    roots_writer: *Io.Writer,
+    n_catalog_rows: *u64,
+    n_roots: *u64,
+    diagnostics: *Manifest.Diagnostics,
+    prim_histogram: []PrimHistogramEntry,
+    progress: ?*Progress,
+    accs: *ScanAccs,
+    n_workers: usize,
+) !void {
+    if (segments.len == 0) return;
 
     if (n_workers <= 1) {
         for (segments) |seg| {
@@ -531,41 +580,29 @@ fn scanSegmentsParallel(
         return;
     }
 
-    // Longest-processing-time-first partition: longest segments go to the
-    // currently lightest worker. Deterministic for a given segment list.
-    const workers = try allocator.alloc(WorkerState, n_workers);
-    defer allocator.free(workers);
-
-    var loads = try allocator.alloc(u64, n_workers);
-    defer allocator.free(loads);
-    @memset(loads, 0);
-
-    const order = try allocator.alloc(SegmentRange, segments.len);
-    defer allocator.free(order);
-    @memcpy(order, segments);
-    std.mem.sort(SegmentRange, order, {}, struct {
-        fn less(_: void, a: SegmentRange, b: SegmentRange) bool {
-            if (a.len != b.len) return a.len > b.len;
-            return a.offset < b.offset;
-        }
-    }.less);
-
-    var buckets = try allocator.alloc(std.ArrayList(SegmentRange), n_workers);
+    const buckets = try partitionSegmentsLPT(allocator, segments, n_workers);
     defer {
         for (buckets) |*b| b.deinit(allocator);
         allocator.free(buckets);
     }
-    for (buckets) |*b| b.* = .empty;
-    for (order) |seg| {
-        var min_i: usize = 0;
-        for (1..n_workers) |i| {
-            if (loads[i] < loads[min_i]) min_i = i;
-        }
-        try buckets[min_i].append(allocator, seg);
-        loads[min_i] += seg.len;
-    }
+
+    const workers = try allocator.alloc(WorkerState, n_workers);
+    defer allocator.free(workers);
+
+    // Open each worker's spill files before spawning. On any error after a
+    // worker is initialized, clean up its open files, spill files, and paths.
+    var n_inited: usize = 0;
+    var n_finalized: usize = 0;
+    errdefer for (workers[n_finalized..n_inited]) |*w| {
+        w.closeFiles();
+        const cleanup_dir = Io.Dir.cwd();
+        cleanup_dir.deleteFile(io, w.catalog_spill_path) catch {};
+        cleanup_dir.deleteFile(io, w.roots_spill_path) catch {};
+        w.deinit();
+    };
     for (buckets, 0..) |*b, i| {
-        workers[i] = WorkerState.init(io, job, source_data, b.items);
+        workers[i] = try WorkerState.init(allocator, io, job, source_data, b.items, i);
+        n_inited += 1;
     }
 
     var threads: std.ArrayList(std.Thread) = .empty;
@@ -577,14 +614,32 @@ fn scanSegmentsParallel(
     }
     for (threads.items) |t| t.join();
 
+    // Flush bytes still sitting in the workers' write buffers and close the
+    // spill files so the merge can read them back. A flush failure (e.g. disk
+    // full during an auto-drain) is recorded as the worker's error.
+    for (workers) |*w| {
+        w.catalog_writer.flush() catch |e| {
+            if (w.err == null) w.err = e;
+        };
+        w.roots_writer.flush() catch |e| {
+            if (w.err == null) w.err = e;
+        };
+        w.closeFiles();
+    }
+
     for (workers) |*w| {
         if (w.err) |e| return e;
     }
 
-    // Merge in worker order for deterministic output.
+    // Merge in worker order for deterministic output: stream each worker's
+    // spill file into the final outputs, then remove the spill files.
+    const merge_dir = Io.Dir.cwd();
+    var merge_buf: [worker_io_buffer_size]u8 = undefined;
     for (workers) |*w| {
-        try catalog_writer.writeAll(w.catalog.writer.buffer[0..w.catalog.writer.end]);
-        try roots_writer.writeAll(w.roots.writer.buffer[0..w.roots.writer.end]);
+        try streamSpillFile(io, w.catalog_spill_path, catalog_writer, &merge_buf);
+        try streamSpillFile(io, w.roots_spill_path, roots_writer, &merge_buf);
+        try merge_dir.deleteFile(io, w.catalog_spill_path);
+        try merge_dir.deleteFile(io, w.roots_spill_path);
         n_catalog_rows.* += w.n_catalog_rows;
         n_roots.* += w.n_roots;
         for (w.prim_histogram, 0..) |entry, i| {
@@ -600,7 +655,58 @@ fn scanSegmentsParallel(
         }
         if (progress) |p| p.tick();
         w.deinit();
+        n_finalized += 1;
     }
+}
+
+/// Stream the entire contents of `path` into `dest` through a bounded buffer,
+/// so merge memory does not scale with spill-file size.
+fn streamSpillFile(io: Io, path: []const u8, dest: *Io.Writer, buf: []u8) !void {
+    const dir = Io.Dir.cwd();
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    var file_reader: Io.File.Reader = .init(file, io, buf);
+    _ = try file_reader.interface.streamRemaining(dest);
+}
+
+/// Longest-processing-time-first partition: segments are sorted by length
+/// (descending, offset ascending on ties) and each goes to the currently
+/// lightest worker bucket. Deterministic for a given segment list, and each
+/// bucket preserves that sorted order. Caller owns the returned buckets.
+fn partitionSegmentsLPT(
+    allocator: std.mem.Allocator,
+    segments: []const SegmentRange,
+    n_workers: usize,
+) ![]std.ArrayList(SegmentRange) {
+    var loads = try allocator.alloc(u64, n_workers);
+    defer allocator.free(loads);
+    @memset(loads, 0);
+
+    const order = try allocator.alloc(SegmentRange, segments.len);
+    defer allocator.free(order);
+    @memcpy(order, segments);
+    std.mem.sort(SegmentRange, order, {}, struct {
+        fn less(_: void, a: SegmentRange, b: SegmentRange) bool {
+            if (a.len != b.len) return a.len > b.len;
+            return a.offset < b.offset;
+        }
+    }.less);
+
+    const buckets = try allocator.alloc(std.ArrayList(SegmentRange), n_workers);
+    errdefer {
+        for (buckets) |*b| b.deinit(allocator);
+        allocator.free(buckets);
+    }
+    for (buckets) |*b| b.* = .empty;
+    for (order) |seg| {
+        var min_i: usize = 0;
+        for (1..n_workers) |i| {
+            if (loads[i] < loads[min_i]) min_i = i;
+        }
+        try buckets[min_i].append(allocator, seg);
+        loads[min_i] += seg.len;
+    }
+    return buckets;
 }
 
 /// Resolve the captured FRAME/TRACE/thread-root metadata against the fully
@@ -776,17 +882,33 @@ const ScanMode = union(enum) {
     },
 };
 
+/// Size of each worker's spill-file write buffer. Workers stream scan output
+/// to per-worker spill files through this buffer instead of accumulating rows
+/// in RAM, keeping parallel-scan memory bounded regardless of dump size.
+const worker_io_buffer_size = 65536;
+
 /// Per-worker scan state for the parallel heap-segment phase.
-/// All buffers live on a thread-safe allocator; the main thread merges them.
+/// Catalog/root rows are streamed to per-worker spill files (fixed 64 KiB
+/// write buffers, auto-drained through the thread-safe `Io`); class dumps and
+/// thread roots are buffered locally (bounded by class/thread counts). The
+/// main thread merges the spill files in worker order afterwards.
 const WorkerState = struct {
+    path_alloc: std.mem.Allocator,
     alloc: std.mem.Allocator,
     io: Io,
     job: *const Preflight.Job,
     source: []const u8,
     segments: []const SegmentRange,
 
-    catalog: std.Io.Writer.Allocating,
-    roots: std.Io.Writer.Allocating,
+    catalog_spill_path: []u8,
+    roots_spill_path: []u8,
+    catalog_buf: []u8,
+    roots_buf: []u8,
+    catalog_file: Io.File,
+    roots_file: Io.File,
+    catalog_writer: Io.File.Writer,
+    roots_writer: Io.File.Writer,
+    files_open: bool = false,
     class_dumps: std.ArrayList(hprof.ClassDump),
     thread_roots: std.ArrayList(ThreadTraces.ThreadRoot),
     prim_histogram: [16]PrimHistogramEntry,
@@ -795,32 +917,69 @@ const WorkerState = struct {
     n_roots: u64 = 0,
     err: ?anyerror = null,
 
+    /// Open the spill files and wire their writers. The writers only point at
+    /// heap memory and copied file handles, so the by-value return is safe.
     fn init(
+        allocator: std.mem.Allocator,
         io: Io,
         job: *const Preflight.Job,
         source: []const u8,
         segments: []const SegmentRange,
-    ) WorkerState {
+        worker_index: usize,
+    ) !WorkerState {
         const alloc = std.heap.smp_allocator;
+        const catalog_spill_path = try std.fmt.allocPrint(allocator, "{s}/catalog.spill-{d}", .{ job.staging_dir, worker_index });
+        errdefer allocator.free(catalog_spill_path);
+        const roots_spill_path = try std.fmt.allocPrint(allocator, "{s}/roots.spill-{d}", .{ job.staging_dir, worker_index });
+        errdefer allocator.free(roots_spill_path);
+        const catalog_buf = try allocator.alloc(u8, worker_io_buffer_size);
+        errdefer allocator.free(catalog_buf);
+        const roots_buf = try allocator.alloc(u8, worker_io_buffer_size);
+        errdefer allocator.free(roots_buf);
+
+        const dir = Io.Dir.cwd();
+        const catalog_file = try dir.createFile(io, catalog_spill_path, .{});
+        errdefer catalog_file.close(io);
+        const roots_file = try dir.createFile(io, roots_spill_path, .{});
+        errdefer roots_file.close(io);
+
         return .{
+            .path_alloc = allocator,
             .alloc = alloc,
             .io = io,
             .job = job,
             .source = source,
             .segments = segments,
-            .catalog = .init(alloc),
-            .roots = .init(alloc),
+            .catalog_spill_path = catalog_spill_path,
+            .roots_spill_path = roots_spill_path,
+            .catalog_buf = catalog_buf,
+            .roots_buf = roots_buf,
+            .catalog_file = catalog_file,
+            .roots_file = roots_file,
+            .catalog_writer = .init(catalog_file, io, catalog_buf),
+            .roots_writer = .init(roots_file, io, roots_buf),
+            .files_open = true,
             .class_dumps = .empty,
             .thread_roots = .empty,
             .prim_histogram = initPrimHistogram(),
         };
     }
 
+    fn closeFiles(self: *WorkerState) void {
+        if (self.files_open) {
+            self.catalog_file.close(self.io);
+            self.roots_file.close(self.io);
+            self.files_open = false;
+        }
+    }
+
     fn deinit(self: *WorkerState) void {
-        self.catalog.deinit();
-        self.roots.deinit();
         self.class_dumps.deinit(self.alloc);
         self.thread_roots.deinit(self.alloc);
+        self.path_alloc.free(self.catalog_buf);
+        self.path_alloc.free(self.roots_buf);
+        self.path_alloc.free(self.catalog_spill_path);
+        self.path_alloc.free(self.roots_spill_path);
     }
 
     fn scanAll(self: *WorkerState) !void {
@@ -837,8 +996,8 @@ const WorkerState = struct {
                 } },
                 self.job,
                 &hr,
-                &self.catalog.writer,
-                &self.roots.writer,
+                &self.catalog_writer.interface,
+                &self.roots_writer.interface,
                 &self.n_catalog_rows,
                 &self.n_roots,
                 &self.diagnostics,
@@ -1361,4 +1520,504 @@ test "scanner treats multiple heap dump segments as continuous" {
     // Instance from segment 2
     try std.testing.expectEqual(@as(hprof.Id, 0x3001), rows[2].raw_id);
     try std.testing.expectEqual(@as(CatalogKind, .instance), rows[2].kind);
+}
+
+// ─── Parallel heap-segment scan tests ────────────────────────────────────────
+
+/// Byte-level scan output of one dispatch, read back from the staging files.
+const DispatchOutcome = struct {
+    catalog: []u8,
+    roots: []u8,
+    prim_histogram: []u8,
+    n_catalog_rows: u64,
+    n_roots: u64,
+    diagnostics: Manifest.Diagnostics,
+
+    fn deinit(self: *DispatchOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.catalog);
+        allocator.free(self.roots);
+        allocator.free(self.prim_histogram);
+    }
+};
+
+/// Collect the byte ranges of every HEAP_DUMP / HEAP_DUMP_SEGMENT record body,
+/// mirroring what `run` records before dispatching to the scan phase.
+fn collectTestSegmentRanges(allocator: std.mem.Allocator, source_data: []const u8) ![]SegmentRange {
+    var segments: std.ArrayList(SegmentRange) = .empty;
+    errdefer segments.deinit(allocator);
+    var reader = try hprof.Reader.init(source_data);
+    while (try reader.next()) |record| {
+        switch (record) {
+            .heap_dump, .heap_dump_segment => {
+                const hr = switch (record) {
+                    .heap_dump => |h| h,
+                    .heap_dump_segment => |h| h,
+                    else => unreachable,
+                };
+                try segments.append(allocator, .{
+                    .offset = hr.body_offset,
+                    .len = hr.cursor.remaining(),
+                });
+            },
+            else => {},
+        }
+    }
+    return segments.toOwnedSlice(allocator);
+}
+
+/// Run `scanSegmentsDispatched` against a fresh staging dir and read back all
+/// scan output. `class_table` and `thread_traces` stay populated for callers
+/// that want to assert on the merged shared state.
+fn runTestDispatch(
+    allocator: std.mem.Allocator,
+    io: Io,
+    source_data: []const u8,
+    tmp_dir: []const u8,
+    n_workers: usize,
+    class_table: *ClassTable,
+    thread_traces: *ThreadTraces.Collector,
+) !DispatchOutcome {
+    const job = try createTestJob(allocator, io, source_data, tmp_dir);
+    defer job.deinit(allocator);
+
+    const dir = Io.Dir.cwd();
+    const catalog_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "catalog.unsorted" });
+    defer allocator.free(catalog_path);
+    const roots_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "roots.raw" });
+    defer allocator.free(roots_path);
+    const hist_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "prim_histogram.bin" });
+    defer allocator.free(hist_path);
+
+    var catalog_file = try dir.createFile(io, catalog_path, .{});
+    defer catalog_file.close(io);
+    var catalog_buf: [65536]u8 = undefined;
+    var catalog_file_writer: Io.File.Writer = .init(catalog_file, io, &catalog_buf);
+
+    var roots_file = try dir.createFile(io, roots_path, .{});
+    defer roots_file.close(io);
+    var roots_buf: [65536]u8 = undefined;
+    var roots_file_writer: Io.File.Writer = .init(roots_file, io, &roots_buf);
+
+    const segments = try collectTestSegmentRanges(allocator, source_data);
+    defer allocator.free(segments);
+
+    var accs: ScanAccs = .{};
+    var prim_histogram = initPrimHistogram();
+    var n_catalog_rows: u64 = 0;
+    var n_roots: u64 = 0;
+    var diagnostics: Manifest.Diagnostics = .{};
+
+    try scanSegmentsDispatched(
+        allocator,
+        io,
+        &job,
+        source_data,
+        segments,
+        class_table,
+        thread_traces,
+        &catalog_file_writer.interface,
+        &roots_file_writer.interface,
+        &n_catalog_rows,
+        &n_roots,
+        &diagnostics,
+        &prim_histogram,
+        null,
+        &accs,
+        n_workers,
+    );
+    try catalog_file_writer.interface.flush();
+    try roots_file_writer.interface.flush();
+
+    // Serialize the histogram in the same format `run` writes, so the files
+    // are byte-comparable with the full-pipeline output.
+    var hist_file = try dir.createFile(io, hist_path, .{});
+    defer hist_file.close(io);
+    var hist_buf: [65536]u8 = undefined;
+    var hist_file_writer: Io.File.Writer = .init(hist_file, io, &hist_buf);
+    const hist_writer = &hist_file_writer.interface;
+    var prim_count: u32 = 0;
+    inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
+        if (prim_histogram[field.value].count > 0) prim_count += 1;
+    }
+    try writeU32(hist_writer, prim_count);
+    inline for (@typeInfo(hprof.PrimitiveType).@"enum".fields) |field| {
+        const entry = prim_histogram[field.value];
+        if (entry.count > 0) {
+            try writePrimHistogramEntry(hist_writer, entry);
+        }
+    }
+    try hist_writer.flush();
+
+    return .{
+        .catalog = try dir.readFileAlloc(io, catalog_path, allocator, .limited(1 << 20)),
+        .roots = try dir.readFileAlloc(io, roots_path, allocator, .limited(1 << 20)),
+        .prim_histogram = try dir.readFileAlloc(io, hist_path, allocator, .limited(1 << 20)),
+        .n_catalog_rows = n_catalog_rows,
+        .n_roots = n_roots,
+        .diagnostics = diagnostics,
+    };
+}
+
+/// Catalog rows sorted lexicographically, so two unsorted catalog files can be
+/// compared as multisets regardless of the scan order that produced them.
+fn sortedTestCatalogRows(allocator: std.mem.Allocator, data: []const u8) ![][catalog_row_size]u8 {
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(data.len % catalog_row_size)));
+    const rows = try allocator.dupe([catalog_row_size]u8, std.mem.bytesAsSlice([catalog_row_size]u8, data));
+    errdefer allocator.free(rows);
+    std.mem.sort([catalog_row_size]u8, rows, {}, struct {
+        fn less(_: void, a: [catalog_row_size]u8, b: [catalog_row_size]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.less);
+    return rows;
+}
+
+/// Root records sorted lexicographically, for order-independent comparison.
+fn sortedTestRootRecords(allocator: std.mem.Allocator, data: []const u8) ![][root_record_size]u8 {
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(data.len % root_record_size)));
+    const records = try allocator.dupe([root_record_size]u8, std.mem.bytesAsSlice([root_record_size]u8, data));
+    errdefer allocator.free(records);
+    std.mem.sort([root_record_size]u8, records, {}, struct {
+        fn less(_: void, a: [root_record_size]u8, b: [root_record_size]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.less);
+    return records;
+}
+
+fn expectTestDiagnosticsEqual(a: Manifest.Diagnostics, b: Manifest.Diagnostics) !void {
+    inline for (@typeInfo(Manifest.Diagnostics).@"struct".fields) |f| {
+        try std.testing.expectEqual(@field(a, f.name), @field(b, f.name));
+    }
+}
+
+test "parallel scan is deterministic and matches sequential scan" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Build a dump with one HEAP_DUMP record and 72 HEAP_DUMP_SEGMENT records
+    // so an explicit 4-worker dispatch genuinely fans out across the pool.
+    var b = @import("../tests/HprofBuilder.zig").Builder.init(allocator, 4);
+    defer b.deinit();
+
+    try b.header(0);
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.utf8(0x1001, "com.shop.User");
+    try b.loadClass(1, 0x2000, 0x1000);
+    try b.loadClass(2, 0x2001, 0x1001);
+
+    // Single-record form: the first segment.
+    var seg0 = try b.heapDump();
+    _ = try seg0.instanceDump(0x3000, 0x2001, &[_]u8{0} ** 16);
+    seg0.end();
+
+    var seg_i: usize = 0;
+    while (seg_i < 72) : (seg_i += 1) {
+        var seg = try b.heapDumpSegment();
+        const inst_id: hprof.Id = @intCast(0x3100 + seg_i);
+        _ = try seg.instanceDump(inst_id, 0x2001, &[_]u8{0} ** 16);
+        // Duplicate object id in two distant segments: exercises the
+        // worker-merge + dedupe interplay (dedupe happens later in the
+        // sorter, so both rows must survive the scan identically).
+        if (seg_i == 5 or seg_i == 60) {
+            _ = try seg.instanceDump(0x9999, 0x2001, &[_]u8{0} ** 16);
+        }
+        // Thread-object roots in two different workers' segments.
+        if (seg_i == 7) {
+            _ = try seg.rootThreadObject(0x3200, 11, 1);
+        }
+        if (seg_i == 40) {
+            _ = try seg.rootThreadObject(0x3201, 12, 2);
+        }
+        // Arrays of both kinds, feeding the histogram merge.
+        if (seg_i == 10) {
+            _ = try seg.primitiveArrayDump(0x3300, .int, 4, &[_]u8{0} ** 16);
+        }
+        if (seg_i == 50) {
+            _ = try seg.objectArrayDump(0x3301, 0x2000, &[_]hprof.Id{ 0x3100, 0 });
+        }
+        // A class dump with a non-null constant-pool object ref, so the
+        // per-worker diagnostics are non-trivial and must sum on merge.
+        if (seg_i == 30) {
+            _ = try seg.classDump(.{
+                .class_id = 0x2002,
+                .super_class_id = 0x2000,
+                .instance_size = 8,
+                .constant_pool = &.{
+                    .{ .index = 0, .type = .object, .value = .{ .object = 0x3100 } },
+                },
+            });
+        }
+        seg.end();
+    }
+
+    const bytes = try b.finish();
+    defer allocator.free(bytes);
+
+    // Sanity: the deferred-segment path really saw all 73 records.
+    const segments = try collectTestSegmentRanges(allocator, bytes);
+    defer allocator.free(segments);
+    try std.testing.expectEqual(@as(usize, 73), segments.len);
+
+    // Four staging dirs: full run(), inline dispatch, 4-worker dispatch twice.
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var tmp_c = std.testing.tmpDir(.{});
+    defer tmp_c.cleanup();
+    var tmp_d = std.testing.tmpDir(.{});
+    defer tmp_d.cleanup();
+    const path_a = try tmp_a.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_a);
+    const path_b = try tmp_b.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_b);
+    const path_c = try tmp_c.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_c);
+    const path_d = try tmp_d.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_d);
+
+    // A: the real entry point (inline or parallel depending on host CPUs).
+    const job_a = try createTestJob(allocator, io, bytes, path_a);
+    defer job_a.deinit(allocator);
+    var result_a = try run(allocator, io, &job_a, bytes, null);
+    defer result_a.deinit(allocator);
+    const dir = Io.Dir.cwd();
+    const catalog_a = try dir.readFileAlloc(io, result_a.catalog_path, allocator, .limited(1 << 20));
+    defer allocator.free(catalog_a);
+    const roots_a = try dir.readFileAlloc(io, result_a.roots_path, allocator, .limited(1 << 20));
+    defer allocator.free(roots_a);
+    const hist_a = try dir.readFileAlloc(io, result_a.prim_histogram_path, allocator, .limited(1 << 20));
+    defer allocator.free(hist_a);
+
+    // B: forced inline. C/D: forced 4-worker pool.
+    var class_table_b = ClassTable.init(allocator);
+    defer class_table_b.deinit();
+    var thread_traces_b = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_b.deinit();
+    var out_b = try runTestDispatch(allocator, io, bytes, path_b, 1, &class_table_b, &thread_traces_b);
+    defer out_b.deinit(allocator);
+
+    var class_table_c = ClassTable.init(allocator);
+    defer class_table_c.deinit();
+    var thread_traces_c = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_c.deinit();
+    var out_c = try runTestDispatch(allocator, io, bytes, path_c, 4, &class_table_c, &thread_traces_c);
+    defer out_c.deinit(allocator);
+
+    var class_table_d = ClassTable.init(allocator);
+    defer class_table_d.deinit();
+    var thread_traces_d = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_d.deinit();
+    var out_d = try runTestDispatch(allocator, io, bytes, path_d, 4, &class_table_d, &thread_traces_d);
+    defer out_d.deinit(allocator);
+
+    // Determinism: two 4-worker runs produce byte-identical output, including
+    // the order of rows within the unsorted catalog and the roots file.
+    try std.testing.expectEqualSlices(u8, out_c.catalog, out_d.catalog);
+    try std.testing.expectEqualSlices(u8, out_c.roots, out_d.roots);
+    try std.testing.expectEqualSlices(u8, out_c.prim_histogram, out_d.prim_histogram);
+
+    // The parallel worker merge really applied the shared-state records.
+    try std.testing.expect(class_table_c.classes.contains(0x2002));
+    try std.testing.expectEqual(@as(usize, 2), thread_traces_c.thread_roots.count());
+
+    // Parity across paths: identical row multisets, root multisets, histogram
+    // bytes, counts, and diagnostics. Row/root order legitimately differs
+    // between the inline and worker paths (workers emit in bucket order);
+    // downstream stages normalize via source_offset tiebreaks.
+    const rows_a = try sortedTestCatalogRows(allocator, catalog_a);
+    defer allocator.free(rows_a);
+    const rows_b = try sortedTestCatalogRows(allocator, out_b.catalog);
+    defer allocator.free(rows_b);
+    const rows_c = try sortedTestCatalogRows(allocator, out_c.catalog);
+    defer allocator.free(rows_c);
+    try std.testing.expectEqualSlices([catalog_row_size]u8, rows_a, rows_b);
+    try std.testing.expectEqualSlices([catalog_row_size]u8, rows_b, rows_c);
+
+    const roots_rec_a = try sortedTestRootRecords(allocator, roots_a);
+    defer allocator.free(roots_rec_a);
+    const roots_rec_b = try sortedTestRootRecords(allocator, out_b.roots);
+    defer allocator.free(roots_rec_b);
+    const roots_rec_c = try sortedTestRootRecords(allocator, out_c.roots);
+    defer allocator.free(roots_rec_c);
+    try std.testing.expectEqualSlices([root_record_size]u8, roots_rec_a, roots_rec_b);
+    try std.testing.expectEqualSlices([root_record_size]u8, roots_rec_b, roots_rec_c);
+
+    try std.testing.expectEqualSlices(u8, hist_a, out_b.prim_histogram);
+    try std.testing.expectEqualSlices(u8, hist_a, out_c.prim_histogram);
+
+    try std.testing.expectEqual(result_a.n_catalog_rows, out_b.n_catalog_rows);
+    try std.testing.expectEqual(result_a.n_catalog_rows, out_c.n_catalog_rows);
+    try std.testing.expectEqual(result_a.n_roots, out_b.n_roots);
+    try std.testing.expectEqual(result_a.n_roots, out_c.n_roots);
+    try expectTestDiagnosticsEqual(result_a.diagnostics, out_b.diagnostics);
+    try expectTestDiagnosticsEqual(result_a.diagnostics, out_c.diagnostics);
+
+    // Content sanity for the fixture: 73 instance rows + 2 duplicate rows +
+    // 1 class row + 2 array rows; 2 thread-object roots; 1 skipped
+    // constant-pool ref counted on every path.
+    try std.testing.expectEqual(@as(u64, 78), out_c.n_catalog_rows);
+    try std.testing.expectEqual(@as(u64, 2), out_c.n_roots);
+    try std.testing.expectEqual(@as(u64, 1), out_c.diagnostics.skipped_constant_pool_refs);
+}
+
+test "LPT partition is deterministic and balanced" {
+    const allocator = std.testing.allocator;
+
+    const segs = [_]SegmentRange{
+        .{ .offset = 100, .len = 100 },
+        .{ .offset = 200, .len = 90 },
+        .{ .offset = 300, .len = 80 },
+        .{ .offset = 400, .len = 80 }, // ties on length: offset must break it
+        .{ .offset = 500, .len = 10 },
+        .{ .offset = 600, .len = 10 }, // ties on length: offset must break it
+        .{ .offset = 700, .len = 5 },
+    };
+
+    const buckets_a = try partitionSegmentsLPT(allocator, &segs, 3);
+    defer {
+        for (buckets_a) |*bucket| bucket.deinit(allocator);
+        allocator.free(buckets_a);
+    }
+    const buckets_b = try partitionSegmentsLPT(allocator, &segs, 3);
+    defer {
+        for (buckets_b) |*bucket| bucket.deinit(allocator);
+        allocator.free(buckets_b);
+    }
+
+    // Same input, same partition.
+    try std.testing.expectEqual(buckets_a.len, buckets_b.len);
+    for (buckets_a, buckets_b) |bucket_a, bucket_b| {
+        try std.testing.expectEqualSlices(SegmentRange, bucket_a.items, bucket_b.items);
+    }
+
+    // Every segment assigned exactly once.
+    var total: usize = 0;
+    for (buckets_a) |bucket| total += bucket.items.len;
+    try std.testing.expectEqual(segs.len, total);
+
+    // Each bucket preserves the (len desc, offset asc) assignment order.
+    for (buckets_a) |bucket| {
+        var i: usize = 1;
+        while (i < bucket.items.len) : (i += 1) {
+            const prev = bucket.items[i - 1];
+            const cur = bucket.items[i];
+            try std.testing.expect(prev.len > cur.len or (prev.len == cur.len and prev.offset < cur.offset));
+        }
+    }
+
+    // One worker takes everything, longest first.
+    const single = try partitionSegmentsLPT(allocator, &segs, 1);
+    defer {
+        for (single) |*bucket| bucket.deinit(allocator);
+        allocator.free(single);
+    }
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqual(segs.len, single[0].items.len);
+    try std.testing.expectEqual(@as(u64, 100), single[0].items[0].offset);
+}
+
+/// Assert that no worker spill files remain in the staging dir for a
+/// `max_workers`-worker run.
+fn expectTestDirWithoutSpills(io: Io, dir_path: []const u8, max_workers: usize) !void {
+    var worker: usize = 0;
+    while (worker < max_workers) : (worker += 1) {
+        for ([_][]const u8{ "catalog.spill-", "roots.spill-" }) |prefix| {
+            const name = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}{d}", .{ dir_path, prefix, worker });
+            defer std.testing.allocator.free(name);
+            if (Io.Dir.cwd().openFile(io, name, .{})) |_| {
+                return error.SpillFileLeftOver;
+            } else |err| {
+                try std.testing.expectEqual(error.FileNotFound, err);
+            }
+        }
+    }
+}
+
+test "parallel scan spills rows and stays bounded" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // ~16000 instance rows (~512 KiB of catalog rows): each 4-worker bucket
+    // must drain its 64 KiB spill buffer multiple times, and the merge reads
+    // every spill file back in chunks.
+    var b = @import("../tests/HprofBuilder.zig").Builder.init(allocator, 4);
+    defer b.deinit();
+
+    try b.header(0);
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.loadClass(1, 0x2000, 0x1000);
+
+    var seg_i: usize = 0;
+    while (seg_i < 80) : (seg_i += 1) {
+        var seg = try b.heapDumpSegment();
+        var j: usize = 0;
+        while (j < 200) : (j += 1) {
+            const id: hprof.Id = @intCast(0x100000 + seg_i * 200 + j);
+            _ = try seg.instanceDump(id, 0x2000, &[_]u8{0} ** 8);
+        }
+        seg.end();
+    }
+
+    const bytes = try b.finish();
+    defer allocator.free(bytes);
+
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var tmp_c = std.testing.tmpDir(.{});
+    defer tmp_c.cleanup();
+    var tmp_d = std.testing.tmpDir(.{});
+    defer tmp_d.cleanup();
+    const path_b = try tmp_b.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_b);
+    const path_c = try tmp_c.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_c);
+    const path_d = try tmp_d.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path_d);
+
+    var class_table_b = ClassTable.init(allocator);
+    defer class_table_b.deinit();
+    var thread_traces_b = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_b.deinit();
+    var out_b = try runTestDispatch(allocator, io, bytes, path_b, 1, &class_table_b, &thread_traces_b);
+    defer out_b.deinit(allocator);
+
+    var class_table_c = ClassTable.init(allocator);
+    defer class_table_c.deinit();
+    var thread_traces_c = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_c.deinit();
+    var out_c = try runTestDispatch(allocator, io, bytes, path_c, 4, &class_table_c, &thread_traces_c);
+    defer out_c.deinit(allocator);
+
+    var class_table_d = ClassTable.init(allocator);
+    defer class_table_d.deinit();
+    var thread_traces_d = ThreadTraces.Collector.init(allocator);
+    defer thread_traces_d.deinit();
+    var out_d = try runTestDispatch(allocator, io, bytes, path_d, 4, &class_table_d, &thread_traces_d);
+    defer out_d.deinit(allocator);
+
+    // Determinism across repeated 4-worker runs.
+    try std.testing.expectEqualSlices(u8, out_c.catalog, out_d.catalog);
+    try std.testing.expectEqualSlices(u8, out_c.roots, out_d.roots);
+
+    // Parity: same row multiset inline vs pooled.
+    const rows_b = try sortedTestCatalogRows(allocator, out_b.catalog);
+    defer allocator.free(rows_b);
+    const rows_c = try sortedTestCatalogRows(allocator, out_c.catalog);
+    defer allocator.free(rows_c);
+    try std.testing.expectEqualSlices([catalog_row_size]u8, rows_b, rows_c);
+    try std.testing.expectEqual(@as(u64, 16000), out_c.n_catalog_rows);
+
+    // All spill files are cleaned up on both paths: staging dirs hold only
+    // the outputs the pipeline produces.
+    const staging_b = try std.fs.path.join(allocator, &.{ path_b, "staging" });
+    defer allocator.free(staging_b);
+    const staging_c = try std.fs.path.join(allocator, &.{ path_c, "staging" });
+    defer allocator.free(staging_c);
+    const staging_d = try std.fs.path.join(allocator, &.{ path_d, "staging" });
+    defer allocator.free(staging_d);
+    try expectTestDirWithoutSpills(io, staging_b, 1);
+    try expectTestDirWithoutSpills(io, staging_c, 4);
+    try expectTestDirWithoutSpills(io, staging_d, 4);
 }

@@ -708,11 +708,27 @@ Heap Hunter is designed for multi-gigabyte production dumps. The
 indexer operates in a single streaming pass with an external-sort
 merge phase, so memory consumption is bounded by
 `--sorting-budget-mb` (default 4 GiB) regardless of dump size.
+Heap-segment scanning is parallelized across all CPU cores: each
+worker streams its rows to small spill files (fixed 64 KiB buffers)
+and the main thread merges them in worker order, so scan memory is
+bounded by worker count, not heap entity count. The parallel path
+requires dumps with multiple heap-dump segments (most JVMs emit
+these); single-segment dumps are scanned inline on one thread.
 
-Typical measurements on a single modern core:
+Measured on a 20-core / 15 GB RAM workstation with a 20 GB dump
+(82M objects, 94M edges) and `--no-dominators`, comparing the
+spilling parallel scanner against the previous single-pass RAM
+accumulator (`--profile` stage timings in a checkout of this repo;
+your numbers will vary with disk and cache state):
 
-- Index build throughput: 60–120 MB/s of source HPROF.
-- 20 GB dump indexed end-to-end in under 3 minutes.
+- Scan stage: 35.5 s → 22.3 s (~37% faster).
+- Whole index build: ~10–19% faster end-to-end under equal
+  budgets; the gap widens under tighter budgets, where the small
+  per-worker footprint stops the scan phase from evicting the page
+  cache that the external sort and join stages stream from.
+- Output is byte-identical to the sequential scan: catalog rows and
+  roots are merged in deterministic worker order, and duplicate
+  object ids are deduped by source offset.
 - The dominator stage uses a per-node memory model (~29 B/node plus the
   DFS stack) and is bounded by `--dominator-budget-mb`. On the
   `fixtures/heapforge.hprof` sample it rounds to 0 ms in the coarse
