@@ -53,6 +53,9 @@ the size of the source dump.
 - **External-sort indexer** that builds an on-disk catalog, edge list,
   and CSR (compressed sparse row) graph in a single pass, with a
   configurable memory budget.
+- **Parallel segment scanning**: heap-dump segments are scanned across
+  all CPU cores, with per-worker rows streamed to spill files so scan
+  memory stays bounded by worker count, not heap entity count.
 - **Fingerprint verification** that refuses to query an index built from
   a different dump.
 - **Cached overview** for sub-second histogram, classes, and info
@@ -780,7 +783,7 @@ src/
     HeapDump.zig        Heap-dump segment reader
     Types.zig           Shared HPROF types
   index/                Persistent heap-graph index
-    Scanner.zig         First-pass scan
+    Scanner.zig         First-pass scan (parallel across heap segments)
     CatalogSorter.zig   External sort of the class catalog
     ExtSort.zig         External-sort driver
     EdgeEmitter.zig     Edge-list emission
