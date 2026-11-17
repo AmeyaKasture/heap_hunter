@@ -607,12 +607,22 @@ fn scanSegmentsDispatched(
 
     var threads: std.ArrayList(std.Thread) = .empty;
     defer threads.deinit(allocator);
-    errdefer for (threads.items) |t| t.join();
+    var n_joined: usize = 0;
+    // Join exactly once: threads appended after a spawn but before an
+    // append failure are joined inline; threads already joined on the
+    // normal path are excluded here via `n_joined`.
+    errdefer for (threads.items[n_joined..]) |t| t.join();
     for (workers) |*w| {
         const t = try std.Thread.spawn(.{}, workerScan, .{w});
-        try threads.append(allocator, t);
+        threads.append(allocator, t) catch |e| {
+            t.join();
+            return e;
+        };
     }
-    for (threads.items) |t| t.join();
+    for (threads.items[n_joined..]) |t| {
+        t.join();
+        n_joined += 1;
+    }
 
     // Flush bytes still sitting in the workers' write buffers and close the
     // spill files so the merge can read them back. A flush failure (e.g. disk
