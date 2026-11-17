@@ -711,27 +711,32 @@ Heap Hunter is designed for multi-gigabyte production dumps. The
 indexer operates in a single streaming pass with an external-sort
 merge phase, so memory consumption is bounded by
 `--sorting-budget-mb` (default 4 GiB) regardless of dump size.
-Heap-segment scanning is parallelized across all CPU cores: each
-worker streams its rows to small spill files (fixed 64 KiB buffers)
-and the main thread merges them in worker order, so scan memory is
-bounded by worker count, not heap entity count. The parallel path
-requires dumps with multiple heap-dump segments (most JVMs emit
-these); single-segment dumps are scanned inline on one thread.
+Heap-segment scanning and edge emission are parallelized across all
+CPU cores: each worker streams its rows to small spill files (fixed
+64 KiB buffers) and the main thread merges them in worker order, so
+scan and edge-emission memory are bounded by worker count, not heap
+entity count. The parallel paths require dumps with multiple heap
+segments (most JVMs emit these); single-segment dumps are scanned and
+edge-emitted inline on one thread.
 
 Measured on a 20-core / 15 GB RAM workstation with a 20 GB dump
 (82M objects, 94M edges) and `--no-dominators`, comparing the
-spilling parallel scanner against the previous single-pass RAM
-accumulator (`--profile` stage timings in a checkout of this repo;
-your numbers will vary with disk and cache state):
+spilling parallel scanner and edge emitter against the previous
+single-pass RAM accumulator (`--profile` stage timings in a checkout
+of this repo; your numbers will vary with disk and cache state):
 
 - Scan stage: 35.5 s → 22.3 s (~37% faster).
-- Whole index build: ~10–19% faster end-to-end under equal
-  budgets; the gap widens under tighter budgets, where the small
-  per-worker footprint stops the scan phase from evicting the page
-  cache that the external sort and join stages stream from.
-- Output is byte-identical to the sequential scan: catalog rows and
-  roots are merged in deterministic worker order, and duplicate
-  object ids are deduped by source offset.
+- Edge emission stage: 41.8 s → 27.5 s (~34% faster); on this box it
+  is the largest stage, so this is the biggest single speedup after
+  the scan.
+- Whole index build: ~19% faster end-to-end at the default budget
+  (150.4 s → 122.1 s); ~14% faster under a tight 1 GiB budget
+  (229.5 s → 198.2 s). The tight-budget gain comes from both stages
+  now keeping their working set out of anonymous RAM, leaving the
+  page cache for the external sort and join phases.
+- Output is byte-identical to the sequential pipeline: catalog rows,
+  roots, and edge records are merged in deterministic worker order,
+  and duplicate object ids are deduped by source offset.
 - The dominator stage uses a per-node memory model (~29 B/node plus the
   DFS stack) and is bounded by `--dominator-budget-mb`. On the
   `fixtures/heapforge.hprof` sample it rounds to 0 ms in the coarse
