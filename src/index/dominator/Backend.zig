@@ -43,8 +43,13 @@ pub const Backend = struct {
     compute: *const fn (ctx: *const Context) anyerror!Result,
 };
 
+/// Hard abort threshold for non-convergence, distinct from the G1 design
+/// gate (10 iterations): the cap only fires when the sweep has stopped
+/// making progress, never as a performance warning.
+pub const default_max_iterations: u32 = 64;
+
 pub const Options = struct {
     algorithm: Algorithm = .chk,
-    max_iterations: u32 = 64,
+    max_iterations: u32 = default_max_iterations,
     use_shortcut: bool = true,
 };

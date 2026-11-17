@@ -44,8 +44,9 @@ fn runEngineAndOracleWithOptions(
 /// The engine writes `NONE` for reachable nodes whose immediate dominator is
 /// the virtual root. The oracle (and the mathematical definition) uses the
 /// root ordinal. Convert the on-disk form to the logical form so the two can
-/// be compared.
-fn toLogicalIdom(
+/// be compared. Pub so the dense-graph probe can reuse the same
+/// normalization rather than duplicating the subtlety.
+pub fn toLogicalIdom(
     allocator: std.mem.Allocator,
     dom_parent: []const u32,
     dom_order: []const u32,

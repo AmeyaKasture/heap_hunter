@@ -14,6 +14,9 @@ pub const EngineOutput = struct {
     dom_parent: []u32,
     dom_order: []u32,
     retained: []u64,
+    /// CHK instrumentation from the engine run (iterations, intersect
+    /// steps, shortcut count). Populated from `Dominator.run`'s stats.
+    stats: Backend.Stats = .{},
 
     pub fn deinit(self: *EngineOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.dom_parent);
@@ -208,6 +211,7 @@ pub fn runEngine(
         .dom_parent = dom_parent,
         .dom_order = dom_order,
         .retained = retained,
+        .stats = result.stats,
     };
 }
 
