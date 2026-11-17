@@ -124,6 +124,9 @@ pub fn runIndexCommand(
             var source_mm = try Io.File.MemoryMap.create(io, source_file, .{
                 .len = source_len,
                 .protection = .{ .read = true, .write = false },
+                // Demand-page the source dump; prefaulting the whole file
+                // up front wastes kernel time and page-table memory.
+                .populate = false,
             });
             defer source_mm.destroy(io);
 
