@@ -42,6 +42,7 @@ pub const optional_files = &[_][]const u8{
     "dom_parent.bin",
     "dom_order.bin",
     "retained.bin",
+    "retained_rank.bin",
 };
 
 /// Keep the old name working for callers that expect a flat list.
@@ -378,7 +379,7 @@ test "publish required files are unchanged and dominator files are optional" {
         try std.testing.expect(!found);
     }
     try std.testing.expectEqual(@as(usize, 10), required_files.len);
-    try std.testing.expectEqual(@as(usize, 3), optional_files.len);
+    try std.testing.expectEqual(@as(usize, 4), optional_files.len);
 }
 
 // Optional files published in one build are removed when the next build does

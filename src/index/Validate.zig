@@ -90,11 +90,19 @@ fn mapFileReadOnly(
     name: []const u8,
     stderr: *Io.Writer,
     err: Error,
+    optional: bool,
 ) Error!?MappedFile {
     const dir = Io.Dir.cwd();
-    var file = dir.openFile(io, path, .{}) catch |open_err| {
-        try Cli.printError(stderr, "index validation failed: failed to open '{s}': {s}", .{ name, @errorName(open_err) });
-        return err;
+    var file = dir.openFile(io, path, .{}) catch |open_err| switch (open_err) {
+        // An optional sidecar that older indexes do not have is simply absent.
+        error.FileNotFound => if (optional) return null else {
+            try Cli.printError(stderr, "index validation failed: failed to open '{s}': {s}", .{ name, @errorName(open_err) });
+            return err;
+        },
+        else => {
+            try Cli.printError(stderr, "index validation failed: failed to open '{s}': {s}", .{ name, @errorName(open_err) });
+            return err;
+        },
     };
     const len = file.length(io) catch |len_err| {
         try Cli.printError(stderr, "index validation failed: failed to read size of '{s}': {s}", .{ name, @errorName(len_err) });
@@ -266,17 +274,17 @@ fn validateDominators(
     const catalog_path = try std.fs.path.join(allocator, &.{ staging_dir, "catalog.bin" });
     defer allocator.free(catalog_path);
 
-    var dom_parent_data = try mapFileReadOnly(io, dom_parent_path, "dom_parent.bin", stderr, error.MissingFile);
+    var dom_parent_data = try mapFileReadOnly(io, dom_parent_path, "dom_parent.bin", stderr, error.MissingFile, false);
     defer if (dom_parent_data) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
     };
-    var dom_order_data = try mapFileReadOnly(io, dom_order_path, "dom_order.bin", stderr, error.MissingFile);
+    var dom_order_data = try mapFileReadOnly(io, dom_order_path, "dom_order.bin", stderr, error.MissingFile, false);
     defer if (dom_order_data) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
     };
-    var retained_data = try mapFileReadOnly(io, retained_path, "retained.bin", stderr, error.MissingFile);
+    var retained_data = try mapFileReadOnly(io, retained_path, "retained.bin", stderr, error.MissingFile, false);
     defer if (retained_data) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -341,7 +349,7 @@ fn validateDominators(
         }
     }
 
-    var catalog_mapped = try mapFileReadOnly(io, catalog_path, "catalog.bin", stderr, error.InvalidCatalogFile);
+    var catalog_mapped = try mapFileReadOnly(io, catalog_path, "catalog.bin", stderr, error.InvalidCatalogFile, false);
     defer if (catalog_mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -369,6 +377,50 @@ fn validateDominators(
     if (root_retained != reachable_shallow_sum) {
         try Cli.printError(stderr, "index validation failed: retained[root] does not reconcile with reachable shallow total", .{});
         return error.InvariantViolation;
+    }
+
+    // The retained-rank sidecar is optional (legacy indexes lack it). When
+    // present it must be exactly the reachable real objects (dom_order minus
+    // the virtual root), strictly ordered by (retained DESC, ordinal ASC).
+    const rank_path = try std.fs.path.join(allocator, &.{ staging_dir, "retained_rank.bin" });
+    defer allocator.free(rank_path);
+    var rank_data = try mapFileReadOnly(io, rank_path, "retained_rank.bin", stderr, error.MissingFile, true);
+    defer if (rank_data) |*m| {
+        m.mm.destroy(io);
+        m.file.close(io);
+    };
+    if (rank_data) |m| {
+        const rk = m.data;
+        if (rk.len % 4 != 0 or rk.len / 4 != n_reachable - 1) {
+            try Cli.printError(stderr, "index validation failed: retained_rank.bin has unexpected size", .{});
+            return error.InvariantViolation;
+        }
+
+        var prev_ordinal: u32 = 0;
+        var prev_retained: u64 = std.math.maxInt(u64);
+        var j: usize = 0;
+        while (j < rk.len / 4) : (j += 1) {
+            const ord = std.mem.readInt(u32, rk[j * 4 ..][0..4], .little);
+            if (ord >= n_nodes) {
+                try Cli.printError(stderr, "index validation failed: retained_rank.bin contains an out-of-range ordinal", .{});
+                return error.InvariantViolation;
+            }
+            if (ord == virtual_root) {
+                try Cli.printError(stderr, "index validation failed: retained_rank.bin contains the virtual root", .{});
+                return error.InvariantViolation;
+            }
+            if (!seen.contains(@intCast(ord))) {
+                try Cli.printError(stderr, "index validation failed: retained_rank.bin contains an unreachable ordinal", .{});
+                return error.InvariantViolation;
+            }
+            const r = std.mem.readInt(u64, ret[ord * 8 ..][0..8], .little);
+            if (j > 0 and (r > prev_retained or (r == prev_retained and ord < prev_ordinal))) {
+                try Cli.printError(stderr, "index validation failed: retained_rank.bin is not in (retained DESC, ordinal ASC) order", .{});
+                return error.InvariantViolation;
+            }
+            prev_ordinal = ord;
+            prev_retained = r;
+        }
     }
 }
 
@@ -416,7 +468,7 @@ fn validateCatalog(
     n_classes: u64,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, "catalog.bin", stderr, error.InvalidCatalogFile);
+    var mapped = try mapFileReadOnly(io, path, "catalog.bin", stderr, error.InvalidCatalogFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -481,7 +533,7 @@ fn validateClasses(
     n_classes: u64,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, "classes.bin", stderr, error.InvalidClassesFile);
+    var mapped = try mapFileReadOnly(io, path, "classes.bin", stderr, error.InvalidClassesFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -533,7 +585,7 @@ fn validateFields(
     n_classes: u64,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, "fields.bin", stderr, error.InvalidFieldsFile);
+    var mapped = try mapFileReadOnly(io, path, "fields.bin", stderr, error.InvalidFieldsFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -590,7 +642,7 @@ fn validateOffsets(
     name: []const u8,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, name, stderr, error.InvalidOffsetFile);
+    var mapped = try mapFileReadOnly(io, path, name, stderr, error.InvalidOffsetFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -643,7 +695,7 @@ fn validateAdjacency(
     name: []const u8,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, name, stderr, error.InvalidAdjacencyFile);
+    var mapped = try mapFileReadOnly(io, path, name, stderr, error.InvalidAdjacencyFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
@@ -684,7 +736,7 @@ fn validateRoots(
     virtual_root_ordinal: u64,
     stderr: *Io.Writer,
 ) Error!void {
-    var mapped = try mapFileReadOnly(io, path, "roots.bin", stderr, error.InvalidRootsFile);
+    var mapped = try mapFileReadOnly(io, path, "roots.bin", stderr, error.InvalidRootsFile, false);
     defer if (mapped) |*m| {
         m.mm.destroy(io);
         m.file.close(io);
