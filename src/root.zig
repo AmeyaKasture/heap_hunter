@@ -1968,6 +1968,7 @@ test {
     _ = @import("index/dominator/Oracle.zig");
     _ = @import("index/dominator/TestSupport.zig");
     _ = @import("index/dominator/Engine_test.zig");
+    _ = @import("index/dominator/Reader_test.zig");
     _ = @import("index/Validate.zig");
     _ = @import("index/Publish.zig");
     _ = @import("index/IndexReader.zig");

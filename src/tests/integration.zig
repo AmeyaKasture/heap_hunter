@@ -6,6 +6,7 @@ const hprof = @import("../hprof.zig");
 const Analysis = @import("../Analysis.zig");
 const Commands = @import("../Commands.zig");
 const Config = @import("../Config.zig").Config;
+const profiling = @import("profiling");
 
 fn loadIndex(allocator: std.mem.Allocator, relative_path: []const u8) !Analysis.Index {
     const io = std.testing.io;
@@ -31,6 +32,9 @@ test "buildIndex finds heap-derived threads in real Java 21 dump" {
 }
 
 test "index --profile emits timing tree to stderr" {
+    // Instrumentation is compile-time gated (build_options.profile). In
+    // Release builds the timing tree is stripped, so skip instead of fail.
+    if (!profiling.build_enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -122,6 +126,8 @@ test "index --profile keeps timings out of stdout" {
 }
 
 test "overview --profile emits timing tree to stderr" {
+    // Same compile-time gate as the index --profile test above.
+    if (!profiling.build_enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

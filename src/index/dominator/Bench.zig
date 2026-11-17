@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     const out_view = CsrView.init(@intCast(V), out_offsets, out_targets);
     const in_view = CsrView.init(@intCast(V), in_offsets, in_sources);
 
-    const timing = try runMeasurement(allocator, V, &out_view, &in_view);
+    const timing = try runMeasurement(allocator, io, V, &out_view, &in_view);
 
     // In-degree histogram over distinct reachable predecessors.
     const histogram = try computeInDegreeHistogram(allocator, @intCast(V), &out_view, &in_view);
@@ -167,25 +167,27 @@ const Timing = struct {
     peak_rss: u64,
 };
 
-fn nowMs() u64 {
-    var tv: std.c.timeval = undefined;
-    if (std.c.gettimeofday(&tv, null) != 0) return 0;
-    return @intCast(tv.sec * std.time.ms_per_s + @divFloor(tv.usec, std.time.us_per_ms));
+fn nowMs(io: Io) u64 {
+    // Monotonic milliseconds via the Io clock (same source as Commands'
+    // stage timings), keeping the bench free of any libc dependency.
+    const ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_ms));
 }
 
 fn runMeasurement(
     allocator: std.mem.Allocator,
+    io: Io,
     V: u64,
     out_view: *const CsrView,
     in_view: *const CsrView,
 ) !Timing {
-    const start_total = nowMs();
+    const start_total = nowMs(io);
 
     var numbering = try Numbering.compute(allocator, @intCast(V), out_view);
     defer numbering.deinit(allocator);
-    const dfs_ms = nowMs() - start_total;
+    const dfs_ms = nowMs(io) - start_total;
 
-    const start_sweeps = nowMs();
+    const start_sweeps = nowMs(io);
     const ctx: Backend.Context = .{
         .allocator = allocator,
         .n_nodes = @intCast(V),
@@ -200,7 +202,7 @@ fn runMeasurement(
     };
     const backend_result = try Chk.compute(&ctx);
     defer allocator.free(backend_result.idom);
-    const sweeps_ms = nowMs() - start_sweeps;
+    const sweeps_ms = nowMs(io) - start_sweeps;
 
     var stats = backend_result.stats;
     stats.edges_processed = estimateEdgesProcessed(in_view, numbering.reachable, @intCast(V));
@@ -211,7 +213,7 @@ fn runMeasurement(
         .stats = stats,
         .dfs_ms = dfs_ms,
         .sweeps_ms = sweeps_ms,
-        .total_ms = nowMs() - start_total,
+        .total_ms = nowMs(io) - start_total,
         .peak_rss = getPeakRss(),
     };
 }
