@@ -2,7 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const Backend = @import("dominator/Backend.zig");
+pub const Backend = @import("dominator/Backend.zig");
 const CsrView = @import("dominator/CsrView.zig").CsrView;
 const Graphs = @import("dominator/Graphs.zig");
 const Numbering = @import("dominator/Numbering.zig");
@@ -17,6 +17,7 @@ pub const NONE = std.math.maxInt(u32);
 pub const dom_parent_entry_size = 4;
 pub const dom_order_entry_size = 4;
 pub const retained_entry_size = 8;
+pub const retained_rank_entry_size = 4;
 
 pub const Error = error{
     DominatorBudgetExceeded,
@@ -31,6 +32,7 @@ pub const Result = struct {
     dom_parent_path: []const u8,
     dom_order_path: []const u8,
     retained_path: []const u8,
+    retained_rank_path: []const u8,
     n_reachable: u64,
     unreachable_objects: u64,
     total_retained_bytes: u64,
@@ -40,6 +42,7 @@ pub const Result = struct {
         allocator.free(self.dom_parent_path);
         allocator.free(self.dom_order_path);
         allocator.free(self.retained_path);
+        allocator.free(self.retained_rank_path);
     }
 };
 
@@ -179,6 +182,33 @@ pub fn run(
     try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
     try writeU64File(io, retained_path, retained);
 
+    // 9b. Retained-rank sidecar: the reachable real objects (dom_order minus
+    // the virtual root at slot 0) sorted by (retained DESC, ordinal ASC) —
+    // exactly the key `IndexReader.writeRetainers` documents. With this file
+    // present, a top-N retainer query reads `top` entries instead of scanning
+    // all of `retained.bin`; without it the reader falls back to the legacy
+    // O(V) scan, and both paths produce byte-identical output.
+    //
+    // Cost note: this is an in-memory O(R log R) sort over one u32 per
+    // reachable object (transient), not an external sort. Fine for fixture
+    // and mid-size heaps; at the 100M-object tier this is ~400 MB transient
+    // and a few seconds — the S5 large-dump profile is the place to revisit.
+    const rank_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "retained_rank.bin" });
+    errdefer allocator.free(rank_path);
+
+    const rank = try allocator.alloc(u32, numbering.n_reachable -| 1);
+    defer allocator.free(rank);
+    @memcpy(rank, numbering.rpo_vertex[1..numbering.n_reachable]);
+
+    const RankContext = struct { retained: []const u64 };
+    std.mem.sort(u32, rank, RankContext{ .retained = retained }, struct {
+        fn lessThan(rank_ctx: RankContext, a: u32, b: u32) bool {
+            if (rank_ctx.retained[a] != rank_ctx.retained[b]) return rank_ctx.retained[a] > rank_ctx.retained[b];
+            return a < b;
+        }
+    }.lessThan);
+    try writeU32File(io, rank_path, rank);
+
     // 10. Set diagnostics.
     diagnostics.unreachable_objects = n_objects -| numbering.n_reachable + 1;
 
@@ -186,6 +216,7 @@ pub fn run(
         .dom_parent_path = dom_parent_path,
         .dom_order_path = dom_order_path,
         .retained_path = retained_path,
+        .retained_rank_path = rank_path,
         .n_reachable = numbering.n_reachable,
         .unreachable_objects = diagnostics.unreachable_objects,
         .total_retained_bytes = retained[root],
@@ -323,7 +354,7 @@ fn createTestJob(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8) !Pre
     };
 }
 
-test "dominator engine writes all three output files" {
+test "dominator engine writes all four output files" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -365,10 +396,14 @@ test "dominator engine writes all three output files" {
     defer allocator.free(dom_order_data);
     const retained_data = try Io.Dir.cwd().readFileAlloc(io, result.retained_path, allocator, .unlimited);
     defer allocator.free(retained_data);
+    const rank_data = try Io.Dir.cwd().readFileAlloc(io, result.retained_rank_path, allocator, .unlimited);
+    defer allocator.free(rank_data);
 
     try std.testing.expectEqual(@as(usize, 4 * 4), dom_parent_data.len);
     try std.testing.expectEqual(@as(usize, 4 * 4), dom_order_data.len);
     try std.testing.expectEqual(@as(usize, 4 * 8), retained_data.len);
+    // One entry per reachable real object (n_reachable - virtual root).
+    try std.testing.expectEqual(@as(usize, 3 * 4), rank_data.len);
 
     var dom_parent: [4]u32 = undefined;
     for (0..4) |i| {
@@ -382,10 +417,83 @@ test "dominator engine writes all three output files" {
     for (0..4) |i| {
         retained[i] = std.mem.readInt(u64, retained_data[i * 8 ..][0..8], .little);
     }
+    var rank: [3]u32 = undefined;
+    for (0..3) |i| {
+        rank[i] = std.mem.readInt(u32, rank_data[i * 4 ..][0..4], .little);
+    }
 
     try std.testing.expectEqual(@as(u32, 3), dom_order[0]);
     try std.testing.expectEqual(NONE, dom_parent[3]);
     try std.testing.expectEqual(@as(u64, 40), retained[3]);
+
+    // Rank order: retained DESC, ordinal ASC on ties.
+    try std.testing.expectEqual(@as(u32, 2), rank[0]);
+    try std.testing.expectEqual(@as(u32, 0), rank[1]);
+    try std.testing.expectEqual(@as(u32, 1), rank[2]);
+    try std.testing.expectEqual(@as(u64, 20), retained[rank[0]]);
+    try std.testing.expectEqual(@as(u64, 10), retained[rank[1]]);
+    try std.testing.expectEqual(@as(u64, 10), retained[rank[2]]);
+}
+
+test "retained rank excludes the virtual root and unreachable objects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // root(3) -> 0 -> 2; object 1 is unreachable.
+    const edges = &[_][2]u32{
+        .{ 3, 0 },
+        .{ 0, 2 },
+    };
+    const shallow = &[_]u32{ 5, 7, 9 };
+
+    try writeTestCsr(allocator, io, tmp_path, 4, edges, shallow);
+
+    var job = try createTestJob(allocator, io, tmp_path);
+    defer job.deinit(allocator);
+
+    var diagnostics: Manifest.Diagnostics = .{};
+    const result = try runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    );
+    defer result.deinit(allocator);
+
+    const retained_data = try Io.Dir.cwd().readFileAlloc(io, result.retained_path, allocator, .unlimited);
+    defer allocator.free(retained_data);
+    const rank_data = try Io.Dir.cwd().readFileAlloc(io, result.retained_rank_path, allocator, .unlimited);
+    defer allocator.free(rank_data);
+
+    // Reachable set = {root, 0, 2}: rank has exactly 2 entries.
+    try std.testing.expectEqual(@as(usize, 2 * 4), rank_data.len);
+
+    var retained: [4]u64 = undefined;
+    for (0..4) |i| {
+        retained[i] = std.mem.readInt(u64, retained_data[i * 8 ..][0..8], .little);
+    }
+
+    var prev: u64 = std.math.maxInt(u64);
+    for (0..2) |i| {
+        const ord = std.mem.readInt(u32, rank_data[i * 4 ..][0..4], .little);
+        // Neither the virtual root nor the unreachable object 1.
+        try std.testing.expect(ord != 3);
+        try std.testing.expect(ord != 1);
+        // Strictly non-increasing retained size along the rank.
+        try std.testing.expect(retained[ord] <= prev);
+        prev = retained[ord];
+    }
+    // Object 0 (retained 14) outranks object 2 (retained 9).
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, rank_data[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, rank_data[4..8], .little));
 }
 
 test "dominator engine marks unreachable objects with NONE" {

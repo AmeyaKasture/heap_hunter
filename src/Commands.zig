@@ -134,7 +134,7 @@ pub fn runIndexCommand(
             var scan_result = blk: {
                 var span = profiling.begin(io, "scan");
                 defer span.end(io);
-                break :blk stageTimed(io, "scan", &elapsed, try Scanner.run(allocator, io, job, source_mm.memory, &progress));
+                break :blk try stageTimed(io, "scan", &elapsed, Scanner.run, .{ allocator, io, job, source_mm.memory, &progress });
             };
             defer scan_result.deinit(allocator);
             log.debug("stage: scan complete, n_objects approx {d}, diagnostics={any}", .{ scan_result.diagnostics.duplicate_object_ids, scan_result.diagnostics });
@@ -144,19 +144,19 @@ pub fn runIndexCommand(
             var catalog_result = blk: {
                 var span = profiling.begin(io, "sort_catalog");
                 defer span.end(io);
-                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe(
+                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe, .{
                     allocator,
                     io,
                     job,
                     scan_result.catalog_path,
                     &scan_result.diagnostics,
-                ) catch |err| switch (err) {
+                }) catch |err| switch (err) {
                     error.TooManyObjects => {
                         try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
                         return @as(anyerror!void, err);
                     },
                     else => return @as(anyerror!void, err),
-                });
+                };
             };
             defer catalog_result.deinit(allocator);
             log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
@@ -179,14 +179,14 @@ pub fn runIndexCommand(
             var layout_table = blk: {
                 var span = profiling.begin(io, "layouts");
                 defer span.end(io);
-                break :blk stageTimed(io, "layouts", &elapsed, try Layouts.writeFields(
+                break :blk try stageTimed(io, "layouts", &elapsed, Layouts.writeFields, .{
                     allocator,
                     io,
                     job.staging_dir,
                     &scan_result.class_table,
                     job.header.id_size,
                     &scan_result.diagnostics,
-                ));
+                });
             };
             defer layout_table.deinit();
             log.debug("stage: layouts complete, n_classes={d}", .{layout_table.layouts.len});
@@ -196,14 +196,14 @@ pub fn runIndexCommand(
             var edge_result = blk: {
                 var span = profiling.begin(io, "emit_edges");
                 defer span.end(io);
-                break :blk stageTimed(io, "emit_edges", &elapsed, try EdgeEmitter.run(
+                break :blk try stageTimed(io, "emit_edges", &elapsed, EdgeEmitter.run, .{
                     allocator,
                     io,
                     job,
                     source_mm.memory,
                     &layout_table,
                     &scan_result.diagnostics,
-                ));
+                });
             };
             defer edge_result.deinit(allocator);
             log.debug("stage: emit_edges complete", .{});
@@ -213,7 +213,7 @@ pub fn runIndexCommand(
             var join_result = blk: {
                 var span = profiling.begin(io, "join");
                 defer span.end(io);
-                break :blk stageTimed(io, "join", &elapsed, try Join.run(
+                break :blk try stageTimed(io, "join", &elapsed, Join.run, .{
                     allocator,
                     io,
                     job,
@@ -221,7 +221,7 @@ pub fn runIndexCommand(
                     catalog_result.catalog_path,
                     catalog_result.n_objects,
                     &scan_result.diagnostics,
-                ));
+                });
             };
             defer join_result.deinit(allocator);
             log.debug("stage: join complete, n_edges={d}", .{join_result.n_edges});
@@ -231,7 +231,7 @@ pub fn runIndexCommand(
             var csr_result = blk: {
                 var span = profiling.begin(io, "csr");
                 defer span.end(io);
-                break :blk stageTimed(io, "csr", &elapsed, try Csr.run(
+                break :blk try stageTimed(io, "csr", &elapsed, Csr.run, .{
                     allocator,
                     io,
                     job,
@@ -242,7 +242,7 @@ pub fn runIndexCommand(
                     join_result.n_edges,
                     scan_result.n_roots,
                     &scan_result.diagnostics,
-                ));
+                });
             };
             defer csr_result.deinit(allocator);
             log.debug("stage: csr complete, n_roots={d}", .{csr_result.n_roots});
@@ -265,7 +265,7 @@ pub fn runIndexCommand(
                 var dominator_result = blk: {
                     var span = profiling.begin(io, "dominators");
                     defer span.end(io);
-                    break :blk stageTimed(io, "dominators", &elapsed, Dominator.run(
+                    break :blk stageTimed(io, "dominators", &elapsed, Dominator.run, .{
                         allocator,
                         io,
                         job,
@@ -277,20 +277,28 @@ pub fn runIndexCommand(
                         catalog_result.n_objects,
                         join_result.n_edges,
                         &scan_result.diagnostics,
-                        .{},
-                    ) catch |err| {
+                        @as(Dominator.Backend.Options, .{}),
+                    }) catch |err| {
                         if (err == error.DominatorBudgetExceeded) {
                             Dominator.formatBudgetError(V, required_conservative, job.dominator_budget_bytes, stderr) catch {};
                             try stderr.flush();
                         }
                         return @as(anyerror!void, err);
-                    });
+                    };
                 };
                 defer dominator_result.deinit(allocator);
                 dominator_n_reachable = dominator_result.n_reachable;
                 dominator_total_retained = dominator_result.total_retained_bytes;
                 dominator_iterations = dominator_result.stats.iterations;
                 dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
+
+                profiling.counter("dominator_iterations", dominator_result.stats.iterations);
+                profiling.counter("dominator_nodes_changed", dominator_result.stats.nodes_changed);
+                profiling.counter("dominator_shortcut_nodes", dominator_result.stats.shortcut_nodes);
+                profiling.counter("dominator_intersect_steps", dominator_result.stats.intersect_steps_total);
+                profiling.counter("dominator_intersect_steps_max", dominator_result.stats.intersect_steps_max);
+                profiling.counter("dominator_reachable_nodes", dominator_result.n_reachable);
+                profiling.counter("dominator_unreachable_objects", dominator_result.unreachable_objects);
             }
 
             progress.nextStep("validating index");
@@ -298,7 +306,7 @@ pub fn runIndexCommand(
             {
                 var span = profiling.begin(io, "validate");
                 defer span.end(io);
-                stageTimed(io, "validate", &elapsed, try Validate.validate(
+                try stageTimed(io, "validate", &elapsed, Validate.validate, .{
                     allocator,
                     io,
                     job.staging_dir,
@@ -308,7 +316,7 @@ pub fn runIndexCommand(
                     n_classes,
                     compute_dominators,
                     stderr,
-                ));
+                });
             }
             log.debug("stage: validate complete", .{});
 
@@ -331,14 +339,14 @@ pub fn runIndexCommand(
             const publish_result = blk: {
                 var span = profiling.begin(io, "publish");
                 defer span.end(io);
-                break :blk stageTimed(io, "publish", &elapsed, try Publish.publish(
+                break :blk try stageTimed(io, "publish", &elapsed, Publish.publish, .{
                     allocator,
                     io,
                     job.staging_dir,
                     index_dir,
                     &manifest,
                     stderr,
-                ));
+                });
             };
             // publish_result.files aliases manifest.files; manifest.deinit frees them.
 
@@ -900,18 +908,27 @@ const StageTimings = struct {
     publish: i64 = 0,
 };
 
+/// Time a pipeline stage: invoke `callee` with `args` between two clock reads
+/// and record the elapsed milliseconds under `name`.
+///
+/// The stage function and its arguments must be passed in (invoked via
+/// `@call` inside the timing window). The previous form took the stage's
+/// result as `anytype`, which Zig evaluates at the call site *before* this
+/// function runs — both clock reads then bracketed only a value copy, so
+/// every recorded timing was zero.
 fn stageTimed(
     io: Io,
     comptime name: []const u8,
     timings: *StageTimings,
-    result: anytype,
-) @TypeOf(result) {
+    comptime callee: anytype,
+    args: anytype,
+) @typeInfo(@TypeOf(callee)).@"fn".return_type.? {
     const start_ns = Io.Timestamp.now(io, .awake).nanoseconds;
-    const r = result;
+    const result = try @call(.auto, callee, args);
     const end_ns = Io.Timestamp.now(io, .awake).nanoseconds;
     const delta_ns: i64 = @intCast(end_ns - start_ns);
     @field(timings, name) = @divTrunc(delta_ns, std.time.ns_per_ms);
-    return r;
+    return result;
 }
 
 fn jsonEscapeString(writer: anytype, s: []const u8) !void {

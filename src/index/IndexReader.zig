@@ -221,6 +221,7 @@ pub const Reader = struct {
     dom_parent: []const u8,
     dom_order: []const u8,
     retained: []const u8,
+    retained_rank: []const u8,
 
     classes_data: []const u8,
     fields_data: []const u8,
@@ -275,6 +276,7 @@ pub const Reader = struct {
             .dom_parent = &.{},
             .dom_order = &.{},
             .retained = &.{},
+            .retained_rank = &.{},
             .classes_data = &[_]u8{},
             .fields_data = &.{},
             .thread_traces = ThreadTraces.Parsed.empty(allocator),
@@ -307,6 +309,9 @@ pub const Reader = struct {
             self.dom_parent = try self.mapFile("dom_parent.bin");
             self.dom_order = try self.mapFile("dom_order.bin");
             self.retained = try self.mapFile("retained.bin");
+            // Optional fast-path sidecar for `writeRetainers`. Absent in
+            // legacy indexes; missing or empty simply keeps the O(V) scan.
+            self.retained_rank = try self.mapOptionalFile("retained_rank.bin");
         }
 
         try self.validateSizes();
@@ -395,6 +400,32 @@ pub const Reader = struct {
         return mf.data();
     }
 
+    /// Like `mapFile` but tolerates absence: an optional file that does not
+    /// exist (or is empty) maps to an empty slice instead of an error. Used
+    /// for sidecars that older indexes legitimately lack.
+    fn mapOptionalFile(self: *Reader, name: []const u8) ![]const u8 {
+        const path = try std.fs.path.join(self.allocator, &.{ self.index_dir, name });
+        defer self.allocator.free(path);
+        const dir = Io.Dir.cwd();
+        const file = dir.openFile(self.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        errdefer file.close(self.io);
+        const len = try file.length(self.io);
+        if (len == 0) {
+            file.close(self.io);
+            return &.{};
+        }
+        const mm = try Io.File.MemoryMap.create(self.io, file, .{
+            .len = len,
+            .protection = .{ .read = true, .write = false },
+            .populate = false,
+        });
+        try self.mapped.append(self.allocator, .{ .file = file, .mm = mm });
+        return mm.memory;
+    }
+
     fn readFile(self: *Reader, name: []const u8) ![]const u8 {
         const path = try std.fs.path.join(self.allocator, &.{ self.index_dir, name });
         defer self.allocator.free(path);
@@ -427,6 +458,8 @@ pub const Reader = struct {
             if (self.retained.len != expected_nodes * 8) return error.CorruptIndexFile;
             if (self.dom_order.len % 4 != 0) return error.CorruptIndexFile;
             if (self.dom_order.len / 4 != self.manifest.n_dominator_nodes) return error.CorruptIndexFile;
+            if (self.retained_rank.len > 0 and
+                self.retained_rank.len != (self.manifest.n_dominator_nodes - 1) * 4) return error.CorruptIndexFile;
         }
     }
 
@@ -1858,56 +1891,75 @@ const RetainedHeap = struct {
 
 /// List the objects with the largest retained size as one JSON line.
 ///
-/// Scans every ordinal keeping a bounded min-heap of size `top`; this is
-/// inherently O(V) because `retained.bin` is a flat array with no index.
 /// Only reachable objects are considered (unreachable objects are retained
 /// by nothing); the virtual root itself is not a catalog row. The final
 /// order is `(retained DESC, ordinal ASC)` so the output is byte-identical
-/// across runs regardless of the heap's internal layout.
+/// across runs.
+///
+/// Two paths produce identical output:
+///   * Fast path — when `retained_rank.bin` is present, it already lists the
+///     reachable real objects in exactly that order, so the answer is its
+///     first `top` entries: O(top).
+///   * Legacy path — otherwise scan every ordinal keeping a bounded min-heap
+///     of size `top`; inherently O(V) because `retained.bin` is a flat array.
 ///
 /// Fails with `error.NoRetainedData` when the index has no dominator data.
 pub fn writeRetainers(self: *const Reader, writer: *Io.Writer, opts: RetainersOptions) !void {
     if (!self.hasDominators()) return error.NoRetainedData;
 
-    // On disk, dom_parent == NONE means "unreachable" OR "child of the
-    // virtual root". Reachability therefore comes from dom_order.bin, which
-    // holds exactly the reachable nodes. Excluding only unreachable objects
-    // keeps the true top retainers (children of the virtual root are
-    // typically the largest ones); the virtual root itself is not a catalog
-    // row and is never scanned.
-    const V: u32 = @intCast(self.n_objects + 1);
-    const reachable = try self.allocator.alloc(bool, V);
-    defer self.allocator.free(reachable);
-    @memset(reachable, false);
-    const n_slots = self.dom_order.len / 4;
-    var slot: usize = 0;
-    while (slot < n_slots) : (slot += 1) {
-        const v = std.mem.readInt(u32, self.dom_order[slot * 4 ..][0..4], .little);
-        if (v < V) reachable[v] = true;
-    }
-
-    var heap = RetainedHeap.init(self.allocator);
-    defer heap.deinit();
+    var items = std.ArrayList(RetainedHeap.Item).empty;
+    defer items.deinit(self.allocator);
     const top: usize = opts.top;
 
-    var ord: u32 = 0;
-    while (ord < self.n_objects) : (ord += 1) {
-        if (!reachable[ord]) continue; // unreachable objects are not retainers
-        const r = self.retainedSize(ord);
-        if (top == 0) break;
-        if (heap.capacity() < top) {
-            try heap.push(.{ .retained = r, .ordinal = ord });
-        } else if (r > heap.minRetained()) {
-            heap.replaceMin(.{ .retained = r, .ordinal = ord });
+    if (self.retained_rank.len > 0) {
+        const n_rank = self.retained_rank.len / 4;
+        const count = @min(top, n_rank);
+        try items.ensureTotalCapacity(self.allocator, count);
+        var k: usize = 0;
+        while (k < count) : (k += 1) {
+            const ord = std.mem.readInt(u32, self.retained_rank[k * 4 ..][0..4], .little);
+            items.appendAssumeCapacity(.{ .retained = self.retainedSize(ord), .ordinal = ord });
         }
+    } else {
+        // On disk, dom_parent == NONE means "unreachable" OR "child of the
+        // virtual root". Reachability therefore comes from dom_order.bin,
+        // which holds exactly the reachable nodes. Excluding only unreachable
+        // objects keeps the true top retainers (children of the virtual root
+        // are typically the largest ones); the virtual root itself is not a
+        // catalog row and is never scanned.
+        const V: u32 = @intCast(self.n_objects + 1);
+        const reachable = try self.allocator.alloc(bool, V);
+        defer self.allocator.free(reachable);
+        @memset(reachable, false);
+        const n_slots = self.dom_order.len / 4;
+        var slot: usize = 0;
+        while (slot < n_slots) : (slot += 1) {
+            const v = std.mem.readInt(u32, self.dom_order[slot * 4 ..][0..4], .little);
+            if (v < V) reachable[v] = true;
+        }
+
+        var heap = RetainedHeap.init(self.allocator);
+        defer heap.deinit();
+
+        var ord: u32 = 0;
+        while (ord < self.n_objects) : (ord += 1) {
+            if (!reachable[ord]) continue; // unreachable objects are not retainers
+            const r = self.retainedSize(ord);
+            if (top == 0) break;
+            if (heap.capacity() < top) {
+                try heap.push(.{ .retained = r, .ordinal = ord });
+            } else if (r > heap.minRetained()) {
+                heap.replaceMin(.{ .retained = r, .ordinal = ord });
+            }
+        }
+        try items.appendSlice(self.allocator, heap.items.items);
     }
 
     // Deterministic output order: retained DESC, ordinal ASC.
-    const items = heap.items.items;
-    std.mem.sort(RetainedHeap.Item, items, {}, retainersOrder);
+    std.mem.sort(RetainedHeap.Item, items.items, {}, retainersOrder);
 
     try writer.print("{{\"top\":{d},\"items\":[", .{top});
-    for (items, 0..) |item, i| {
+    for (items.items, 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
         const row = self.catalogRow(item.ordinal);
         try writer.writeAll("{\"id\":");

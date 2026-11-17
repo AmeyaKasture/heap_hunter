@@ -74,6 +74,70 @@ test "real dump index built without dominators has no dominator data" {
 
     const first_id = reader.rawIdForOrdinal(0) orelse return error.TestUnexpectedResult;
     try std.testing.expectError(error.NoRetainedData, IndexReader.writeRetained(&reader, &buf.writer, first_id));
+
+    // Option B: the retained-rank sidecar is also absent from a
+    // --no-dominators index.
+    const rank_path = try std.fs.path.join(allocator, &.{ index_dir, "retained_rank.bin" });
+    defer allocator.free(rank_path);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(io, rank_path, .{}));
+}
+
+test "retained rank sidecar and legacy scan produce identical retainer output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const index_dir = try buildIndex(allocator, io, tmp_path, fixtures[0], true);
+    defer allocator.free(index_dir);
+
+    var reader = try IndexReader.open(allocator, io, index_dir, null);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.hasDominators());
+    // The freshly built index has the sidecar mapped.
+    try std.testing.expect(reader.retained_rank.len > 0);
+
+    // The sidecar is ordered exactly like the documented retainer key:
+    // (retained DESC, ordinal ASC).
+    {
+        const n_rank = reader.retained_rank.len / 4;
+        var prev_retained: u64 = std.math.maxInt(u64);
+        var prev_ordinal: u32 = 0;
+        var k: usize = 0;
+        while (k < n_rank) : (k += 1) {
+            const ord = std.mem.readInt(u32, reader.retained_rank[k * 4 ..][0..4], .little);
+            try std.testing.expect(ord < reader.n_objects);
+            const r = reader.retainedSize(ord);
+            if (k > 0) {
+                try std.testing.expect(r < prev_retained or
+                    (r == prev_retained and ord > prev_ordinal));
+            }
+            prev_retained = r;
+            prev_ordinal = ord;
+        }
+    }
+
+    // Both paths (sidecar first `top` entries vs legacy O(V) scan) must print
+    // byte-identical JSON.
+    for ([_]u32{ 10, 1_000_000 }) |top| {
+        var with_rank = Io.Writer.Allocating.init(allocator);
+        defer with_rank.deinit();
+        try IndexReader.writeRetainers(&reader, &with_rank.writer, .{ .top = top });
+        const fast_output = with_rank.writer.buffer[0..with_rank.writer.end];
+
+        const saved_rank = reader.retained_rank;
+        reader.retained_rank = &.{}; // force the legacy path
+        defer reader.retained_rank = saved_rank;
+
+        var without_rank = Io.Writer.Allocating.init(allocator);
+        defer without_rank.deinit();
+        try IndexReader.writeRetainers(&reader, &without_rank.writer, .{ .top = top });
+        try std.testing.expectEqualSlices(u8, fast_output, without_rank.writer.buffer[0..without_rank.writer.end]);
+    }
 }
 
 fn validateRealDump(
