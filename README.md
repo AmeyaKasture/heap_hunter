@@ -71,7 +71,8 @@ the size of the source dump.
 - **Dominator tree and retained sizes** (`index`): immediate dominator
   tree, dominator order, and retained bytes per object. Stored in
   `dom_parent.bin`, `dom_order.bin`, and `retained.bin`; computed by
-  default and can be skipped with `--no-dominators`.
+  default with the Lengauer-Tarjan algorithm (selectable with
+  `--dominator-algorithm`, skippable with `--no-dominators`).
 
 ### Object queries
 
@@ -350,7 +351,8 @@ JSON error payload inside the content block.
 
 | Option | Description |
 |--------|-------------|
-| `--no-dominators` | Skip the CHK dominator computation. Stale `dom_parent.bin`, `dom_order.bin`, and `retained.bin` files are removed on rebuild. |
+| `--no-dominators` | Skip the dominator computation. Stale `dom_parent.bin`, `dom_order.bin`, and `retained.bin` files are removed on rebuild. |
+| `--dominator-algorithm <chk\|lt>` | Dominator algorithm: `lt` (Lengauer-Tarjan, default; single reverse-preorder pass, O(E log V) worst case) or `chk` (Cooper-Harvey-Kennedy, iterative). |
 | `--dominator-budget-mb <n>` | Memory budget for the dominator stage in MiB. Raises a user error if the stage cannot fit. |
 | `--sorting-budget-mb <n>` | Memory budget for the external-sort catalog stage. |
 | `--force` | Rebuild the index even if a matching one already exists. |
@@ -418,6 +420,7 @@ When a bound cuts the chain short, the output carries `"truncated": true`, match
 | `--max-visited <n>` | `roots` | BFS visit budget for the root search. |
 | `--source <path>` | query commands | Override the path to the original HPROF dump. |
 | `--no-dominators` | `index` | Skip dominator computation and delete stale dominator files. |
+| `--dominator-algorithm <chk\|lt>` | `index` | Dominator algorithm: `lt` (Lengauer-Tarjan, default) or `chk` (Cooper-Harvey-Kennedy). |
 | `--dominator-budget-mb <n>` | `index` | Memory budget (MiB) for the dominator tree computation. |
 
 ### Server
@@ -732,10 +735,21 @@ your numbers will vary with disk and cache state):
 - Output is byte-identical to the sequential scan: catalog rows and
   roots are merged in deterministic worker order, and duplicate
   object ids are deduped by source offset.
-- The dominator stage uses a per-node memory model (~29 B/node plus the
-  DFS stack) and is bounded by `--dominator-budget-mb`. On the
-  `fixtures/heapforge.hprof` sample it rounds to 0 ms in the coarse
-  timing output.
+- The dominator stage defaults to the Lengauer-Tarjan algorithm: one
+  reverse-preorder pass with eval/link path compression, near-linear in
+  practice (O(E log V) worst case) and no iteration cap. The
+  Cooper-Harvey-Kennedy iterative algorithm remains available via
+  `--dominator-algorithm chk`. Both compute the same unique dominator
+  tree and publish byte-identical output files.
+- The stage's anonymous working set is bounded by a per-node model
+  (~41 B/node for LT, ~33 B/node for CHK, plus the DFS stack at 12
+  B/depth and 8 B/depth respectively) and gated by
+  `--dominator-budget-mb`. The CSR and catalog files are demand-paged
+  read-only mappings rather than anonymous reads, so their clean pages
+  evict under memory pressure instead of thrashing; the stage
+  therefore never allocates unbounded anonymous memory regardless of
+  dump size. On the `fixtures/heapforge.hprof` sample the stage rounds
+  to 0 ms in the coarse timing output.
 - Subsequent `histogram`, `classes`, and `info` queries return in
   milliseconds (served from the overview cache).
 - `roots` and `tree` queries run as BFS over the CSR graph; latency
@@ -794,8 +808,9 @@ src/
     dominator/          Dominator algorithm modules
       Backend.zig       Backend interface and options
       Chk.zig           Cooper-Harvey-Kennedy (CHK) algorithm
+      Lt.zig            Lengauer-Tarjan (LT) algorithm, default backend
       CsrView.zig       CSR read-only view
-      Numbering.zig     Iterative DFS / reverse postorder
+      Numbering.zig     Iterative DFS / reverse postorder / preorder slots
     Preflight.zig       Pre-index validation
     Publish.zig         Index publication
     Validate.zig        Post-build validation
