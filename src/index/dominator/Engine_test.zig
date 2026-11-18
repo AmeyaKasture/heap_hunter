@@ -10,6 +10,10 @@ const TestSupport = @import("TestSupport.zig");
 
 const NONE = std.math.maxInt(u32);
 
+/// Every engine test runs against every backend, so a new algorithm has to
+/// pass the whole matrix before it ships.
+const algorithms = [_]Backend.Algorithm{ .chk, .lt };
+
 const EngineOracleResult = struct {
     engine: TestSupport.EngineOutput,
     oracle: []u32,
@@ -23,6 +27,23 @@ fn runEngineAndOracle(
     graph: Graphs.Graph,
 ) !EngineOracleResult {
     return runEngineAndOracleWithOptions(allocator, io, tmp_path, graph, .{});
+}
+
+/// Runs the engine once per backend and checks the oracle agreement for
+/// each. Per-iteration `defer`s keep the cleanup local to one algorithm.
+fn runEngineAndOracleAllBackends(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tmp_path: []const u8,
+    graph: Graphs.Graph,
+) !void {
+    for (algorithms) |algo| {
+        var both = try runEngineAndOracleWithOptions(allocator, io, tmp_path, graph, .{ .algorithm = algo });
+        defer both.engine.deinit(allocator);
+        defer allocator.free(both.oracle);
+        defer allocator.free(both.logical_idom);
+        try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    }
 }
 
 fn runEngineAndOracleWithOptions(
@@ -81,12 +102,7 @@ test "dominator oracle agrees with engine on a linear chain" {
     var graph = try Graphs.linearChain(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator oracle agrees with engine on a diamond" {
@@ -100,12 +116,7 @@ test "dominator oracle agrees with engine on a diamond" {
     var graph = try Graphs.diamond(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator oracle agrees with engine on two roots into one object" {
@@ -119,12 +130,7 @@ test "dominator oracle agrees with engine on two roots into one object" {
     var graph = try Graphs.twoRootsIntoOne(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator oracle agrees with engine on a reference cycle" {
@@ -138,12 +144,7 @@ test "dominator oracle agrees with engine on a reference cycle" {
     var graph = try Graphs.cycle(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator oracle agrees with engine on a self loop" {
@@ -157,12 +158,7 @@ test "dominator oracle agrees with engine on a self loop" {
     var graph = try Graphs.selfLoop(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator oracle agrees with engine with an unreachable island" {
@@ -176,12 +172,7 @@ test "dominator oracle agrees with engine with an unreachable island" {
     var graph = try Graphs.unreachableIsland(allocator, 0);
     defer graph.deinit(allocator);
 
-    var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
-    defer both.engine.deinit(allocator);
-    defer allocator.free(both.oracle);
-    defer allocator.free(both.logical_idom);
-
-    try std.testing.expectEqualSlices(u32, both.oracle, both.logical_idom);
+    try runEngineAndOracleAllBackends(allocator, io, tmp_path, graph);
 }
 
 test "dominator engine produces identical output across repeated runs" {
@@ -195,15 +186,17 @@ test "dominator engine produces identical output across repeated runs" {
     var graph = try Graphs.diamondLadder(allocator, 0);
     defer graph.deinit(allocator);
 
-    var first = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{});
-    defer first.deinit(allocator);
+    for (algorithms) |algo| {
+        var first = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = algo });
+        defer first.deinit(allocator);
 
-    var second = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{});
-    defer second.deinit(allocator);
+        var second = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = algo });
+        defer second.deinit(allocator);
 
-    try std.testing.expectEqualSlices(u32, first.dom_parent, second.dom_parent);
-    try std.testing.expectEqualSlices(u32, first.dom_order, second.dom_order);
-    try std.testing.expectEqualSlices(u64, first.retained, second.retained);
+        try std.testing.expectEqualSlices(u32, first.dom_parent, second.dom_parent);
+        try std.testing.expectEqualSlices(u32, first.dom_order, second.dom_order);
+        try std.testing.expectEqualSlices(u64, first.retained, second.retained);
+    }
 }
 
 test "dominator shortcut does not change the answer" {
@@ -239,18 +232,20 @@ test "dominator result does not depend on the edge order" {
     var graph = try Graphs.randomGraph(allocator, 20, 40, 123);
     defer graph.deinit(allocator);
 
-    var baseline = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{});
-    defer baseline.deinit(allocator);
+    for (algorithms) |algo| {
+        var baseline = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = algo });
+        defer baseline.deinit(allocator);
 
-    // Shuffle the edge array in-place with a different seed.
-    var prng = std.Random.DefaultPrng.init(456);
-    prng.random().shuffle(Graphs.Edge, graph.edges);
+        // Shuffle the edge array in-place with a different seed.
+        var prng = std.Random.DefaultPrng.init(456);
+        prng.random().shuffle(Graphs.Edge, graph.edges);
 
-    var shuffled = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{});
-    defer shuffled.deinit(allocator);
+        var shuffled = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = algo });
+        defer shuffled.deinit(allocator);
 
-    try std.testing.expectEqualSlices(u32, baseline.dom_parent, shuffled.dom_parent);
-    try std.testing.expectEqualSlices(u64, baseline.retained, shuffled.retained);
+        try std.testing.expectEqualSlices(u32, baseline.dom_parent, shuffled.dom_parent);
+        try std.testing.expectEqualSlices(u64, baseline.retained, shuffled.retained);
+    }
 }
 
 test "dominator relation survives a renumbering of the ordinals" {
@@ -261,10 +256,24 @@ test "dominator relation survives a renumbering of the ordinals" {
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_path);
 
+    // LT keeps its scratch arrays in preorder-slot space, a relabeling of
+    // the ordinals; running it over a permuted graph is exactly the check
+    // that the relabeling is semantics-neutral.
+    for (algorithms) |algo| {
+        try renumberingCase(allocator, io, tmp_path, .{ .algorithm = algo });
+    }
+}
+
+fn renumberingCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tmp_path: []const u8,
+    options: Backend.Options,
+) !void {
     var graph = try Graphs.randomGraph(allocator, 20, 40, 789);
     defer graph.deinit(allocator);
 
-    var original = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{});
+    var original = try TestSupport.runEngine(allocator, io, tmp_path, graph, options);
     defer original.deinit(allocator);
 
     // Build a random permutation of ordinals 0..V-1 that keeps the root fixed.
@@ -301,7 +310,7 @@ test "dominator relation survives a renumbering of the ordinals" {
         .shallow = new_shallow,
     };
 
-    var remapped = try TestSupport.runEngine(allocator, io, tmp_path, remapped_graph, .{});
+    var remapped = try TestSupport.runEngine(allocator, io, tmp_path, remapped_graph, options);
     defer remapped.deinit(allocator);
     const remapped_idom = try toLogicalIdom(allocator, remapped.dom_parent, remapped.dom_order, V);
     defer allocator.free(remapped_idom);
@@ -328,6 +337,17 @@ test "dominator engine satisfies the dominator property set on random graphs" {
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_path);
 
+    for (algorithms) |algo| {
+        try randomGraphPropertyCase(allocator, io, tmp_path, .{ .algorithm = algo });
+    }
+}
+
+fn randomGraphPropertyCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tmp_path: []const u8,
+    options: Backend.Options,
+) !void {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const random = prng.random();
 
@@ -340,7 +360,7 @@ test "dominator engine satisfies the dominator property set on random graphs" {
         var graph = try Graphs.randomGraph(allocator, n, m, seed);
         defer graph.deinit(allocator);
 
-        var both = try runEngineAndOracle(allocator, io, tmp_path, graph);
+        var both = try runEngineAndOracleWithOptions(allocator, io, tmp_path, graph, options);
         defer both.engine.deinit(allocator);
         defer allocator.free(both.oracle);
         defer allocator.free(both.logical_idom);
@@ -466,4 +486,75 @@ fn checkProperties(
         }
         try std.testing.expectEqual(engine.retained[v], graph.shallow[v] + child_sum);
     }
+}
+
+test "lt and chk produce identical dominator output across the shape catalogue" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var graphs = try Graphs.catalogue(allocator, 0xa11ce);
+    defer Graphs.deinitCatalogue(allocator, &graphs);
+
+    for (graphs) |graph| {
+        var chk = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = .chk });
+        defer chk.deinit(allocator);
+        var lt = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = .lt });
+        defer lt.deinit(allocator);
+
+        // dom_order comes from the shared DFS, so it must be byte-identical;
+        // dom_parent and retained must agree because the dominator tree is
+        // unique — two algorithms, one answer.
+        try std.testing.expectEqualSlices(u32, chk.dom_order, lt.dom_order);
+        try std.testing.expectEqualSlices(u32, chk.dom_parent, lt.dom_parent);
+        try std.testing.expectEqualSlices(u64, chk.retained, lt.retained);
+    }
+}
+
+test "lt backend handles a deep chain without recursion" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // A 200k-node chain (root -> 0 -> 1 -> ... -> 199999): the DFS stack,
+    // the eval path buffer, and the bucket chain all scale with the depth.
+    // The oracle is quadratic in memory, so this test checks structural
+    // invariants instead.
+    const n: u32 = 200_000;
+    const n_nodes: u32 = n + 1;
+    const root = n_nodes - 1;
+
+    var edges = try allocator.alloc(Graphs.Edge, n);
+    defer allocator.free(edges);
+    edges[0] = .{ .source = root, .target = 0 };
+    for (1..n) |i| {
+        edges[i] = .{ .source = @intCast(i - 1), .target = @intCast(i) };
+    }
+    const shallow = try allocator.alloc(u32, n);
+    defer allocator.free(shallow);
+    @memset(shallow, 1);
+
+    const graph = Graphs.Graph{ .n_nodes = n_nodes, .edges = edges, .shallow = shallow };
+
+    var output = try TestSupport.runEngine(allocator, io, tmp_path, graph, .{ .algorithm = .lt });
+    defer output.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, n_nodes), output.dom_order.len);
+
+    // The chain is the dominator tree: object 0 hangs off the virtual root,
+    // every other object off its predecessor, so object i retains the
+    // n - i objects from i to the end, and the root retains everything.
+    try std.testing.expectEqual(NONE, output.dom_parent[0]);
+    try std.testing.expectEqual(@as(u64, n), output.retained[0]);
+    for (1..n) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i - 1)), output.dom_parent[i]);
+        try std.testing.expectEqual(@as(u64, n - i), output.retained[i]);
+    }
+    try std.testing.expectEqual(@as(u64, n), output.retained[root]);
 }

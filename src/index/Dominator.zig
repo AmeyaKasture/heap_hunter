@@ -7,6 +7,7 @@ const CsrView = @import("dominator/CsrView.zig").CsrView;
 const Graphs = @import("dominator/Graphs.zig");
 const Numbering = @import("dominator/Numbering.zig");
 const Chk = @import("dominator/Chk.zig");
+const Lt = @import("dominator/Lt.zig");
 const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
@@ -60,10 +61,13 @@ pub fn run(
     const V = n_objects + 1;
     const root: u32 = @intCast(V - 1);
 
-    // 1. Budget pre-check (conservative: stack depth = V).
+    // 1. Budget pre-check (conservative: stack depth = V). LT adds the
+    // eval path-compression buffer on top of the DFS stack, both bounded
+    // by the DFS depth.
     const budget_bytes = job.dominator_budget_bytes;
-    const bytes_per_node = chkBytesPerNode();
-    const conservative_stack = @as(u64, V) * 8;
+    const bytes_per_node = bytesPerNode(options.algorithm);
+    const stack_bytes_per_node: u64 = if (options.algorithm == .lt) 12 else 8;
+    const conservative_stack = @as(u64, V) * stack_bytes_per_node;
     const required_conservative = checkedMulAdd(V, bytes_per_node, conservative_stack) catch return error.DominatorInternalError;
     if (required_conservative > budget_bytes) {
         return error.DominatorBudgetExceeded;
@@ -88,12 +92,16 @@ pub fn run(
     try out_view.validate();
     try in_view.validate();
 
-    // 4. Shared DFS.
-    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view, .{});
+    // 4. Shared DFS. LT consumes the DFS tree (preorder slots and parents);
+    // CHK consumes the reverse postorder numbering.
+    const numbering_options: Numbering.Options = .{
+        .emit_dfs_tree = options.algorithm == .lt,
+    };
+    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view, numbering_options);
     defer numbering.deinit(allocator);
 
-    // 5. Budget re-check with real depth.
-    const real_stack = @as(u64, numbering.max_depth) * 8;
+    // 5. Budget re-check with the real depth.
+    const real_stack = @as(u64, numbering.max_depth) * stack_bytes_per_node;
     const required_real = checkedMulAdd(V, bytes_per_node, real_stack) catch return error.DominatorInternalError;
     if (required_real > budget_bytes) {
         return error.DominatorBudgetExceeded;
@@ -108,12 +116,23 @@ pub fn run(
         .rpo_num = numbering.rpo_num,
         .rpo_vertex = numbering.rpo_vertex,
         .reachable = numbering.reachable,
+        .dfn = numbering.dfn,
+        .dfn_vertex = numbering.dfn_vertex,
+        .parent = numbering.parent,
+        .max_dfs_depth = numbering.max_depth,
         .options = options,
         .out_edges = &out_view,
         .in_edges = &in_view,
     };
-    const backend_result = try Chk.compute(&ctx);
+    const backend_result = switch (options.algorithm) {
+        .chk => try Chk.compute(&ctx),
+        .lt => try Lt.compute(&ctx),
+    };
     defer allocator.free(backend_result.idom);
+
+    // The DFS-tree products are dead once the backend has spoken; freeing
+    // them now keeps the orchestrator phase from stacking on top of them.
+    numbering.releaseDfsTree(allocator);
 
     // 7. Read shallow sizes from catalog.
     const catalog_data = try Io.Dir.cwd().readFileAlloc(io, catalog_path, allocator, .unlimited);
@@ -213,14 +232,23 @@ pub fn formatBudgetError(V: u64, required: u64, budget: usize, writer: anytype) 
     try writer.print("       raise it with --dominator-budget-mb, or index with --no-dominators\n", .{});
 }
 
-pub fn chkBytesPerNode() u64 {
-    return 4 + // rpo_num
-        4 + // rpo_vertex
-        4 + // idom
-        4 + // sole_pred
-        4 + // shallow
-        8 + // retained
-        1; // reachable
+/// Anonymous bytes per node the stage's peak phase needs, by algorithm.
+/// The model must cover every phase's live arrays, including the
+/// orchestrator's (which is why `shallow` counts 8, not 4).
+pub fn bytesPerNode(algorithm: Backend.Algorithm) u64 {
+    return switch (algorithm) {
+        // Backend phase: rpo_num 4 + rpo_vertex 4 + reachable 1 +
+        // idom 4 + sole_pred 4 = 17. Orchestrator phase (rpo_num is freed
+        // only at scope end): rpo_num 4 + rpo_vertex 4 + reachable 1 +
+        // idom 4 + shallow 8 + retained 8 + dom_parent 4 = 33.
+        .chk => 4 + 4 + 1 + 4 + 8 + 8 + 4,
+        // Main-loop phase (peak): rpo_vertex 4 + dfn 4 + dfn_vertex 4 +
+        // parent 4 + reachable 1 + sdom 4 + doms 4 + anc 4 + label 4 +
+        // bucket_head 4 + bucket_next 4 = 41. The backend frees its
+        // scratch before returning and the orchestrator releases the
+        // DFS-tree products, so its phase is 29.
+        .lt => 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 4,
+    };
 }
 
 fn writeU32File(io: Io, path: []const u8, values: []const u32) !void {
@@ -626,9 +654,16 @@ test "dominator engine reports the required bytes and budget when over budget" {
 
 test "declared budget figure is at least the real allocation" {
     const V: u64 = 1_000_000;
-    const real_arrays = V * chkBytesPerNode();
-    const real_stack = V * 8; // worst-case DFS depth
-    const real_total = real_arrays + real_stack;
-    const declared = V * (chkBytesPerNode() + 8);
-    try std.testing.expect(declared >= real_total);
+    for ([_]Backend.Algorithm{ .chk, .lt }) |algorithm| {
+        const bytes_per_node = bytesPerNode(algorithm);
+        const stack_bytes_per_node: u64 = if (algorithm == .lt) 12 else 8;
+        const real_total = V * (bytes_per_node + stack_bytes_per_node);
+        const declared = V * (bytesPerNode(algorithm) + stack_bytes_per_node);
+        try std.testing.expect(declared >= real_total);
+        // The declared per-node figure also covers each phase's arrays:
+        // CHK backend 17, CHK orchestrator 33, LT main loop 41,
+        // LT orchestrator 29.
+        try std.testing.expect(bytes_per_node >= 17);
+        try std.testing.expect(bytes_per_node >= 33);
+    }
 }

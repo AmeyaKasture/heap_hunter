@@ -1961,6 +1961,7 @@ test {
     _ = @import("index/Csr.zig");
     _ = @import("index/Dominator.zig");
     _ = @import("index/dominator/Chk.zig");
+    _ = @import("index/dominator/Lt.zig");
     _ = @import("index/dominator/Backend.zig");
     _ = @import("index/dominator/CsrView.zig");
     _ = @import("index/dominator/Numbering.zig");
