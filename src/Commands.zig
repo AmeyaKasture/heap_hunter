@@ -31,6 +31,8 @@ pub const IndexOptions = struct {
     no_progress: bool = false,
     compute_dominators: bool = true,
     dominator_budget_mb: ?u32 = null,
+    /// "chk" or "lt"; null falls back to the config default.
+    dominator_algorithm: ?[]const u8 = null,
     profile: bool = false,
 };
 
@@ -64,6 +66,11 @@ pub fn runIndexCommand(
     const sorting_budget_mb = options.sorting_budget_mb orelse config.sortingBudgetMb();
     const compute_dominators = options.compute_dominators;
     const dominator_budget_mb = options.dominator_budget_mb orelse config.dominatorBudgetMb();
+    const dominator_algorithm_name = options.dominator_algorithm orelse config.dominatorAlgorithm();
+    const dominator_algorithm = Dominator.parseAlgorithmName(dominator_algorithm_name) orelse {
+        try Cli.printError(stderr, "unknown dominator algorithm '{s}' (expected chk or lt)", .{dominator_algorithm_name});
+        return error.InvalidArgument;
+    };
     const force = options.force;
     const no_progress = options.no_progress;
 
@@ -260,11 +267,14 @@ pub fn runIndexCommand(
             var dominator_total_retained: u64 = 0;
             var dominator_iterations: u32 = 0;
             var dominator_shortcut_nodes: u64 = 0;
+            var dominator_eval_calls: u64 = 0;
+            var dominator_compress_steps: u64 = 0;
             if (compute_dominators) {
                 progress.nextStep("computing dominators");
                 log.debug("stage: computing dominators", .{});
                 const V = catalog_result.n_objects + 1;
-                const required_conservative: u64 = @intCast(@as(u128, Dominator.bytesPerNode(.chk)) * V + 8 * V);
+                const stack_bytes_per_node: u64 = if (dominator_algorithm == .lt) 12 else 8;
+                const required_conservative: u64 = @intCast(@as(u128, Dominator.bytesPerNode(dominator_algorithm)) * V + stack_bytes_per_node * V);
                 var dominator_result = blk: {
                     var span = profiling.begin(io, "dominators");
                     defer span.end(io);
@@ -280,7 +290,7 @@ pub fn runIndexCommand(
                         catalog_result.n_objects,
                         join_result.n_edges,
                         &scan_result.diagnostics,
-                        .{},
+                        .{ .algorithm = dominator_algorithm },
                     ) catch |err| {
                         if (err == error.DominatorBudgetExceeded) {
                             Dominator.formatBudgetError(V, required_conservative, job.dominator_budget_bytes, stderr) catch {};
@@ -294,6 +304,8 @@ pub fn runIndexCommand(
                 dominator_total_retained = dominator_result.total_retained_bytes;
                 dominator_iterations = dominator_result.stats.iterations;
                 dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
+                dominator_eval_calls = dominator_result.stats.eval_calls;
+                dominator_compress_steps = dominator_result.stats.compress_steps;
             }
 
             progress.nextStep("validating index");
@@ -324,6 +336,7 @@ pub fn runIndexCommand(
                 .diagnostics = scan_result.diagnostics,
                 .source_path = try allocator.dupe(u8, path),
                 .has_dominators = compute_dominators,
+                .dominator_algorithm = try allocator.dupe(u8, @tagName(dominator_algorithm)),
                 .n_dominator_nodes = dominator_n_reachable,
                 .retained_total_bytes = dominator_total_retained,
             };
@@ -347,8 +360,10 @@ pub fn runIndexCommand(
 
             progress.stop("index complete");
             log.debug("index complete: n_objects={d}, n_classes={d}, n_edges={d}, n_roots={d}", .{ n_objects, n_classes, n_edges, n_roots });
-            const dominator_algorithm = if (compute_dominators) "chk" else "none";
-            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"dominator_algorithm\":\"{s}\",\"dominator_iterations\":{d},\"dominator_shortcut_nodes\":{d},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
+            // Split into two prints: Zig format calls take at most 32
+            // arguments, and the single-JSON-object output would exceed that.
+            const dominator_algorithm_label = if (compute_dominators) @tagName(dominator_algorithm) else "none";
+            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"dominator_algorithm\":\"{s}\",\"dominator_iterations\":{d},\"dominator_shortcut_nodes\":{d},\"dominator_eval_calls\":{d},\"dominator_compress_steps\":{d},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}}", .{
                 escaped_index_dir,
                 n_objects,
                 n_classes,
@@ -356,9 +371,11 @@ pub fn runIndexCommand(
                 n_roots,
                 virtual_root_ordinal,
                 compute_dominators,
-                dominator_algorithm,
+                dominator_algorithm_label,
                 dominator_iterations,
                 dominator_shortcut_nodes,
+                dominator_eval_calls,
+                dominator_compress_steps,
                 dominator_n_reachable,
                 dominator_total_retained,
                 scan_result.diagnostics.duplicate_object_ids,
@@ -371,6 +388,8 @@ pub fn runIndexCommand(
                 scan_result.diagnostics.missing_layout,
                 scan_result.diagnostics.dangling_root_targets,
                 scan_result.diagnostics.unreachable_objects,
+            });
+            try stdout.print(",\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
                 elapsed.scan,
                 elapsed.sort_catalog,
                 elapsed.layouts,
@@ -527,6 +546,7 @@ pub fn parseIndexArgs(
     var index_dir_opt: ?[]const u8 = null;
     var sorting_budget_mb: ?u32 = null;
     var dominator_budget_mb: ?u32 = null;
+    var dominator_algorithm: ?[]const u8 = null;
     var compute_dominators = true;
     var force = false;
     var no_progress = false;
@@ -550,6 +570,14 @@ pub fn parseIndexArgs(
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
             dominator_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--dominator-algorithm")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            if (Dominator.parseAlgorithmName(value) == null) {
+                try Cli.printError(stderr, "unknown dominator algorithm '{s}' (expected chk or lt)", .{value});
+                return error.InvalidArgument;
+            }
+            dominator_algorithm = value;
         } else if (std.mem.eql(u8, arg, "--no-dominators")) {
             compute_dominators = false;
         } else if (std.mem.eql(u8, arg, "--force")) {
@@ -583,6 +611,7 @@ pub fn parseIndexArgs(
         .no_progress = no_progress,
         .compute_dominators = compute_dominators,
         .dominator_budget_mb = dominator_budget_mb,
+        .dominator_algorithm = dominator_algorithm,
         .profile = profile,
     };
 }

@@ -15,6 +15,9 @@ const TestSupport = @import("dominator/TestSupport.zig");
 
 pub const NONE = std.math.maxInt(u32);
 
+/// Parses a user-facing algorithm name; see Backend.parseAlgorithm.
+pub const parseAlgorithmName = Backend.parseAlgorithm;
+
 pub const dom_parent_entry_size = 4;
 pub const dom_order_entry_size = 4;
 pub const retained_entry_size = 8;

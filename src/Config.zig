@@ -39,8 +39,13 @@ pub const Config = struct {
     /// Default dominator computation budget in megabytes.
     @"dominator-budget-mb": ?u32 = null,
 
+    /// Default dominator algorithm: "lt" (Lengauer-Tarjan) or "chk"
+    /// (Cooper-Harvey-Kennedy).
+    @"dominator-algorithm": ?[]const u8 = null,
+
     pub const default_sorting_budget_mb: u32 = 4096;
     pub const default_dominator_budget_mb: u32 = 4096;
+    pub const default_dominator_algorithm: []const u8 = "lt";
 
     pub fn indexDir(self: Config) ?[]const u8 {
         return self.@"index-dir";
@@ -54,8 +59,13 @@ pub const Config = struct {
         return self.@"dominator-budget-mb" orelse default_dominator_budget_mb;
     }
 
+    pub fn dominatorAlgorithm(self: Config) []const u8 {
+        return self.@"dominator-algorithm" orelse default_dominator_algorithm;
+    }
+
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
         if (self.@"index-dir") |p| allocator.free(p);
+        if (self.@"dominator-algorithm") |a| allocator.free(a);
     }
 
     pub const LoadError = error{
@@ -150,6 +160,9 @@ pub const Config = struct {
         }
         if (parsed.value.@"dominator-budget-mb") |mb| {
             config.@"dominator-budget-mb" = mb;
+        }
+        if (parsed.value.@"dominator-algorithm") |a| {
+            config.@"dominator-algorithm" = try allocator.dupe(u8, a);
         }
         result.config = config;
         return result;

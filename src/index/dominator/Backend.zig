@@ -4,6 +4,14 @@ const CsrView = @import("CsrView.zig").CsrView;
 
 pub const Algorithm = enum { chk, lt };
 
+/// Parses a user-facing algorithm name ("chk" | "lt"). Returns null for any
+/// other spelling so the CLI can report the raw input.
+pub fn parseAlgorithm(name: []const u8) ?Algorithm {
+    if (std.mem.eql(u8, name, "chk")) return .chk;
+    if (std.mem.eql(u8, name, "lt")) return .lt;
+    return null;
+}
+
 pub const Stats = struct {
     iterations: u32 = 0,
     nodes_changed: u64 = 0,

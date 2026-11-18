@@ -23,7 +23,6 @@ pub fn compute(ctx: *const Context) anyerror!Result {
     const n = ctx.n_reachable;
     const root_slot: u32 = 0; // The DFS discovers the virtual root first.
     std.debug.assert(ctx.dfn[ctx.root] == root_slot);
-    std.debug.assert(ctx.max_dfs_depth > 0);
 
     const dfn = ctx.dfn; // ordinal -> slot (NONE when unreachable)
     const dfn_vertex = ctx.dfn_vertex; // slot -> ordinal
@@ -73,10 +72,14 @@ pub fn compute(ctx: *const Context) anyerror!Result {
 
     // Reused path buffer for eval's iterative compression. A forest chain
     // is a sub-path of a root-to-node DFS tree path, so the DFS depth caps
-    // it; reserving that bound up front keeps eval infallible.
+    // it; reserving that bound up front keeps eval infallible. A graph with
+    // no reachable object besides the root has depth 0 and never calls
+    // eval, so the reservation is skipped.
     var path = std.ArrayList(u32).empty;
     defer path.deinit(allocator);
-    try path.ensureTotalCapacity(allocator, ctx.max_dfs_depth);
+    if (ctx.max_dfs_depth > 0) {
+        try path.ensureTotalCapacity(allocator, ctx.max_dfs_depth);
+    }
 
     var stats: Stats = .{};
 

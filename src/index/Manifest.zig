@@ -71,6 +71,10 @@ pub const IndexManifest = struct {
     source_path: ?[]const u8 = null,
     /// True when the index was built with dominator data.
     has_dominators: bool = false,
+    /// Dominator algorithm used to build this index ("lt" or "chk").
+    /// Defaults to "chk" so manifests written before the field existed
+    /// still describe themselves accurately.
+    dominator_algorithm: []const u8 = "chk",
     /// Number of nodes reachable from the virtual root when dominators were computed.
     n_dominator_nodes: u64 = 0,
     /// Total retained bytes for the reachable heap when dominators were computed.
@@ -83,6 +87,7 @@ pub const IndexManifest = struct {
         }
         if (self.files.len > 0) allocator.free(self.files);
         if (self.source_path) |p| allocator.free(p);
+        allocator.free(self.dominator_algorithm);
     }
 
     pub fn clone(self: IndexManifest, allocator: std.mem.Allocator) !IndexManifest {
@@ -104,6 +109,7 @@ pub const IndexManifest = struct {
             .files = files,
             .source_path = if (self.source_path) |p| try allocator.dupe(u8, p) else null,
             .has_dominators = self.has_dominators,
+            .dominator_algorithm = try allocator.dupe(u8, self.dominator_algorithm),
             .n_dominator_nodes = self.n_dominator_nodes,
             .retained_total_bytes = self.retained_total_bytes,
         };
