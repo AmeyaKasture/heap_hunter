@@ -1,8 +1,24 @@
 //! Developer-only dominator benchmark harness.
 //!
 //! Usage:
-//!   zig build bench -- dominator --dump <path.hprof> --cache cold|warm --json out.json
+//!   zig build bench -- dominator --dump <path.hprof> --algorithm chk|lt|both
+//!       --cache cold|warm --json out.json
+//!
+//! Per algorithm this reports two measurements:
+//!   * `backend_ms`: the backend alone, running on CSR data already read
+//!     into RAM. Isolates the algorithm from I/O and page-fault noise.
+//!   * `stage_ms`: the production `Dominator.run` path, including the
+//!     demand-paged CSR/catalog mappings, the retained sweep, and the
+//!     output writes. `minor_faults` / `major_faults` deltas around this
+//!     pass feed the in-CSR re-fault escalation decision documented in
+//!     Dominator.zig (prefault in_offsets vs. dfn-ordered pred array):
+//!     a cold-vs-warm `stage_ms` ratio near 1 and near-zero major faults
+//!     mean the page cache absorbed the pass and no escalation is worth
+//!     its memory. `--cache cold` drops the stage files from the page
+//!     cache (fadvise DONTNEED) before each stage pass so the two runs
+//!     are actually comparable.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const Backend = @import("Backend.zig");
@@ -10,10 +26,21 @@ const Chk = @import("Chk.zig");
 const Commands = @import("../../Commands.zig");
 const Config = @import("../../Config.zig").Config;
 const CsrView = @import("CsrView.zig").CsrView;
+const Dominator = @import("../Dominator.zig");
+const Lt = @import("Lt.zig");
 const Manifest = @import("../Manifest.zig");
 const Numbering = @import("Numbering.zig");
+const Preflight = @import("../Preflight.zig");
 
 const NONE = std.math.maxInt(u32);
+
+const stage_file_names = [_][]const u8{
+    "out_offsets.bin",
+    "out_targets.bin",
+    "in_offsets.bin",
+    "in_sources.bin",
+    "catalog.bin",
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -23,6 +50,7 @@ pub fn main(init: std.process.Init) !void {
     var dump_path: ?[]const u8 = null;
     var json_path: ?[]const u8 = null;
     var cache_mode: []const u8 = "warm";
+    var algorithm_arg: []const u8 = "both";
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -39,17 +67,31 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             cache_mode = args[i];
+        } else if (std.mem.eql(u8, arg, "--algorithm")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            algorithm_arg = args[i];
         }
     }
 
     const dump = dump_path orelse {
-        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--cache cold|warm]\n", .{});
+        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm]\n", .{});
         return error.InvalidArgument;
     };
     const out_path = json_path orelse {
-        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--cache cold|warm]\n", .{});
+        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm]\n", .{});
         return error.InvalidArgument;
     };
+    var algorithms: [2]bool = .{ true, true }; // [chk, lt]
+    if (std.mem.eql(u8, algorithm_arg, "chk")) {
+        algorithms = .{ true, false };
+    } else if (std.mem.eql(u8, algorithm_arg, "lt")) {
+        algorithms = .{ false, true };
+    } else if (!std.mem.eql(u8, algorithm_arg, "both")) {
+        std.debug.print("unknown --algorithm '{s}' (expected chk, lt, or both)\n", .{algorithm_arg});
+        return error.InvalidArgument;
+    }
+    const cold = std.mem.eql(u8, cache_mode, "cold");
 
     const index_dir = try std.fs.path.join(allocator, &.{ "/tmp", "bench_dominator" });
     defer allocator.free(index_dir);
@@ -63,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 
     const V = manifest.n_objects + 1;
 
-    // Read CSR into memory.
+    // Read CSR into memory for the backend-isolated measurement.
     const out_offsets = try readFileBytes(allocator, io, index_dir, "out_offsets.bin");
     defer allocator.free(out_offsets);
     const out_targets = try readFileBytes(allocator, io, index_dir, "out_targets.bin");
@@ -76,7 +118,19 @@ pub fn main(init: std.process.Init) !void {
     const out_view = CsrView.init(@intCast(V), out_offsets, out_targets);
     const in_view = CsrView.init(@intCast(V), in_offsets, in_sources);
 
-    const timing = try runMeasurement(allocator, io, V, &out_view, &in_view);
+    var chk_timing: ?Timing = null;
+    var lt_timing: ?Timing = null;
+    var chk_stage: ?StageTiming = null;
+    var lt_stage: ?StageTiming = null;
+
+    if (algorithms[0]) {
+        chk_timing = try runMeasurement(allocator, io, V, &out_view, &in_view, .chk);
+        chk_stage = try runStageMeasurement(allocator, io, index_dir, dump, manifest, .chk, cold);
+    }
+    if (algorithms[1]) {
+        lt_timing = try runMeasurement(allocator, io, V, &out_view, &in_view, .lt);
+        lt_stage = try runStageMeasurement(allocator, io, index_dir, dump, manifest, .lt, cold);
+    }
 
     // In-degree histogram over distinct reachable predecessors.
     const histogram = try computeInDegreeHistogram(allocator, @intCast(V), &out_view, &in_view);
@@ -90,22 +144,46 @@ pub fn main(init: std.process.Init) !void {
     try writer.interface.print("  \"dump\": \"{s}\",\n", .{dump});
     try writer.interface.print("  \"n_objects\": {d},\n", .{manifest.n_objects});
     try writer.interface.print("  \"n_edges\": {d},\n", .{manifest.n_edges});
-    try writer.interface.print("  \"n_reachable\": {d},\n", .{timing.n_reachable});
-    try writer.interface.print("  \"max_dfs_depth\": {d},\n", .{timing.max_depth});
+    try writer.interface.print("  \"max_dfs_depth\": {d},\n", .{if (chk_timing) |t| t.max_depth else lt_timing.?.max_depth});
     try writer.interface.print("  \"in_degree_histogram\": {{ \"0\": {d}, \"1\": {d}, \"2\": {d}, \"3+\": {d} }},\n", .{
         histogram[0], histogram[1], histogram[2], histogram[3],
     });
-    try writer.interface.print("  \"chk_iterations\": {d},\n", .{timing.stats.iterations});
-    try writer.interface.print("  \"nodes_changed\": {d},\n", .{timing.stats.nodes_changed});
-    try writer.interface.print("  \"edges_processed\": {d},\n", .{timing.stats.edges_processed});
-    try writer.interface.print("  \"intersect_steps_total\": {d},\n", .{timing.stats.intersect_steps_total});
-    try writer.interface.print("  \"intersect_steps_max\": {d},\n", .{timing.stats.intersect_steps_max});
-    try writer.interface.print("  \"shortcut_nodes\": {d},\n", .{timing.stats.shortcut_nodes});
-    try writer.interface.print("  \"stage_ms\": {{ \"dfs\": {d}, \"sweeps\": {d}, \"total\": {d} }},\n", .{ timing.dfs_ms, timing.sweeps_ms, timing.total_ms });
-    try writer.interface.print("  \"peak_rss_bytes\": {d},\n", .{timing.peak_rss});
+    if (chk_timing) |t| {
+        try writeBackendBlock(&writer.interface, "chk", t, chk_stage.?);
+    }
+    if (lt_timing) |t| {
+        try writeBackendBlock(&writer.interface, "lt", t, lt_stage.?);
+    }
+    try writer.interface.print("  \"peak_rss_bytes\": {d},\n", .{getPeakRss()});
     try writer.interface.print("  \"cache_mode\": \"{s}\"\n", .{cache_mode});
     try writer.interface.print("}}\n", .{});
     try writer.flush();
+}
+
+fn writeBackendBlock(
+    writer: *Io.Writer,
+    name: []const u8,
+    timing: Timing,
+    stage: StageTiming,
+) !void {
+    try writer.print("  \"{s}\": {{\n", .{name});
+    try writer.print("    \"n_reachable\": {d},\n", .{timing.n_reachable});
+    // CHK sweep statistics.
+    try writer.print("    \"chk_iterations\": {d},\n", .{timing.stats.iterations});
+    try writer.print("    \"nodes_changed\": {d},\n", .{timing.stats.nodes_changed});
+    try writer.print("    \"shortcut_nodes\": {d},\n", .{timing.stats.shortcut_nodes});
+    try writer.print("    \"intersect_steps_total\": {d},\n", .{timing.stats.intersect_steps_total});
+    try writer.print("    \"intersect_steps_max\": {d},\n", .{timing.stats.intersect_steps_max});
+    // LT eval/link statistics.
+    try writer.print("    \"eval_calls\": {d},\n", .{timing.stats.eval_calls});
+    try writer.print("    \"compress_steps\": {d},\n", .{timing.stats.compress_steps});
+    try writer.print("    \"compress_steps_max\": {d},\n", .{timing.stats.compress_steps_max});
+    try writer.print("    \"edges_processed\": {d},\n", .{timing.stats.edges_processed});
+    try writer.print("    \"backend_ms\": {{ \"dfs\": {d}, \"sweeps\": {d}, \"total\": {d} }},\n", .{ timing.dfs_ms, timing.sweeps_ms, timing.total_ms });
+    try writer.print("    \"stage_ms\": {d},\n", .{stage.stage_ms});
+    try writer.print("    \"stage_faults\": {{ \"minor\": {d}, \"major\": {d} }},\n", .{ stage.minor_faults, stage.major_faults });
+    try writer.print("    \"stage_n_reachable\": {d}\n", .{stage.n_reachable});
+    try writer.print("  }},\n", .{});
 }
 
 fn runHuntIndex(
@@ -167,6 +245,26 @@ const Timing = struct {
     peak_rss: u64,
 };
 
+const StageTiming = struct {
+    stage_ms: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    n_reachable: u64,
+};
+
+const FaultCounters = struct {
+    minor: u64,
+    major: u64,
+};
+
+fn faultCounters() FaultCounters {
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    return .{
+        .minor = @intCast(@max(usage.minflt, 0)),
+        .major = @intCast(@max(usage.majflt, 0)),
+    };
+}
+
 fn nowMs(io: Io) u64 {
     // Monotonic milliseconds via the Io clock (same source as Commands'
     // stage timings), keeping the bench free of any libc dependency.
@@ -180,10 +278,14 @@ fn runMeasurement(
     V: u64,
     out_view: *const CsrView,
     in_view: *const CsrView,
+    algorithm: Backend.Algorithm,
 ) !Timing {
     const start_total = nowMs(io);
 
-    var numbering = try Numbering.compute(allocator, @intCast(V), out_view, .{});
+    const numbering_options: Numbering.Options = .{
+        .emit_dfs_tree = algorithm == .lt,
+    };
+    var numbering = try Numbering.compute(allocator, @intCast(V), out_view, numbering_options);
     defer numbering.deinit(allocator);
     const dfs_ms = nowMs(io) - start_total;
 
@@ -196,11 +298,18 @@ fn runMeasurement(
         .rpo_num = numbering.rpo_num,
         .rpo_vertex = numbering.rpo_vertex,
         .reachable = numbering.reachable,
-        .options = .{},
+        .dfn = numbering.dfn,
+        .dfn_vertex = numbering.dfn_vertex,
+        .parent = numbering.parent,
+        .max_dfs_depth = numbering.max_depth,
+        .options = .{ .algorithm = algorithm },
         .out_edges = out_view,
         .in_edges = in_view,
     };
-    const backend_result = try Chk.compute(&ctx);
+    const backend_result = switch (algorithm) {
+        .chk => try Chk.compute(&ctx),
+        .lt => try Lt.compute(&ctx),
+    };
     defer allocator.free(backend_result.idom);
     const sweeps_ms = nowMs(io) - start_sweeps;
 
@@ -216,6 +325,95 @@ fn runMeasurement(
         .total_ms = nowMs(io) - start_total,
         .peak_rss = getPeakRss(),
     };
+}
+
+/// Runs the production dominator stage end to end (demand-paged CSR and
+/// catalog, backend, retained sweep, output writes) and captures the fault
+/// deltas around it. This is the measurement the in-CSR re-fault escalation
+/// decision in Dominator.zig is judged against.
+fn runStageMeasurement(
+    allocator: std.mem.Allocator,
+    io: Io,
+    index_dir: []const u8,
+    dump: []const u8,
+    manifest: Manifest.IndexManifest,
+    algorithm: Backend.Algorithm,
+    cold: bool,
+) !StageTiming {
+    if (cold) dropStageFileCache(allocator, io, index_dir);
+
+    var job = blk: {
+        const staging_dir = try std.fs.path.join(allocator, &.{ index_dir, "bench-staging" });
+        errdefer allocator.free(staging_dir);
+        try Io.Dir.cwd().createDirPath(io, staging_dir);
+        break :blk Preflight.Job{
+            .source_path = dump,
+            .index_dir = index_dir,
+            .staging_dir = staging_dir,
+            .budget_bytes = 1024 * 1024 * 1024,
+            .dominator_budget_bytes = 64 * 1024 * 1024 * 1024,
+            .fingerprint = try manifest.fingerprint.clone(allocator),
+            .header = .{
+                .id_size = manifest.fingerprint.id_size,
+                .timestamp = manifest.fingerprint.hprof_timestamp,
+            },
+        };
+    };
+    defer job.deinit(allocator);
+
+    const out_offsets_path = try std.fs.path.join(allocator, &.{ index_dir, "out_offsets.bin" });
+    defer allocator.free(out_offsets_path);
+    const out_targets_path = try std.fs.path.join(allocator, &.{ index_dir, "out_targets.bin" });
+    defer allocator.free(out_targets_path);
+    const in_offsets_path = try std.fs.path.join(allocator, &.{ index_dir, "in_offsets.bin" });
+    defer allocator.free(in_offsets_path);
+    const in_sources_path = try std.fs.path.join(allocator, &.{ index_dir, "in_sources.bin" });
+    defer allocator.free(in_sources_path);
+    const catalog_path = try std.fs.path.join(allocator, &.{ index_dir, "catalog.bin" });
+    defer allocator.free(catalog_path);
+
+    const before = faultCounters();
+    const start = nowMs(io);
+    var diagnostics: Manifest.Diagnostics = .{};
+    var result = try Dominator.run(
+        allocator,
+        io,
+        &job,
+        out_offsets_path,
+        out_targets_path,
+        in_offsets_path,
+        in_sources_path,
+        catalog_path,
+        manifest.n_objects,
+        manifest.n_edges,
+        &diagnostics,
+        .{ .algorithm = algorithm },
+    );
+    defer result.deinit(allocator);
+    const stage_ms = nowMs(io) - start;
+    const after = faultCounters();
+
+    return .{
+        .stage_ms = stage_ms,
+        .minor_faults = after.minor - before.minor,
+        .major_faults = after.major - before.major,
+        .n_reachable = result.n_reachable,
+    };
+}
+
+/// Best-effort page-cache drop for the stage files so a cold run is
+/// reproducible without root privileges. Only meaningful on Linux.
+fn dropStageFileCache(allocator: std.mem.Allocator, io: Io, index_dir: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+    for (stage_file_names) |name| {
+        const path = std.fs.path.join(allocator, &.{ index_dir, name }) catch continue;
+        defer allocator.free(path);
+        const file = Io.Dir.cwd().openFile(io, path, .{}) catch continue;
+        defer file.close(io);
+        // Ignore failures: a best-effort drop still beats benching a warm
+        // cache by accident.
+        _ = std.os.linux.fadvise(file.handle, 0, 0, std.posix.POSIX_FADV.DONTNEED);
+    }
 }
 
 fn estimateEdgesProcessed(
