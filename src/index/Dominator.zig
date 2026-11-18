@@ -1,6 +1,7 @@
 //! Stage 7: compute the dominator tree and retained sizes.
 const std = @import("std");
 const Io = std.Io;
+const profiling = @import("profiling");
 
 const Backend = @import("dominator/Backend.zig");
 const CsrView = @import("dominator/CsrView.zig").CsrView;
@@ -107,6 +108,13 @@ pub fn run(
     //         the budget or does not close the cold/warm gap.
     // A cold/warm ratio near 1 means the page cache absorbed the pass and
     // neither escalation is worth its memory.
+    // The four CSR mappings live for the whole stage (the views and the
+    // backends index into them), so their defers sit at function scope; the
+    // span closes explicitly instead, so later phases stay siblings of
+    // map_csr in the --profile tree rather than children of it.
+    var map_span = profiling.begin(io, "map_csr");
+    errdefer map_span.end(io);
+
     var out_offsets_map = try mapStageFile(io, out_offsets_path);
     defer out_offsets_map.deinit(io);
     var out_targets_map = try mapStageFile(io, out_targets_path);
@@ -129,13 +137,19 @@ pub fn run(
     const in_view = CsrView.init(@intCast(V), in_offsets_data, in_sources_data);
     try out_view.validate();
     try in_view.validate();
+    map_span.end(io);
 
     // 4. Shared DFS. LT consumes the DFS tree (preorder slots and parents);
     // CHK consumes the reverse postorder numbering.
-    const numbering_options: Numbering.Options = .{
-        .emit_dfs_tree = options.algorithm == .lt,
-    };
-    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view, numbering_options);
+    var numbering: Numbering.Numbering = undefined;
+    {
+        var span = profiling.begin(io, "dfs_numbering");
+        defer span.end(io);
+        const numbering_options: Numbering.Options = .{
+            .emit_dfs_tree = options.algorithm == .lt,
+        };
+        numbering = try Numbering.compute(allocator, @intCast(V), &out_view, numbering_options);
+    }
     defer numbering.deinit(allocator);
 
     // 5. Budget re-check with the real depth.
@@ -162,9 +176,18 @@ pub fn run(
         .out_edges = &out_view,
         .in_edges = &in_view,
     };
-    const backend_result = switch (options.algorithm) {
-        .chk => try Chk.compute(&ctx),
-        .lt => try Lt.compute(&ctx),
+    // 6. Backend. The label names the algorithm so a --profile tree splits
+    // the stage by backend without a runtime string (labels are comptime).
+    const backend_result = blk: {
+        var span = if (options.algorithm == .lt)
+            profiling.begin(io, "lt_backend")
+        else
+            profiling.begin(io, "chk_backend");
+        defer span.end(io);
+        break :blk switch (options.algorithm) {
+            .chk => try Chk.compute(&ctx),
+            .lt => try Lt.compute(&ctx),
+        };
     };
     defer allocator.free(backend_result.idom);
 
@@ -172,57 +195,67 @@ pub fn run(
     // them now keeps the orchestrator phase from stacking on top of them.
     numbering.releaseDfsTree(allocator);
 
-    // 7. Read shallow sizes from catalog.
     // 7. Read shallow sizes from the catalog (demand-paged, one sequential
-    // pass; see the mapping rationale in step 2).
-    var catalog_map = try mapStageFile(io, catalog_path);
-    defer catalog_map.deinit(io);
-    const catalog_data = catalog_map.memory();
-    if (catalog_data.len % Scanner.catalog_row_size != 0) return error.InvalidCatalogFile;
-    if (catalog_data.len / Scanner.catalog_row_size != n_objects) return error.InvalidCatalogFile;
-
+    // pass; see the mapping rationale in step 2). The catalog mapping is
+    // dead after this phase, so the whole phase is block-scoped.
     const shallow = try allocator.alloc(u64, V);
     defer allocator.free(shallow);
-    var v: u32 = 0;
     var total_shallow_reachable: u64 = 0;
-    while (v < n_objects) : (v += 1) {
-        const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
-        shallow[v] = row.shallow_size;
-        if (numbering.reachable[v]) {
-            total_shallow_reachable += row.shallow_size;
+    {
+        var span = profiling.begin(io, "read_shallow");
+        defer span.end(io);
+        var catalog_map = try mapStageFile(io, catalog_path);
+        defer catalog_map.deinit(io);
+        const catalog_data = catalog_map.memory();
+        if (catalog_data.len % Scanner.catalog_row_size != 0) return error.InvalidCatalogFile;
+        if (catalog_data.len / Scanner.catalog_row_size != n_objects) return error.InvalidCatalogFile;
+
+        var v: u32 = 0;
+        while (v < n_objects) : (v += 1) {
+            const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
+            shallow[v] = row.shallow_size;
+            if (numbering.reachable[v]) {
+                total_shallow_reachable += row.shallow_size;
+            }
         }
     }
     shallow[root] = 0;
 
     // 8. Build dom_parent (root -> NONE) and retained (reverse RPO sweep).
+    // The arrays live on to the write phase, so only the computation sits
+    // inside the span block.
     const dom_parent = try allocator.alloc(u32, V);
     defer allocator.free(dom_parent);
-    @memset(dom_parent, NONE);
-
     const retained = try allocator.alloc(u64, V);
     defer allocator.free(retained);
-    for (0..V) |i| {
-        retained[i] = shallow[i];
-    }
-    retained[root] = 0;
+    {
+        var span = profiling.begin(io, "retained_sweep");
+        defer span.end(io);
+        @memset(dom_parent, NONE);
 
-    v = 0;
-    while (v < V) : (v += 1) {
-        if (!numbering.reachable[v] or v == root) {
-            dom_parent[v] = NONE;
-            continue;
+        for (0..V) |i| {
+            retained[i] = shallow[i];
         }
-        const idom = backend_result.idom[v];
-        dom_parent[v] = if (idom == v or idom == root) NONE else idom;
-    }
+        retained[root] = 0;
 
-    var rpo_slot: u32 = numbering.n_reachable;
-    while (rpo_slot > 1) {
-        rpo_slot -= 1;
-        const node = numbering.rpo_vertex[rpo_slot];
-        const p = dom_parent[node];
-        if (p != NONE) {
-            retained[p] += retained[node];
+        var v: u32 = 0;
+        while (v < V) : (v += 1) {
+            if (!numbering.reachable[v] or v == root) {
+                dom_parent[v] = NONE;
+                continue;
+            }
+            const idom = backend_result.idom[v];
+            dom_parent[v] = if (idom == v or idom == root) NONE else idom;
+        }
+
+        var rpo_slot: u32 = numbering.n_reachable;
+        while (rpo_slot > 1) {
+            rpo_slot -= 1;
+            const node = numbering.rpo_vertex[rpo_slot];
+            const p = dom_parent[node];
+            if (p != NONE) {
+                retained[p] += retained[node];
+            }
         }
     }
     retained[root] = total_shallow_reachable;
@@ -235,9 +268,13 @@ pub fn run(
     const retained_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "retained.bin" });
     errdefer allocator.free(retained_path);
 
-    try writeU32File(io, dom_parent_path, dom_parent);
-    try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
-    try writeU64File(io, retained_path, retained);
+    {
+        var span = profiling.begin(io, "write_outputs");
+        defer span.end(io);
+        try writeU32File(io, dom_parent_path, dom_parent);
+        try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
+        try writeU64File(io, retained_path, retained);
+    }
 
     // 10. Set diagnostics.
     diagnostics.unreachable_objects = n_objects -| numbering.n_reachable + 1;
