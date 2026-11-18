@@ -238,6 +238,7 @@ pub const commands = [_]Command{
             .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory where the index will be written. Defaults to the config value, or <base>/<stem>.idx/ when the config is a base directory." },
             .{ .flags = "--sorting-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for external sorting.", .default_value = "4096" },
             .{ .flags = "--dominator-budget-mb", .argument = "<n>", .description = "Memory budget in megabytes for dominator computation.", .default_value = "4096" },
+            .{ .flags = "--dominator-algorithm", .argument = "<chk|lt>", .description = "Dominator algorithm: lt (Lengauer-Tarjan, single pass) or chk (Cooper-Harvey-Kennedy, iterative).", .default_value = "lt" },
             .{ .flags = "--no-dominators", .argument = null, .description = "Skip dominator computation and do not publish dom_parent.bin, dom_order.bin, or retained.bin." },
             .{ .flags = "--force", .argument = null, .description = "Rebuild the index even if a matching index already exists." },
             .{ .flags = "--no-progress", .argument = null, .description = "Suppress the progress spinner and checkpoint output." },
