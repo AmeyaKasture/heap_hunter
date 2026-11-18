@@ -65,15 +65,19 @@ pub fn run(
     const V = n_objects + 1;
     const root: u32 = @intCast(V - 1);
 
-    // 1. Budget pre-check (conservative: stack depth = V). LT adds the
-    // eval path-compression buffer on top of the DFS stack, both bounded
-    // by the DFS depth.
+    // 1. Budget pre-check. Only the numbering phase is allocated before the
+    // DFS depth is known, so this gate covers the numbering arrays plus a
+    // worst-case-depth (V) DFS stack; the full per-node model is enforced
+    // against the measured depth in step 5. Gating the whole stage here
+    // would over-reserve the stack cushion (12 B/node on a 21M-object dump
+    // is ~250 MB of pure cushion) and reject budgets the stage actually
+    // fits, e.g. the 1024 MB tier on the 2 GB workbench dump.
     const budget_bytes = job.dominator_budget_bytes;
     const bytes_per_node = bytesPerNode(options.algorithm);
+    const numbering_bytes_per_node: u64 = if (options.algorithm == .lt) 17 else 9;
     const stack_bytes_per_node: u64 = if (options.algorithm == .lt) 12 else 8;
-    const conservative_stack = @as(u64, V) * stack_bytes_per_node;
-    const required_conservative = checkedMulAdd(V, bytes_per_node, conservative_stack) catch return error.DominatorInternalError;
-    if (required_conservative > budget_bytes) {
+    const pre_required = checkedMulAdd(V, numbering_bytes_per_node + 8, 0) catch return error.DominatorInternalError;
+    if (pre_required > budget_bytes) {
         return error.DominatorBudgetExceeded;
     }
 
@@ -776,13 +780,76 @@ test "declared budget figure is at least the real allocation" {
     for ([_]Backend.Algorithm{ .chk, .lt }) |algorithm| {
         const bytes_per_node = bytesPerNode(algorithm);
         const stack_bytes_per_node: u64 = if (algorithm == .lt) 12 else 8;
-        const real_total = V * (bytes_per_node + stack_bytes_per_node);
+        const numbering_bytes_per_node: u64 = if (algorithm == .lt) 17 else 9;
+
+        // The real check covers the stage's peak arrays plus the measured
+        // stacks, bounded by V for the worst chain dump.
+        const real_worst = V * bytes_per_node + V * stack_bytes_per_node;
         const declared = V * (bytesPerNode(algorithm) + stack_bytes_per_node);
-        try std.testing.expect(declared >= real_total);
+        try std.testing.expect(declared >= real_worst);
+
+        // The pre-check gates only the numbering phase, so it never
+        // rejects a budget the real check accepts.
+        try std.testing.expect(numbering_bytes_per_node + 8 <= bytes_per_node);
+
         // The declared per-node figure also covers each phase's arrays:
         // CHK backend 17, CHK orchestrator 33, LT main loop 41,
         // LT orchestrator 29.
         try std.testing.expect(bytes_per_node >= 17);
         try std.testing.expect(bytes_per_node >= 33);
     }
+}
+
+test "dominator budget gate is phase-aware" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // 4-node diamond. LT: pre-check 4 x 25 = 100 B, real check 4 x 41 +
+    // 3 x 12 = 200 B. CHK: pre-check 4 x 17 = 68 B, real check 4 x 33 +
+    // 3 x 8 = 156 B. For both, a 150 B budget passes the pre-check and is
+    // then rejected by the real check with the honest figure, and 250 B
+    // fits both — even though a whole-stage conservative gate (4 x 53 B)
+    // would have rejected a budget the stage can actually run in.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const edges = &[_][2]u32{
+        .{ 3, 0 },
+        .{ 3, 1 },
+        .{ 0, 2 },
+        .{ 1, 2 },
+    };
+    const shallow = &[_]u32{ 10, 10, 20 };
+
+    try writeTestCsr(allocator, io, tmp_path, 4, edges, shallow);
+
+    var job = try createTestJob(allocator, io, tmp_path);
+    defer job.deinit(allocator);
+
+    var diagnostics: Manifest.Diagnostics = .{};
+    job.dominator_budget_bytes = 150;
+    try std.testing.expectError(error.DominatorBudgetExceeded, runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    ));
+
+    job.dominator_budget_bytes = 250;
+    const result = try runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), result.n_reachable);
 }
