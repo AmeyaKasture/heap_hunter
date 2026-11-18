@@ -89,7 +89,7 @@ pub fn run(
     try in_view.validate();
 
     // 4. Shared DFS.
-    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view);
+    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view, .{});
     defer numbering.deinit(allocator);
 
     // 5. Budget re-check with real depth.

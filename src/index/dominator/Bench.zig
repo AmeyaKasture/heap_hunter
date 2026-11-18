@@ -183,7 +183,7 @@ fn runMeasurement(
 ) !Timing {
     const start_total = nowMs(io);
 
-    var numbering = try Numbering.compute(allocator, @intCast(V), out_view);
+    var numbering = try Numbering.compute(allocator, @intCast(V), out_view, .{});
     defer numbering.deinit(allocator);
     const dfs_ms = nowMs(io) - start_total;
 
