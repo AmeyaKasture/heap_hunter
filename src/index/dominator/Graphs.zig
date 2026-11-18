@@ -417,7 +417,7 @@ pub fn deinitCatalogue(allocator: std.mem.Allocator, graphs: *[]Graph) void {
         graph.deinit(allocator);
     }
     allocator.free(graphs.*);
-    graphs.* = &[]Graph{};
+    graphs.* = &[_]Graph{};
 }
 
 // ---------------------------------------------------------------------------

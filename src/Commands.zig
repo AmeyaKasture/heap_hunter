@@ -261,7 +261,7 @@ pub fn runIndexCommand(
                 progress.nextStep("computing dominators");
                 log.debug("stage: computing dominators", .{});
                 const V = catalog_result.n_objects + 1;
-                const required_conservative: u64 = @intCast(@as(u128, Dominator.chkBytesPerNode()) * V + 8 * V);
+                const required_conservative: u64 = @intCast(@as(u128, Dominator.bytesPerNode(.chk)) * V + 8 * V);
                 var dominator_result = blk: {
                     var span = profiling.begin(io, "dominators");
                     defer span.end(io);
