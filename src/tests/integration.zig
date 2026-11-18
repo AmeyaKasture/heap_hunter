@@ -17,6 +17,9 @@ fn loadIndex(allocator: std.mem.Allocator, relative_path: []const u8) !Analysis.
     var mm = try std.Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        // Prefault: fixtures are small and parsed in full, and this mirrors
+        // the production source mapping only in access pattern.
+        .populate = true,
     });
     defer mm.destroy(io);
 

@@ -481,6 +481,10 @@ fn resolveSourcesMapped(
     var edges_mm = try Io.File.MemoryMap.create(io, edges_file, .{
         .len = edges_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the edge file is scanned sequentially and can be
+        // larger than RAM, and the catalog mapped below must stay cached for
+        // the binary searches. Prefaulting would evict it.
+        .populate = false,
     });
     defer edges_mm.destroy(io);
 
@@ -499,6 +503,9 @@ fn resolveSourcesMapped(
         catalog_mm = try Io.File.MemoryMap.create(io, catalog_file, .{
             .len = catalog_len,
             .protection = .{ .read = true, .write = false },
+            // Demand paging: the catalog is probed by binary search, so
+            // random pages are touched and the file may exceed RAM.
+            .populate = false,
         });
         break :blk catalog_mm.?.memory;
     };
@@ -602,6 +609,9 @@ fn resolveTargetsMapped(
     var intermediate_mm = try Io.File.MemoryMap.create(io, intermediate_file, .{
         .len = intermediate_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the intermediate file is scanned sequentially and
+        // can be larger than RAM.
+        .populate = false,
     });
     defer intermediate_mm.destroy(io);
 
@@ -619,6 +629,9 @@ fn resolveTargetsMapped(
         catalog_mm = try Io.File.MemoryMap.create(io, catalog_file, .{
             .len = catalog_len,
             .protection = .{ .read = true, .write = false },
+            // Demand paging: the catalog is probed by binary search, so
+            // random pages are touched and the file may exceed RAM.
+            .populate = false,
         });
         break :blk catalog_mm.?.memory;
     };

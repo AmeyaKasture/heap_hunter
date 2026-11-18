@@ -1977,6 +1977,7 @@ test {
     _ = @import("Overview.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/mapping_policy.zig");
 }
 
 test {
@@ -1991,6 +1992,7 @@ test {
     _ = @import("Commands.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/mapping_policy.zig");
 }
 
 test "object query decodes string values, scalar types, and array previews" {

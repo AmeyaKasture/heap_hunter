@@ -134,6 +134,8 @@ pub fn buildFromIndex(
     var catalog_mm = Io.File.MemoryMap.create(io, catalog_file, .{
         .len = catalog_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the catalog is aggregated with a streaming scan and
+        // can be larger than RAM.
         .populate = false,
     }) catch |err| {
         log.err("failed to map catalog.bin: {s}", .{@errorName(err)});

@@ -436,6 +436,9 @@ pub fn runOverviewCommand(
     var mm = try Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the fingerprint only reads the header and the
+        // first/last block, so prefaulting the whole dump would be a
+        // full-file read for nothing.
         .populate = false,
     });
     defer mm.destroy(io);
