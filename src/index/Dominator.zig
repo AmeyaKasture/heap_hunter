@@ -76,15 +76,50 @@ pub fn run(
         return error.DominatorBudgetExceeded;
     }
 
-    // 2. Validate n_edges against CSR lengths.
-    const out_offsets_data = try Io.Dir.cwd().readFileAlloc(io, out_offsets_path, allocator, .unlimited);
-    defer allocator.free(out_offsets_data);
-    const out_targets_data = try Io.Dir.cwd().readFileAlloc(io, out_targets_path, allocator, .unlimited);
-    defer allocator.free(out_targets_data);
-    const in_offsets_data = try Io.Dir.cwd().readFileAlloc(io, in_offsets_path, allocator, .unlimited);
-    defer allocator.free(in_offsets_data);
-    const in_sources_data = try Io.Dir.cwd().readFileAlloc(io, in_sources_path, allocator, .unlimited);
-    defer allocator.free(in_sources_data);
+    // 2. Map the CSR and catalog files, then validate n_edges against CSR
+    // lengths.
+    //
+    // Every stage file is mapped read-only with demand paging instead of
+    // being read wholesale into anonymous memory: on the 20 GB reference
+    // dump (82M objects, 94M edges) the two CSR pairs total ~2.1 GB and the
+    // catalog is larger still, which as anonymous allocations would spike
+    // RSS uncounted by the budget and push the box into swap. Mapped
+    // clean pages evict under memory pressure without thrashing.
+    //
+    // Page-fault expectations, so a bench run (zig build bench --
+    // dominator, cold vs. warm) can give a sound verdict:
+    //   * out_offsets/out_targets: consumed once, sequentially, by the DFS.
+    //     One fault per 4 KiB page, never re-faulted. No action possible.
+    //   * catalog: one sequential pass for shallow sizes. Same as above.
+    //   * in_offsets/in_sources: touched in preorder-slot order, which is
+    //     scattered over the ordinal space, so each 4 KiB page (512 offset
+    //     rows, 1024 source rows) is faulted at scattered times and can
+    //     evict and re-fault when RAM is tight. This is the one mapping
+    //     with a re-fault risk. Escalation path, only if the bench shows
+    //     the cold/warm dominator-pass ratio staying well above 1:
+    //     (b) prefault in_offsets only (.populate = true): ~8 B/node
+    //         resident (~656 MB at 82M nodes); apply when the dominator
+    //         budget headroom covers that plus ~10% slack.
+    //     (c) build a dfn-ordered private pred array in one sequential
+    //         in-CSR sweep, then drop the in-CSR mapping for the backend:
+    //         +4 B/edge anonymous (~380 MB at 94M edges), LT peak model
+    //         rises from 41 to ~50 B/node. Apply when (b) does not fit
+    //         the budget or does not close the cold/warm gap.
+    // A cold/warm ratio near 1 means the page cache absorbed the pass and
+    // neither escalation is worth its memory.
+    var out_offsets_map = try mapStageFile(io, out_offsets_path);
+    defer out_offsets_map.deinit(io);
+    var out_targets_map = try mapStageFile(io, out_targets_path);
+    defer out_targets_map.deinit(io);
+    var in_offsets_map = try mapStageFile(io, in_offsets_path);
+    defer in_offsets_map.deinit(io);
+    var in_sources_map = try mapStageFile(io, in_sources_path);
+    defer in_sources_map.deinit(io);
+
+    const out_offsets_data = out_offsets_map.memory();
+    const out_targets_data = out_targets_map.memory();
+    const in_offsets_data = in_offsets_map.memory();
+    const in_sources_data = in_sources_map.memory();
 
     if (out_targets_data.len != n_edges * 4) return error.InvalidCsrFile;
     if (in_sources_data.len != n_edges * 4) return error.InvalidCsrFile;
@@ -138,8 +173,11 @@ pub fn run(
     numbering.releaseDfsTree(allocator);
 
     // 7. Read shallow sizes from catalog.
-    const catalog_data = try Io.Dir.cwd().readFileAlloc(io, catalog_path, allocator, .unlimited);
-    defer allocator.free(catalog_data);
+    // 7. Read shallow sizes from the catalog (demand-paged, one sequential
+    // pass; see the mapping rationale in step 2).
+    var catalog_map = try mapStageFile(io, catalog_path);
+    defer catalog_map.deinit(io);
+    const catalog_data = catalog_map.memory();
     if (catalog_data.len % Scanner.catalog_row_size != 0) return error.InvalidCatalogFile;
     if (catalog_data.len / Scanner.catalog_row_size != n_objects) return error.InvalidCatalogFile;
 
@@ -220,6 +258,44 @@ fn checkedMulAdd(a: u64, b: u64, c: u64) !u64 {
     return try std.math.add(u64, prod, c);
 }
 
+/// A read-only, demand-paged mapping of one stage file. The file stays open
+/// for the mapping's lifetime; `deinit` unmaps before closing. A zero-length
+/// file has no mapping: mmap rejects length 0, and the callers' length
+/// checks treat it as empty either way (a dump with no references produces
+/// empty CSR adjacency files).
+const StageMap = struct {
+    file: Io.File,
+    mm: ?Io.File.MemoryMap,
+
+    fn deinit(self: *StageMap, io: Io) void {
+        if (self.mm) |*mm| mm.destroy(io);
+        self.file.close(io);
+    }
+
+    fn memory(self: *const StageMap) []const u8 {
+        if (self.mm) |mm| return mm.memory;
+        return &.{};
+    }
+};
+
+fn mapStageFile(io: Io, path: []const u8) !StageMap {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    errdefer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len == 0) return .{ .file = file, .mm = null };
+    // Demand paging: every stage file here is either streamed once
+    // sequentially (out-CSR, catalog) or touched in a scattered order that
+    // may exceed RAM (in-CSR); see the escalation rationale in `run`.
+    // Prefaulting would turn both into a full-file read up front.
+    const mm = try Io.File.MemoryMap.create(io, file, .{
+        .len = file_len,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    errdefer mm.destroy(io);
+    return .{ .file = file, .mm = mm };
+}
+
 /// Format the user-facing budget-exceeded message. The caller supplies the
 /// writer so the message can be emitted as a true CLI error (e.g. prefixed
 /// with "error:") without writing to stderr during unit tests, which would
@@ -237,7 +313,10 @@ pub fn formatBudgetError(V: u64, required: u64, budget: usize, writer: anytype) 
 
 /// Anonymous bytes per node the stage's peak phase needs, by algorithm.
 /// The model must cover every phase's live arrays, including the
-/// orchestrator's (which is why `shallow` counts 8, not 4).
+/// orchestrator's (which is why `shallow` counts 8, not 4). The CSR and
+/// catalog bytes are deliberately excluded: they are demand-paged,
+/// file-backed mappings whose clean pages evict under pressure, not
+/// anonymous allocations the budget must reserve for.
 pub fn bytesPerNode(algorithm: Backend.Algorithm) u64 {
     return switch (algorithm) {
         // Backend phase: rpo_num 4 + rpo_vertex 4 + reachable 1 +
