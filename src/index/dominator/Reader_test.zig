@@ -489,19 +489,9 @@ test "real dump dominator output is identical for chk and lt" {
         const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(tmp_path);
 
-        // Two separate index directories: an in-process second --force run
-        // into the same directory trips a latent close-while-iterating bug
-        // in the threaded test Io, unrelated to the dominator stage.
-        const lt_base = try std.fs.path.join(allocator, &.{ tmp_path, "lt" });
-        defer allocator.free(lt_base);
-        try Io.Dir.cwd().createDirPath(io, lt_base);
-        const chk_base = try std.fs.path.join(allocator, &.{ tmp_path, "chk" });
-        defer allocator.free(chk_base);
-        try Io.Dir.cwd().createDirPath(io, chk_base);
-
-        const lt_dir = try buildIndexWithAlgorithm(allocator, io, lt_base, fixture, true, "lt");
+        const lt_dir = try buildIndexWithAlgorithm(allocator, io, tmp_path, fixture, true, "lt");
         defer allocator.free(lt_dir);
-        const chk_dir = try buildIndexWithAlgorithm(allocator, io, chk_base, fixture, true, "chk");
+        const chk_dir = try buildIndexWithAlgorithm(allocator, io, tmp_path, fixture, true, "chk");
         defer allocator.free(chk_dir);
 
         // The dominator tree is unique, so two algorithms must produce

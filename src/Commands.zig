@@ -897,7 +897,10 @@ fn deleteOldStagingDirs(
     index_dir: []const u8,
     stderr: *Io.Writer,
 ) void {
-    var dir = Io.Dir.cwd().openDir(io, index_dir, .{}) catch return;
+    // `iterate = true` is required: without it the platform layer opens the
+    // directory without read access and the first `next` seeks a handle that
+    // rejects it, panicking with BADF instead of listing the entries.
+    var dir = Io.Dir.cwd().openDir(io, index_dir, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
     var iter = dir.iterate();
