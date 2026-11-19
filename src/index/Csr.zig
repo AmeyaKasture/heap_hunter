@@ -175,6 +175,10 @@ fn writeCsrWithExtractor(
     var sorted_mm = try Io.File.MemoryMap.create(io, sorted_file, .{
         .len = sorted_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the edge file is streamed once and can be larger
+        // than RAM; the catalog mapped below must stay cached for the
+        // binary searches. Prefaulting would evict it.
+        .populate = false,
     });
     defer sorted_mm.destroy(io);
 
@@ -409,6 +413,9 @@ fn resolveRoots(
     var roots_raw_mm = try Io.File.MemoryMap.create(io, roots_raw_file, .{
         .len = roots_raw_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the roots file is streamed once and is tiny; no
+        // benefit from prefaulting it.
+        .populate = false,
     });
     defer roots_raw_mm.destroy(io);
     const roots_raw_data = roots_raw_mm.memory;
@@ -427,6 +434,9 @@ fn resolveRoots(
         catalog_mm = try Io.File.MemoryMap.create(io, catalog_file, .{
             .len = catalog_len,
             .protection = .{ .read = true, .write = false },
+            // Demand paging: the catalog is probed by binary search, so
+            // random pages are touched and the file may exceed RAM.
+            .populate = false,
         });
         break :blk catalog_mm.?.memory;
     };

@@ -127,7 +127,7 @@ fn runHuntIndex(
         .index_dir = index_dir,
         .force = true,
         .no_progress = true,
-        .compute_dominators = true,
+        .compute_dominators = false,
     };
 
     Commands.runIndexCommand(

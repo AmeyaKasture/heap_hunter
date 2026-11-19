@@ -124,6 +124,9 @@ pub fn runIndexCommand(
             var source_mm = try Io.File.MemoryMap.create(io, source_file, .{
                 .len = source_len,
                 .protection = .{ .read = true, .write = false },
+                // Demand-page the source dump; prefaulting the whole file
+                // up front wastes kernel time and page-table memory.
+                .populate = false,
             });
             defer source_mm.destroy(io);
 
@@ -138,28 +141,6 @@ pub fn runIndexCommand(
             };
             defer scan_result.deinit(allocator);
             log.debug("stage: scan complete, n_objects approx {d}, diagnostics={any}", .{ scan_result.diagnostics.duplicate_object_ids, scan_result.diagnostics });
-
-            progress.nextStep("sorting catalog");
-            log.debug("stage: sorting catalog", .{});
-            var catalog_result = blk: {
-                var span = profiling.begin(io, "sort_catalog");
-                defer span.end(io);
-                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe(
-                    allocator,
-                    io,
-                    job,
-                    scan_result.catalog_path,
-                    &scan_result.diagnostics,
-                ) catch |err| switch (err) {
-                    error.TooManyObjects => {
-                        try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
-                        return @as(anyerror!void, err);
-                    },
-                    else => return @as(anyerror!void, err),
-                });
-            };
-            defer catalog_result.deinit(allocator);
-            log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
 
             const classes_path = blk: {
                 var span = profiling.begin(io, "writeClasses");
@@ -207,6 +188,28 @@ pub fn runIndexCommand(
             };
             defer edge_result.deinit(allocator);
             log.debug("stage: emit_edges complete", .{});
+
+            progress.nextStep("sorting catalog");
+            log.debug("stage: sorting catalog", .{});
+            var catalog_result = blk: {
+                var span = profiling.begin(io, "sort_catalog");
+                defer span.end(io);
+                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe(
+                    allocator,
+                    io,
+                    job,
+                    scan_result.catalog_path,
+                    &scan_result.diagnostics,
+                ) catch |err| switch (err) {
+                    error.TooManyObjects => {
+                        try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
+                        return @as(anyerror!void, err);
+                    },
+                    else => return @as(anyerror!void, err),
+                });
+            };
+            defer catalog_result.deinit(allocator);
+            log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
 
             progress.nextStep("resolving references");
             log.debug("stage: resolving references", .{});
@@ -441,6 +444,9 @@ pub fn runOverviewCommand(
     var mm = try Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the fingerprint only reads the header and the
+        // first/last block, so prefaulting the whole dump would be a
+        // full-file read for nothing.
         .populate = false,
     });
     defer mm.destroy(io);
