@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   zig build bench -- dominator --dump <path.hprof> --algorithm chk|lt|both
-//!       --cache cold|warm --json out.json
+//!       --cache cold|warm [--reuse-index] --json out.json
 //!
 //! Per algorithm this reports two measurements:
 //!   * `backend_ms`: the backend alone, running on CSR data already read
@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var json_path: ?[]const u8 = null;
     var cache_mode: []const u8 = "warm";
     var algorithm_arg: []const u8 = "both";
+    var reuse_index = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -71,15 +72,17 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             algorithm_arg = args[i];
+        } else if (std.mem.eql(u8, arg, "--reuse-index")) {
+            reuse_index = true;
         }
     }
 
     const dump = dump_path orelse {
-        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm]\n", .{});
+        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm] [--reuse-index]\n", .{});
         return error.InvalidArgument;
     };
     const out_path = json_path orelse {
-        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm]\n", .{});
+        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm] [--reuse-index]\n", .{});
         return error.InvalidArgument;
     };
     var algorithms: [2]bool = .{ true, true }; // [chk, lt]
@@ -95,11 +98,20 @@ pub fn main(init: std.process.Init) !void {
 
     const index_dir = try std.fs.path.join(allocator, &.{ "/tmp", "bench_dominator" });
     defer allocator.free(index_dir);
-    try Io.Dir.cwd().deleteTree(io, index_dir);
-    try Io.Dir.cwd().createDirPath(io, index_dir);
 
-    // Build the index so the CSR files exist.
-    try runHuntIndex(allocator, io, dump, index_dir);
+    // `--reuse-index` measures against an index already built at
+    // /tmp/bench_dominator: the pipeline buffers are the peak of this
+    // process's memory, and re-paying them just to re-measure backends can
+    // push a small box over its limit.
+    if (reuse_index) {
+        std.debug.print("reusing existing index at {s}\n", .{index_dir});
+    } else {
+        try Io.Dir.cwd().deleteTree(io, index_dir);
+        try Io.Dir.cwd().createDirPath(io, index_dir);
+
+        // Build the index so the CSR files exist.
+        try runHuntIndex(allocator, io, dump, index_dir);
+    }
 
     const manifest = try readManifest(allocator, io, index_dir);
 
@@ -206,6 +218,10 @@ fn runHuntIndex(
         .force = true,
         .no_progress = true,
         .compute_dominators = true,
+        // Constrained budgets: this harness holds everything in one arena,
+        // so the default 4 GiB sort budget is a silent OOM on small boxes.
+        .sorting_budget_mb = 1024,
+        .dominator_budget_mb = 1024,
     };
 
     Commands.runIndexCommand(
@@ -441,9 +457,12 @@ fn computeInDegreeHistogram(
     var buckets = [4]u64{ 0, 0, 0, 0 };
     var seen = try allocator.alloc(u32, V);
     defer allocator.free(seen);
+    // Dedup marker: seen[p] holds the v of the last iteration that visited
+    // p, so one initial clear suffices — a per-node memset would make this
+    // O(V^2), which is hours at the 5.5M-node workbench tier.
+    @memset(seen, NONE);
 
     for (0..V) |v| {
-        @memset(seen, NONE);
         var distinct: u32 = 0;
         const preds = in_view.edges(@intCast(v));
         for (preds) |p| {
