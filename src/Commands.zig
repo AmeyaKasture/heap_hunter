@@ -258,6 +258,8 @@ pub fn runIndexCommand(
 
             var dominator_n_reachable: u64 = 0;
             var dominator_total_retained: u64 = 0;
+            var dominator_iterations: u32 = 0;
+            var dominator_shortcut_nodes: u64 = 0;
             if (compute_dominators) {
                 progress.nextStep("computing dominators");
                 log.debug("stage: computing dominators", .{});
@@ -290,6 +292,8 @@ pub fn runIndexCommand(
                 defer dominator_result.deinit(allocator);
                 dominator_n_reachable = dominator_result.n_reachable;
                 dominator_total_retained = dominator_result.total_retained_bytes;
+                dominator_iterations = dominator_result.stats.iterations;
+                dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
             }
 
             progress.nextStep("validating index");
@@ -343,7 +347,8 @@ pub fn runIndexCommand(
 
             progress.stop("index complete");
             log.debug("index complete: n_objects={d}, n_classes={d}, n_edges={d}, n_roots={d}", .{ n_objects, n_classes, n_edges, n_roots });
-            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
+            const dominator_algorithm = if (compute_dominators) "chk" else "none";
+            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"dominator_algorithm\":\"{s}\",\"dominator_iterations\":{d},\"dominator_shortcut_nodes\":{d},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
                 escaped_index_dir,
                 n_objects,
                 n_classes,
@@ -351,6 +356,9 @@ pub fn runIndexCommand(
                 n_roots,
                 virtual_root_ordinal,
                 compute_dominators,
+                dominator_algorithm,
+                dominator_iterations,
+                dominator_shortcut_nodes,
                 dominator_n_reachable,
                 dominator_total_retained,
                 scan_result.diagnostics.duplicate_object_ids,

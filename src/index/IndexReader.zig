@@ -25,6 +25,8 @@ pub const Error = error{
     InvalidFieldType,
     LimitTooLarge,
     InvalidDirection,
+    NoRetainedData,
+    InvalidArgument,
 };
 
 const MappedFile = struct {
@@ -628,6 +630,97 @@ pub const Reader = struct {
         if (ordinal > self.n_objects) return 0;
         const off = ordinal * 8;
         return std.mem.readInt(u64, self.retained[off..][0..8], .little);
+    }
+
+    /// Whether the index has dominator data. Requires BOTH `retained.bin` and
+    /// `dom_parent.bin` to be mapped (I37); a manifest flag alone is not
+    /// enough.
+    pub fn hasDominators(self: *const Reader) bool {
+        return self.retained.len > 0 and self.dom_parent.len > 0;
+    }
+
+    /// The immediate dominator of `ordinal`, or null if `ordinal` is the
+    /// virtual root, unreachable, or the index has no dominator data.
+    /// S3 name for `domParent`; the two are the same surface.
+    pub fn dominatorOf(self: *const Reader, ordinal: u32) ?u32 {
+        return self.domParent(ordinal);
+    }
+
+    /// The retained size of `ordinal` in bytes. 0 if the index has no
+    /// dominator data. S3 name for `retainedBytes`.
+    pub fn retainedSize(self: *const Reader, ordinal: u32) u64 {
+        return self.retainedBytes(ordinal);
+    }
+
+    /// The depth of `ordinal` in the dominator tree: the number of dominator
+    /// links from `ordinal` up to the top of the reachable graph. Nodes whose
+    /// dominator is the virtual root (the on-disk `NONE` value) have depth 0.
+    /// O(depth).
+    pub fn domDepth(self: *const Reader, ordinal: u32) u32 {
+        if (!self.hasDominators()) return 0;
+        var depth: u32 = 0;
+        var cur = ordinal;
+        var guard: u32 = 0;
+        while (guard < self.n_objects + 1) : (guard += 1) {
+            const p = self.dominatorOf(cur) orelse break;
+            if (p == cur) break;
+            cur = p;
+            depth += 1;
+            if (cur == self.virtual_root_ordinal) break;
+        }
+        return depth;
+    }
+
+    /// The dominator chain from `ordinal` up to the top of the reachable
+    /// graph, in child-to-root order. The chain holds at most `max` entries;
+    /// the virtual root itself is never included because `dom_parent.bin`
+    /// stores `NONE` for its children. Caller owns the returned slice.
+    pub fn domPath(self: *const Reader, allocator: std.mem.Allocator, ordinal: u32, max: u32) ![]u32 {
+        var list = std.ArrayList(u32).empty;
+        errdefer list.deinit(allocator);
+        if (!self.hasDominators()) return list.toOwnedSlice(allocator);
+        var cur = ordinal;
+        var guard: u32 = 0;
+        while (guard < max + 1 and guard < self.n_objects + 1) : (guard += 1) {
+            try list.append(allocator, cur);
+            if (cur == self.virtual_root_ordinal) break;
+            const p = self.dominatorOf(cur) orelse break;
+            if (p == cur) break;
+            cur = p;
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// The direct dominator-tree children of `ordinal`. For the virtual root
+    /// this scans `dom_order.bin` (its children are the reachable nodes stored
+    /// with `NONE`); for any other ordinal it scans `dom_parent.bin`.
+    /// Caller owns the returned slice.
+    pub fn domChildren(self: *const Reader, allocator: std.mem.Allocator, ordinal: u32) ![]u32 {
+        var list = std.ArrayList(u32).empty;
+        errdefer list.deinit(allocator);
+        if (!self.hasDominators()) return list.toOwnedSlice(allocator);
+
+        if (ordinal == self.virtual_root_ordinal) {
+            const n_slots = self.dom_order.len / 4;
+            var slot: usize = 0;
+            while (slot < n_slots) : (slot += 1) {
+                const v = std.mem.readInt(u32, self.dom_order[slot * 4 ..][0..4], .little);
+                if (v == ordinal) continue;
+                if (self.dominatorOf(v) == null) {
+                    try list.append(allocator, v);
+                }
+            }
+        } else {
+            var v: u32 = 0;
+            while (v < self.n_objects) : (v += 1) {
+                if (self.dominatorOf(v)) |p| {
+                    if (p == ordinal) {
+                        try list.append(allocator, v);
+                    }
+                }
+            }
+        }
+        return list.toOwnedSlice(allocator);
     }
 
     fn csrRange(self: *const Reader, offsets: []const u8, adjacency: []const u8, ordinal: u32) []align(1) const u32 {
@@ -1646,6 +1739,196 @@ fn writeTreeNode(
         _ = path.remove(ordinal);
     }
     try writer.writeAll("]}");
+}
+
+/// Print the retained size, shallow size, delta, dominator depth, and the
+/// dominator chain for a single object as one JSON line (I34).
+///
+/// Fails with `error.NoRetainedData` when the index has no dominator data,
+/// and `error.ObjectNotFound` when `raw_id` is not in the catalog.
+pub fn writeRetained(self: *const Reader, writer: *Io.Writer, raw_id: hprof.Id) !void {
+    if (!self.hasDominators()) return error.NoRetainedData;
+    const ordinal = self.ordinalForRawId(raw_id) orelse return error.ObjectNotFound;
+
+    const row = self.catalogRow(ordinal);
+    const shallow: u64 = row.shallow_size;
+    const retained = self.retainedSize(ordinal);
+
+    try writer.writeAll("{\"id\":");
+    try writeId(writer, raw_id);
+    try writer.print(",\"ordinal\":{d},\"class\":", .{ordinal});
+    try writeJsonString(writer, self.className(row.class_raw_id));
+    try writer.print(",\"shallow_bytes\":{d},\"retained_bytes\":{d},\"retained_delta_bytes\":{d}", .{
+        shallow,
+        retained,
+        retained - shallow,
+    });
+    try writer.print(",\"dom_depth\":{d}", .{self.domDepth(ordinal)});
+    try writer.writeAll(",\"dominators\":[");
+
+    // The dominator chain from `ordinal` upward, excluding `ordinal` itself.
+    // The on-disk convention stores NONE for children of the virtual root, so
+    // the chain ends at the top real object and never includes the root.
+    var cur = ordinal;
+    var first = true;
+    var guard: u32 = 0;
+    while (guard < self.n_objects + 1) : (guard += 1) {
+        const p = self.dominatorOf(cur) orelse break;
+        if (p == cur) break;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        const p_row = self.catalogRow(p);
+        try writer.writeAll("{\"id\":");
+        try writeId(writer, self.rawIdForOrdinal(p) orelse 0);
+        try writer.writeAll(",\"class\":");
+        try writeJsonString(writer, self.className(p_row.class_raw_id));
+        try writer.print(",\"retained_bytes\":{d}}}", .{self.retainedSize(p)});
+        cur = p;
+    }
+
+    try writer.writeAll("]}\n");
+}
+
+pub const RetainersOptions = struct {
+    /// How many of the largest-retained objects to report.
+    top: u32 = 10,
+};
+
+/// A bounded min-heap keyed by (retained, ordinal). Holding the top-N of a
+/// flat O(V) scan without allocating more than `top` entries.
+const RetainedHeap = struct {
+    items: std.ArrayList(Item),
+    allocator: std.mem.Allocator,
+
+    const Item = struct { retained: u64, ordinal: u32 };
+
+    fn init(allocator: std.mem.Allocator) RetainedHeap {
+        return .{ .items = std.ArrayList(Item).empty, .allocator = allocator };
+    }
+
+    fn deinit(self: *RetainedHeap) void {
+        self.items.deinit(self.allocator);
+    }
+
+    fn capacity(self: *const RetainedHeap) usize {
+        return self.items.items.len;
+    }
+
+    /// The smallest retained size in the heap, or 0 when empty.
+    fn minRetained(self: *const RetainedHeap) u64 {
+        if (self.items.items.len == 0) return 0;
+        return self.items.items[0].retained;
+    }
+
+    fn push(self: *RetainedHeap, item: Item) !void {
+        try self.items.append(self.allocator, item);
+        var i = self.items.items.len - 1;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (!less(self.items.items[i], self.items.items[parent])) break;
+            std.mem.swap(Item, &self.items.items[i], &self.items.items[parent]);
+            i = parent;
+        }
+    }
+
+    /// Replace the root (the current minimum) with `item` and restore the
+    /// heap invariant.
+    fn replaceMin(self: *RetainedHeap, item: Item) void {
+        self.items.items[0] = item;
+        const n = self.items.items.len;
+        var i: usize = 0;
+        while (true) {
+            const left = 2 * i + 1;
+            const right = 2 * i + 2;
+            var smallest = i;
+            if (left < n and less(self.items.items[left], self.items.items[smallest])) smallest = left;
+            if (right < n and less(self.items.items[right], self.items.items[smallest])) smallest = right;
+            if (smallest == i) break;
+            std.mem.swap(Item, &self.items.items[i], &self.items.items[smallest]);
+            i = smallest;
+        }
+    }
+
+    /// Order by (retained ASC, ordinal ASC): the min-heap's key.
+    fn less(a: Item, b: Item) bool {
+        if (a.retained != b.retained) return a.retained < b.retained;
+        return a.ordinal < b.ordinal;
+    }
+};
+
+/// List the objects with the largest retained size as one JSON line.
+///
+/// Scans every ordinal keeping a bounded min-heap of size `top`; this is
+/// inherently O(V) because `retained.bin` is a flat array with no index.
+/// Only reachable objects are considered (unreachable objects are retained
+/// by nothing); the virtual root itself is not a catalog row. The final
+/// order is `(retained DESC, ordinal ASC)` so the output is byte-identical
+/// across runs regardless of the heap's internal layout.
+///
+/// Fails with `error.NoRetainedData` when the index has no dominator data.
+pub fn writeRetainers(self: *const Reader, writer: *Io.Writer, opts: RetainersOptions) !void {
+    if (!self.hasDominators()) return error.NoRetainedData;
+
+    // On disk, dom_parent == NONE means "unreachable" OR "child of the
+    // virtual root". Reachability therefore comes from dom_order.bin, which
+    // holds exactly the reachable nodes. Excluding only unreachable objects
+    // keeps the true top retainers (children of the virtual root are
+    // typically the largest ones); the virtual root itself is not a catalog
+    // row and is never scanned.
+    const V: u32 = @intCast(self.n_objects + 1);
+    const reachable = try self.allocator.alloc(bool, V);
+    defer self.allocator.free(reachable);
+    @memset(reachable, false);
+    const n_slots = self.dom_order.len / 4;
+    var slot: usize = 0;
+    while (slot < n_slots) : (slot += 1) {
+        const v = std.mem.readInt(u32, self.dom_order[slot * 4 ..][0..4], .little);
+        if (v < V) reachable[v] = true;
+    }
+
+    var heap = RetainedHeap.init(self.allocator);
+    defer heap.deinit();
+    const top: usize = opts.top;
+
+    var ord: u32 = 0;
+    while (ord < self.n_objects) : (ord += 1) {
+        if (!reachable[ord]) continue; // unreachable objects are not retainers
+        const r = self.retainedSize(ord);
+        if (top == 0) break;
+        if (heap.capacity() < top) {
+            try heap.push(.{ .retained = r, .ordinal = ord });
+        } else if (r > heap.minRetained()) {
+            heap.replaceMin(.{ .retained = r, .ordinal = ord });
+        }
+    }
+
+    // Deterministic output order: retained DESC, ordinal ASC.
+    const items = heap.items.items;
+    std.mem.sort(RetainedHeap.Item, items, {}, retainersOrder);
+
+    try writer.print("{{\"top\":{d},\"items\":[", .{top});
+    for (items, 0..) |item, i| {
+        if (i > 0) try writer.writeByte(',');
+        const row = self.catalogRow(item.ordinal);
+        try writer.writeAll("{\"id\":");
+        try writeId(writer, self.rawIdForOrdinal(item.ordinal) orelse 0);
+        try writer.print(",\"ordinal\":{d},\"class\":", .{item.ordinal});
+        try writeJsonString(writer, self.className(row.class_raw_id));
+        try writer.print(",\"shallow_bytes\":{d},\"retained_bytes\":{d},\"retained_delta_bytes\":{d},\"dom_depth\":{d}}}", .{
+            row.shallow_size,
+            item.retained,
+            item.retained - row.shallow_size,
+            self.domDepth(item.ordinal),
+        });
+    }
+    try writer.writeAll("]}\n");
+}
+
+/// Sort order for the retainers list: retained descending, ordinal ascending
+/// (the tiebreak that makes the output stable and reviewable).
+fn retainersOrder(_: void, a: RetainedHeap.Item, b: RetainedHeap.Item) bool {
+    if (a.retained != b.retained) return a.retained > b.retained;
+    return a.ordinal < b.ordinal;
 }
 
 fn writeRootKindName(writer: *Io.Writer, kind: u8) !void {

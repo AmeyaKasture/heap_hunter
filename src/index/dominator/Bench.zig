@@ -168,8 +168,10 @@ const Timing = struct {
 };
 
 fn nowMs(io: Io) u64 {
-    const ts = Io.Timestamp.now(io, .awake);
-    return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+    // Monotonic milliseconds via the Io clock (same source as Commands'
+    // stage timings), keeping the bench free of any libc dependency.
+    const ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_ms));
 }
 
 fn runMeasurement(
