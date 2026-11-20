@@ -57,6 +57,7 @@ pub fn run(
     var mm = try Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        .populate = false,
     });
     defer mm.destroy(io);
 
@@ -192,6 +193,10 @@ test "preflight reuse path with matching manifest" {
     var mm = try Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: only the header and the first/last block are read
+        // for the fingerprint, so prefaulting the whole dump would be a
+        // full-file read for nothing.
+        .populate = false,
     });
     defer mm.destroy(io);
 

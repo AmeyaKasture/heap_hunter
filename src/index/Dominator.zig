@@ -1,18 +1,23 @@
 //! Stage 7: compute the dominator tree and retained sizes.
 const std = @import("std");
 const Io = std.Io;
+const profiling = @import("profiling");
 
 pub const Backend = @import("dominator/Backend.zig");
 const CsrView = @import("dominator/CsrView.zig").CsrView;
 const Graphs = @import("dominator/Graphs.zig");
 const Numbering = @import("dominator/Numbering.zig");
 const Chk = @import("dominator/Chk.zig");
+const Lt = @import("dominator/Lt.zig");
 const Manifest = @import("Manifest.zig");
 const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
 const TestSupport = @import("dominator/TestSupport.zig");
 
 pub const NONE = std.math.maxInt(u32);
+
+/// Parses a user-facing algorithm name; see Backend.parseAlgorithm.
+pub const parseAlgorithmName = Backend.parseAlgorithm;
 
 pub const dom_parent_entry_size = 4;
 pub const dom_order_entry_size = 4;
@@ -63,24 +68,73 @@ pub fn run(
     const V = n_objects + 1;
     const root: u32 = @intCast(V - 1);
 
-    // 1. Budget pre-check (conservative: stack depth = V).
+    // 1. Budget pre-check. Only the numbering phase is allocated before the
+    // DFS depth is known, so this gate covers the numbering arrays plus a
+    // worst-case-depth (V) DFS stack; the full per-node model is enforced
+    // against the measured depth in step 5. Gating the whole stage here
+    // would over-reserve the stack cushion (12 B/node on a 21M-object dump
+    // is ~250 MB of pure cushion) and reject budgets the stage actually
+    // fits, e.g. the 1024 MB tier on the 2 GB workbench dump.
     const budget_bytes = job.dominator_budget_bytes;
-    const bytes_per_node = chkBytesPerNode();
-    const conservative_stack = @as(u64, V) * 8;
-    const required_conservative = checkedMulAdd(V, bytes_per_node, conservative_stack) catch return error.DominatorInternalError;
-    if (required_conservative > budget_bytes) {
+    const bytes_per_node = bytesPerNode(options.algorithm);
+    const numbering_bytes_per_node: u64 = if (options.algorithm == .lt) 17 else 9;
+    const stack_bytes_per_node: u64 = if (options.algorithm == .lt) 12 else 8;
+    const pre_required = checkedMulAdd(V, numbering_bytes_per_node + 8, 0) catch return error.DominatorInternalError;
+    if (pre_required > budget_bytes) {
         return error.DominatorBudgetExceeded;
     }
 
-    // 2. Validate n_edges against CSR lengths.
-    const out_offsets_data = try Io.Dir.cwd().readFileAlloc(io, out_offsets_path, allocator, .unlimited);
-    defer allocator.free(out_offsets_data);
-    const out_targets_data = try Io.Dir.cwd().readFileAlloc(io, out_targets_path, allocator, .unlimited);
-    defer allocator.free(out_targets_data);
-    const in_offsets_data = try Io.Dir.cwd().readFileAlloc(io, in_offsets_path, allocator, .unlimited);
-    defer allocator.free(in_offsets_data);
-    const in_sources_data = try Io.Dir.cwd().readFileAlloc(io, in_sources_path, allocator, .unlimited);
-    defer allocator.free(in_sources_data);
+    // 2. Map the CSR and catalog files, then validate n_edges against CSR
+    // lengths.
+    //
+    // Every stage file is mapped read-only with demand paging instead of
+    // being read wholesale into anonymous memory: on the 20 GB reference
+    // dump (82M objects, 94M edges) the two CSR pairs total ~2.1 GB and the
+    // catalog is larger still, which as anonymous allocations would spike
+    // RSS uncounted by the budget and push the box into swap. Mapped
+    // clean pages evict under memory pressure without thrashing.
+    //
+    // Page-fault expectations, so a bench run (zig build bench --
+    // dominator, cold vs. warm) can give a sound verdict:
+    //   * out_offsets/out_targets: consumed once, sequentially, by the DFS.
+    //     One fault per 4 KiB page, never re-faulted. No action possible.
+    //   * catalog: one sequential pass for shallow sizes. Same as above.
+    //   * in_offsets/in_sources: touched in preorder-slot order, which is
+    //     scattered over the ordinal space, so each 4 KiB page (512 offset
+    //     rows, 1024 source rows) is faulted at scattered times and can
+    //     evict and re-fault when RAM is tight. This is the one mapping
+    //     with a re-fault risk. Escalation path, only if the bench shows
+    //     the cold/warm dominator-pass ratio staying well above 1:
+    //     (b) prefault in_offsets only (.populate = true): ~8 B/node
+    //         resident (~656 MB at 82M nodes); apply when the dominator
+    //         budget headroom covers that plus ~10% slack.
+    //     (c) build a dfn-ordered private pred array in one sequential
+    //         in-CSR sweep, then drop the in-CSR mapping for the backend:
+    //         +4 B/edge anonymous (~380 MB at 94M edges), LT peak model
+    //         rises from 41 to ~50 B/node. Apply when (b) does not fit
+    //         the budget or does not close the cold/warm gap.
+    // A cold/warm ratio near 1 means the page cache absorbed the pass and
+    // neither escalation is worth its memory.
+    // The four CSR mappings live for the whole stage (the views and the
+    // backends index into them), so their defers sit at function scope; the
+    // span closes explicitly instead, so later phases stay siblings of
+    // map_csr in the --profile tree rather than children of it.
+    var map_span = profiling.begin(io, "map_csr");
+    errdefer map_span.end(io);
+
+    var out_offsets_map = try mapStageFile(io, out_offsets_path);
+    defer out_offsets_map.deinit(io);
+    var out_targets_map = try mapStageFile(io, out_targets_path);
+    defer out_targets_map.deinit(io);
+    var in_offsets_map = try mapStageFile(io, in_offsets_path);
+    defer in_offsets_map.deinit(io);
+    var in_sources_map = try mapStageFile(io, in_sources_path);
+    defer in_sources_map.deinit(io);
+
+    const out_offsets_data = out_offsets_map.memory();
+    const out_targets_data = out_targets_map.memory();
+    const in_offsets_data = in_offsets_map.memory();
+    const in_sources_data = in_sources_map.memory();
 
     if (out_targets_data.len != n_edges * 4) return error.InvalidCsrFile;
     if (in_sources_data.len != n_edges * 4) return error.InvalidCsrFile;
@@ -90,13 +144,23 @@ pub fn run(
     const in_view = CsrView.init(@intCast(V), in_offsets_data, in_sources_data);
     try out_view.validate();
     try in_view.validate();
+    map_span.end(io);
 
-    // 4. Shared DFS.
-    var numbering = try Numbering.compute(allocator, @intCast(V), &out_view);
+    // 4. Shared DFS. LT consumes the DFS tree (preorder slots and parents);
+    // CHK consumes the reverse postorder numbering.
+    var numbering: Numbering.Numbering = undefined;
+    {
+        var span = profiling.begin(io, "dfs_numbering");
+        defer span.end(io);
+        const numbering_options: Numbering.Options = .{
+            .emit_dfs_tree = options.algorithm == .lt,
+        };
+        numbering = try Numbering.compute(allocator, @intCast(V), &out_view, numbering_options);
+    }
     defer numbering.deinit(allocator);
 
-    // 5. Budget re-check with real depth.
-    const real_stack = @as(u64, numbering.max_depth) * 8;
+    // 5. Budget re-check with the real depth.
+    const real_stack = @as(u64, numbering.max_depth) * stack_bytes_per_node;
     const required_real = checkedMulAdd(V, bytes_per_node, real_stack) catch return error.DominatorInternalError;
     if (required_real > budget_bytes) {
         return error.DominatorBudgetExceeded;
@@ -111,61 +175,94 @@ pub fn run(
         .rpo_num = numbering.rpo_num,
         .rpo_vertex = numbering.rpo_vertex,
         .reachable = numbering.reachable,
+        .dfn = numbering.dfn,
+        .dfn_vertex = numbering.dfn_vertex,
+        .parent = numbering.parent,
+        .max_dfs_depth = numbering.max_depth,
         .options = options,
         .out_edges = &out_view,
         .in_edges = &in_view,
     };
-    const backend_result = try Chk.compute(&ctx);
+    // 6. Backend. The label names the algorithm so a --profile tree splits
+    // the stage by backend without a runtime string (labels are comptime).
+    const backend_result = blk: {
+        var span = if (options.algorithm == .lt)
+            profiling.begin(io, "lt_backend")
+        else
+            profiling.begin(io, "chk_backend");
+        defer span.end(io);
+        break :blk switch (options.algorithm) {
+            .chk => try Chk.compute(&ctx),
+            .lt => try Lt.compute(&ctx),
+        };
+    };
     defer allocator.free(backend_result.idom);
 
-    // 7. Read shallow sizes from catalog.
-    const catalog_data = try Io.Dir.cwd().readFileAlloc(io, catalog_path, allocator, .unlimited);
-    defer allocator.free(catalog_data);
-    if (catalog_data.len % Scanner.catalog_row_size != 0) return error.InvalidCatalogFile;
-    if (catalog_data.len / Scanner.catalog_row_size != n_objects) return error.InvalidCatalogFile;
+    // The DFS-tree products are dead once the backend has spoken; freeing
+    // them now keeps the orchestrator phase from stacking on top of them.
+    numbering.releaseDfsTree(allocator);
 
+    // 7. Read shallow sizes from the catalog (demand-paged, one sequential
+    // pass; see the mapping rationale in step 2). The catalog mapping is
+    // dead after this phase, so the whole phase is block-scoped.
     const shallow = try allocator.alloc(u64, V);
     defer allocator.free(shallow);
-    var v: u32 = 0;
     var total_shallow_reachable: u64 = 0;
-    while (v < n_objects) : (v += 1) {
-        const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
-        shallow[v] = row.shallow_size;
-        if (numbering.reachable[v]) {
-            total_shallow_reachable += row.shallow_size;
+    {
+        var span = profiling.begin(io, "read_shallow");
+        defer span.end(io);
+        var catalog_map = try mapStageFile(io, catalog_path);
+        defer catalog_map.deinit(io);
+        const catalog_data = catalog_map.memory();
+        if (catalog_data.len % Scanner.catalog_row_size != 0) return error.InvalidCatalogFile;
+        if (catalog_data.len / Scanner.catalog_row_size != n_objects) return error.InvalidCatalogFile;
+
+        var v: u32 = 0;
+        while (v < n_objects) : (v += 1) {
+            const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
+            shallow[v] = row.shallow_size;
+            if (numbering.reachable[v]) {
+                total_shallow_reachable += row.shallow_size;
+            }
         }
     }
     shallow[root] = 0;
 
     // 8. Build dom_parent (root -> NONE) and retained (reverse RPO sweep).
+    // The arrays live on to the write phase, so only the computation sits
+    // inside the span block.
     const dom_parent = try allocator.alloc(u32, V);
     defer allocator.free(dom_parent);
-    @memset(dom_parent, NONE);
-
     const retained = try allocator.alloc(u64, V);
     defer allocator.free(retained);
-    for (0..V) |i| {
-        retained[i] = shallow[i];
-    }
-    retained[root] = 0;
+    {
+        var span = profiling.begin(io, "retained_sweep");
+        defer span.end(io);
+        @memset(dom_parent, NONE);
 
-    v = 0;
-    while (v < V) : (v += 1) {
-        if (!numbering.reachable[v] or v == root) {
-            dom_parent[v] = NONE;
-            continue;
+        for (0..V) |i| {
+            retained[i] = shallow[i];
         }
-        const idom = backend_result.idom[v];
-        dom_parent[v] = if (idom == v or idom == root) NONE else idom;
-    }
+        retained[root] = 0;
 
-    var rpo_slot: u32 = numbering.n_reachable;
-    while (rpo_slot > 1) {
-        rpo_slot -= 1;
-        const node = numbering.rpo_vertex[rpo_slot];
-        const p = dom_parent[node];
-        if (p != NONE) {
-            retained[p] += retained[node];
+        var v: u32 = 0;
+        while (v < V) : (v += 1) {
+            if (!numbering.reachable[v] or v == root) {
+                dom_parent[v] = NONE;
+                continue;
+            }
+            const idom = backend_result.idom[v];
+            dom_parent[v] = if (idom == v or idom == root) NONE else idom;
+        }
+
+        var rpo_slot: u32 = numbering.n_reachable;
+        while (rpo_slot > 1) {
+            rpo_slot -= 1;
+            const node = numbering.rpo_vertex[rpo_slot];
+            const p = dom_parent[node];
+            if (p != NONE) {
+                retained[p] += retained[node];
+            }
         }
     }
     retained[root] = total_shallow_reachable;
@@ -178,9 +275,13 @@ pub fn run(
     const retained_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "retained.bin" });
     errdefer allocator.free(retained_path);
 
-    try writeU32File(io, dom_parent_path, dom_parent);
-    try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
-    try writeU64File(io, retained_path, retained);
+    {
+        var span = profiling.begin(io, "write_outputs");
+        defer span.end(io);
+        try writeU32File(io, dom_parent_path, dom_parent);
+        try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
+        try writeU64File(io, retained_path, retained);
+    }
 
     // 9b. Retained-rank sidecar: the reachable real objects (dom_order minus
     // the virtual root at slot 0) sorted by (retained DESC, ordinal ASC) —
@@ -229,6 +330,44 @@ fn checkedMulAdd(a: u64, b: u64, c: u64) !u64 {
     return try std.math.add(u64, prod, c);
 }
 
+/// A read-only, demand-paged mapping of one stage file. The file stays open
+/// for the mapping's lifetime; `deinit` unmaps before closing. A zero-length
+/// file has no mapping: mmap rejects length 0, and the callers' length
+/// checks treat it as empty either way (a dump with no references produces
+/// empty CSR adjacency files).
+const StageMap = struct {
+    file: Io.File,
+    mm: ?Io.File.MemoryMap,
+
+    fn deinit(self: *StageMap, io: Io) void {
+        if (self.mm) |*mm| mm.destroy(io);
+        self.file.close(io);
+    }
+
+    fn memory(self: *const StageMap) []const u8 {
+        if (self.mm) |mm| return mm.memory;
+        return &.{};
+    }
+};
+
+fn mapStageFile(io: Io, path: []const u8) !StageMap {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    errdefer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len == 0) return .{ .file = file, .mm = null };
+    // Demand paging: every stage file here is either streamed once
+    // sequentially (out-CSR, catalog) or touched in a scattered order that
+    // may exceed RAM (in-CSR); see the escalation rationale in `run`.
+    // Prefaulting would turn both into a full-file read up front.
+    const mm = try Io.File.MemoryMap.create(io, file, .{
+        .len = file_len,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    errdefer mm.destroy(io);
+    return .{ .file = file, .mm = mm };
+}
+
 /// Format the user-facing budget-exceeded message. The caller supplies the
 /// writer so the message can be emitted as a true CLI error (e.g. prefixed
 /// with "error:") without writing to stderr during unit tests, which would
@@ -244,14 +383,26 @@ pub fn formatBudgetError(V: u64, required: u64, budget: usize, writer: anytype) 
     try writer.print("       raise it with --dominator-budget-mb, or index with --no-dominators\n", .{});
 }
 
-pub fn chkBytesPerNode() u64 {
-    return 4 + // rpo_num
-        4 + // rpo_vertex
-        4 + // idom
-        4 + // sole_pred
-        4 + // shallow
-        8 + // retained
-        1; // reachable
+/// Anonymous bytes per node the stage's peak phase needs, by algorithm.
+/// The model must cover every phase's live arrays, including the
+/// orchestrator's (which is why `shallow` counts 8, not 4). The CSR and
+/// catalog bytes are deliberately excluded: they are demand-paged,
+/// file-backed mappings whose clean pages evict under pressure, not
+/// anonymous allocations the budget must reserve for.
+pub fn bytesPerNode(algorithm: Backend.Algorithm) u64 {
+    return switch (algorithm) {
+        // Backend phase: rpo_num 4 + rpo_vertex 4 + reachable 1 +
+        // idom 4 + sole_pred 4 = 17. Orchestrator phase (rpo_num is freed
+        // only at scope end): rpo_num 4 + rpo_vertex 4 + reachable 1 +
+        // idom 4 + shallow 8 + retained 8 + dom_parent 4 = 33.
+        .chk => 4 + 4 + 1 + 4 + 8 + 8 + 4,
+        // Main-loop phase (peak): rpo_vertex 4 + dfn 4 + dfn_vertex 4 +
+        // parent 4 + reachable 1 + sdom 4 + doms 4 + anc 4 + label 4 +
+        // bucket_head 4 + bucket_next 4 = 41. The backend frees its
+        // scratch before returning and the orchestrator releases the
+        // DFS-tree products, so its phase is 29.
+        .lt => 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 4,
+    };
 }
 
 fn writeU32File(io: Io, path: []const u8, values: []const u32) !void {
@@ -734,9 +885,79 @@ test "dominator engine reports the required bytes and budget when over budget" {
 
 test "declared budget figure is at least the real allocation" {
     const V: u64 = 1_000_000;
-    const real_arrays = V * chkBytesPerNode();
-    const real_stack = V * 8; // worst-case DFS depth
-    const real_total = real_arrays + real_stack;
-    const declared = V * (chkBytesPerNode() + 8);
-    try std.testing.expect(declared >= real_total);
+    for ([_]Backend.Algorithm{ .chk, .lt }) |algorithm| {
+        const bytes_per_node = bytesPerNode(algorithm);
+        const stack_bytes_per_node: u64 = if (algorithm == .lt) 12 else 8;
+        const numbering_bytes_per_node: u64 = if (algorithm == .lt) 17 else 9;
+
+        // The real check covers the stage's peak arrays plus the measured
+        // stacks, bounded by V for the worst chain dump.
+        const real_worst = V * bytes_per_node + V * stack_bytes_per_node;
+        const declared = V * (bytesPerNode(algorithm) + stack_bytes_per_node);
+        try std.testing.expect(declared >= real_worst);
+
+        // The pre-check gates only the numbering phase, so it never
+        // rejects a budget the real check accepts.
+        try std.testing.expect(numbering_bytes_per_node + 8 <= bytes_per_node);
+
+        // The declared per-node figure also covers each phase's arrays:
+        // CHK backend 17, CHK orchestrator 33, LT main loop 41,
+        // LT orchestrator 29.
+        try std.testing.expect(bytes_per_node >= 17);
+        try std.testing.expect(bytes_per_node >= 33);
+    }
+}
+
+test "dominator budget gate is phase-aware" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // 4-node diamond. LT: pre-check 4 x 25 = 100 B, real check 4 x 41 +
+    // 3 x 12 = 200 B. CHK: pre-check 4 x 17 = 68 B, real check 4 x 33 +
+    // 3 x 8 = 156 B. For both, a 150 B budget passes the pre-check and is
+    // then rejected by the real check with the honest figure, and 250 B
+    // fits both — even though a whole-stage conservative gate (4 x 53 B)
+    // would have rejected a budget the stage can actually run in.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const edges = &[_][2]u32{
+        .{ 3, 0 },
+        .{ 3, 1 },
+        .{ 0, 2 },
+        .{ 1, 2 },
+    };
+    const shallow = &[_]u32{ 10, 10, 20 };
+
+    try writeTestCsr(allocator, io, tmp_path, 4, edges, shallow);
+
+    var job = try createTestJob(allocator, io, tmp_path);
+    defer job.deinit(allocator);
+
+    var diagnostics: Manifest.Diagnostics = .{};
+    job.dominator_budget_bytes = 150;
+    try std.testing.expectError(error.DominatorBudgetExceeded, runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    ));
+
+    job.dominator_budget_bytes = 250;
+    const result = try runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    );
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 4), result.n_reachable);
 }

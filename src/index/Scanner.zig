@@ -489,7 +489,7 @@ pub fn run(
 
 /// Minimum segments a worker must be assigned for spawning to pay off;
 /// below this the inline path is faster than thread startup.
-const min_segments_per_worker: usize = 32;
+pub const min_segments_per_worker: usize = 32;
 
 /// Intra-step fraction landmarks for the scan step. Pass 1 walks record
 /// headers, the segment scan parses heap records (the dominant cost on
@@ -832,7 +832,7 @@ fn scanSegmentsDispatched(
 
 /// Stream the entire contents of `path` into `dest` through a bounded buffer,
 /// so merge memory does not scale with spill-file size.
-fn streamSpillFile(io: Io, path: []const u8, dest: *Io.Writer, buf: []u8) !void {
+pub fn streamSpillFile(io: Io, path: []const u8, dest: *Io.Writer, buf: []u8) !void {
     const dir = Io.Dir.cwd();
     const file = try dir.openFile(io, path, .{});
     defer file.close(io);
@@ -844,7 +844,7 @@ fn streamSpillFile(io: Io, path: []const u8, dest: *Io.Writer, buf: []u8) !void 
 /// (descending, offset ascending on ties) and each goes to the currently
 /// lightest worker bucket. Deterministic for a given segment list, and each
 /// bucket preserves that sorted order. Caller owns the returned buckets.
-fn partitionSegmentsLPT(
+pub fn partitionSegmentsLPT(
     allocator: std.mem.Allocator,
     segments: []const SegmentRange,
     n_workers: usize,
@@ -1031,7 +1031,7 @@ const ScanAccs = struct {
 };
 
 /// Byte range of one heap dump segment body within the source HPROF.
-const SegmentRange = struct {
+pub const SegmentRange = struct {
     offset: u64,
     len: u64,
 };
@@ -1056,7 +1056,7 @@ const ScanMode = union(enum) {
 /// Size of each worker's spill-file write buffer. Workers stream scan output
 /// to per-worker spill files through this buffer instead of accumulating rows
 /// in RAM, keeping parallel-scan memory bounded regardless of dump size.
-const worker_io_buffer_size = 65536;
+pub const worker_io_buffer_size = 65536;
 
 /// Per-worker scan state for the parallel heap-segment phase.
 /// Catalog/root rows are streamed to per-worker spill files (fixed 64 KiB
@@ -1205,7 +1205,7 @@ fn initPrimHistogram() [16]PrimHistogramEntry {
     return histogram;
 }
 
-fn mergeDiagnostics(dst: *Manifest.Diagnostics, src: *const Manifest.Diagnostics) void {
+pub fn mergeDiagnostics(dst: *Manifest.Diagnostics, src: *const Manifest.Diagnostics) void {
     inline for (@typeInfo(Manifest.Diagnostics).@"struct".fields) |f| {
         @field(dst, f.name) += @field(src, f.name);
     }
@@ -1727,7 +1727,7 @@ const DispatchOutcome = struct {
 
 /// Collect the byte ranges of every HEAP_DUMP / HEAP_DUMP_SEGMENT record body,
 /// mirroring what `run` records before dispatching to the scan phase.
-fn collectTestSegmentRanges(allocator: std.mem.Allocator, source_data: []const u8) ![]SegmentRange {
+pub fn collectTestSegmentRanges(allocator: std.mem.Allocator, source_data: []const u8) ![]SegmentRange {
     var segments: std.ArrayList(SegmentRange) = .empty;
     errdefer segments.deinit(allocator);
     var reader = try hprof.Reader.init(source_data);

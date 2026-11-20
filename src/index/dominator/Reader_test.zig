@@ -482,6 +482,17 @@ fn buildIndex(
     fixture: []const u8,
     with_dominators: bool,
 ) ![]u8 {
+    return buildIndexWithAlgorithm(allocator, io, tmp_path, fixture, with_dominators, "lt");
+}
+
+fn buildIndexWithAlgorithm(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tmp_path: []const u8,
+    fixture: []const u8,
+    with_dominators: bool,
+    algorithm: []const u8,
+) ![]u8 {
     const index_dir = try std.fs.path.join(allocator, &.{ tmp_path, "index" });
     errdefer allocator.free(index_dir);
 
@@ -502,6 +513,7 @@ fn buildIndex(
             .force = true,
             .no_progress = true,
             .compute_dominators = with_dominators,
+            .dominator_algorithm = algorithm,
         },
         &stdout.writer,
         &stderr.writer,
@@ -515,9 +527,12 @@ fn buildIndex(
     if (with_dominators) {
         // I36: the index JSON reports the algorithm, the iteration count, and
         // the reachable count.
-        try std.testing.expect(std.mem.indexOf(u8, output, "\"dominator_algorithm\":\"chk\"") != null);
+        const algo_tag = try std.fmt.allocPrint(allocator, "\"dominator_algorithm\":\"{s}\"", .{algorithm});
+        defer allocator.free(algo_tag);
+        try std.testing.expect(std.mem.indexOf(u8, output, algo_tag) != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "\"dominator_iterations\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "\"dominator_shortcut_nodes\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"dominator_eval_calls\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "\"n_dominator_nodes\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, output, "\"retained_total_bytes\":") != null);
     } else {
@@ -525,4 +540,38 @@ fn buildIndex(
     }
 
     return index_dir;
+}
+
+test "real dump dominator output is identical for chk and lt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    for (fixtures) |fixture| {
+        std.debug.print("checking chk/lt parity on real dump: {s}\n", .{fixture});
+        var tmp_dir = std.testing.tmpDir(.{});
+        defer tmp_dir.cleanup();
+        const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(tmp_path);
+
+        const lt_dir = try buildIndexWithAlgorithm(allocator, io, tmp_path, fixture, true, "lt");
+        defer allocator.free(lt_dir);
+        const chk_dir = try buildIndexWithAlgorithm(allocator, io, tmp_path, fixture, true, "chk");
+        defer allocator.free(chk_dir);
+
+        // The dominator tree is unique, so two algorithms must produce
+        // byte-identical dom_parent, dom_order, and retained files.
+        for ([_][]const u8{ "dom_parent.bin", "dom_order.bin", "retained.bin" }) |name| {
+            const lt_path = try std.fs.path.join(allocator, &.{ lt_dir, name });
+            defer allocator.free(lt_path);
+            const chk_path = try std.fs.path.join(allocator, &.{ chk_dir, name });
+            defer allocator.free(chk_path);
+
+            const lt_data = try Io.Dir.cwd().readFileAlloc(io, lt_path, allocator, .unlimited);
+            defer allocator.free(lt_data);
+            const chk_data = try Io.Dir.cwd().readFileAlloc(io, chk_path, allocator, .unlimited);
+            defer allocator.free(chk_data);
+
+            try std.testing.expectEqualSlices(u8, chk_data, lt_data);
+        }
+    }
 }

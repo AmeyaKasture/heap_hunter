@@ -74,6 +74,9 @@ pub fn sortAndDedupe(
     var sorted_mm = try Io.File.MemoryMap.create(io, sorted_file, .{
         .len = sorted_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the sorted catalog is streamed once during the
+        // dedupe pass and can be larger than RAM.
+        .populate = false,
     });
     defer sorted_mm.destroy(io);
 

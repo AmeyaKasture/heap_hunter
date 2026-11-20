@@ -2060,6 +2060,7 @@ test {
     _ = @import("index/Csr.zig");
     _ = @import("index/Dominator.zig");
     _ = @import("index/dominator/Chk.zig");
+    _ = @import("index/dominator/Lt.zig");
     _ = @import("index/dominator/Backend.zig");
     _ = @import("index/dominator/CsrView.zig");
     _ = @import("index/dominator/Numbering.zig");
@@ -2078,6 +2079,7 @@ test {
     _ = @import("Overview.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/mapping_policy.zig");
 }
 
 test {
@@ -2093,6 +2095,7 @@ test {
     _ = @import("Commands.zig");
     _ = @import("tests/HprofBuilder.zig");
     _ = @import("tests/integration.zig");
+    _ = @import("tests/mapping_policy.zig");
 }
 
 test "object query decodes string values, scalar types, and array previews" {

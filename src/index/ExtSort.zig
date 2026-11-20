@@ -76,6 +76,10 @@ pub fn sort(
     var input_mm = try Io.File.MemoryMap.create(io, input_file, .{
         .len = input_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the external path exists precisely because the
+        // input does not fit in RAM, and it is consumed in sequential
+        // chunks, so readahead already streams it efficiently.
+        .populate = false,
     });
     defer input_mm.destroy(io);
 
@@ -123,6 +127,12 @@ fn sortInMemory(
     var input_mm = try Io.File.MemoryMap.create(io, input_file, .{
         .len = input_len,
         .protection = .{ .read = true, .write = false },
+        // Prefault: the input is bounded by the sorting budget and is
+        // accessed through a randomly permuted index array, so prefaulting
+        // turns random I/O into a single sequential read. This path already
+        // assumes the budget fits in RAM (it allocates one usize per
+        // record), so the mapping does not change the memory profile.
+        .populate = true,
     });
     defer input_mm.destroy(io);
 
@@ -386,9 +396,16 @@ fn mergeRunGroup(
         mmaps[i] = try Io.File.MemoryMap.create(io, files[i], .{
             .len = len,
             .protection = .{ .read = true, .write = false },
+            // Demand paging: every run is mapped at once and their combined
+            // size is unbounded, so they are read in sequence as the merge
+            // advances rather than prefaulted up front.
+            .populate = false,
         });
         mmaps_created += 1;
-        try mmaps[i].read(io);
+        // No explicit `read` here: the mapping is file-backed and
+        // read-only, so its contents already come from the file.
+        // `MemoryMap.read` would pread the whole run back into the
+        // mapping, copying every byte a second time.
 
         runs[i] = .{ .data = mmaps[i].memory, .cursor = 0 };
     }
@@ -1046,6 +1063,10 @@ pub fn sortStreaming(
     var input_mm = try Io.File.MemoryMap.create(io, input_file, .{
         .len = input_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the external path exists precisely because the
+        // input does not fit in RAM, and it is consumed in sequential
+        // chunks, so readahead already streams it efficiently.
+        .populate = false,
     });
     defer input_mm.destroy(io);
 

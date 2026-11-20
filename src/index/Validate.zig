@@ -117,6 +117,9 @@ fn mapFileReadOnly(
     const mm = Io.File.MemoryMap.create(io, file, .{
         .len = len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: index files are validated with a streaming scan and
+        // can be larger than RAM.
+        .populate = false,
     }) catch |map_err| {
         try Cli.printError(stderr, "index validation failed: failed to map '{s}': {s}", .{ name, @errorName(map_err) });
         file.close(io);

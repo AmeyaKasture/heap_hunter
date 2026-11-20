@@ -31,6 +31,8 @@ pub const IndexOptions = struct {
     no_progress: bool = false,
     compute_dominators: bool = true,
     dominator_budget_mb: ?u32 = null,
+    /// "chk" or "lt"; null falls back to the config default.
+    dominator_algorithm: ?[]const u8 = null,
     profile: bool = false,
 };
 
@@ -64,6 +66,11 @@ pub fn runIndexCommand(
     const sorting_budget_mb = options.sorting_budget_mb orelse config.sortingBudgetMb();
     const compute_dominators = options.compute_dominators;
     const dominator_budget_mb = options.dominator_budget_mb orelse config.dominatorBudgetMb();
+    const dominator_algorithm_name = options.dominator_algorithm orelse config.dominatorAlgorithm();
+    const dominator_algorithm = Dominator.parseAlgorithmName(dominator_algorithm_name) orelse {
+        try Cli.printError(stderr, "unknown dominator algorithm '{s}' (expected chk or lt)", .{dominator_algorithm_name});
+        return error.InvalidArgument;
+    };
     const force = options.force;
     const no_progress = options.no_progress;
 
@@ -124,6 +131,9 @@ pub fn runIndexCommand(
             var source_mm = try Io.File.MemoryMap.create(io, source_file, .{
                 .len = source_len,
                 .protection = .{ .read = true, .write = false },
+                // Demand-page the source dump; prefaulting the whole file
+                // up front wastes kernel time and page-table memory.
+                .populate = false,
             });
             defer source_mm.destroy(io);
 
@@ -138,29 +148,6 @@ pub fn runIndexCommand(
             };
             defer scan_result.deinit(allocator);
             log.debug("stage: scan complete, n_objects approx {d}, diagnostics={any}", .{ scan_result.diagnostics.duplicate_object_ids, scan_result.diagnostics });
-
-            progress.nextStep("sorting catalog");
-            log.debug("stage: sorting catalog", .{});
-            var catalog_result = blk: {
-                var span = profiling.begin(io, "sort_catalog");
-                defer span.end(io);
-                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe, .{
-                    allocator,
-                    io,
-                    job,
-                    scan_result.catalog_path,
-                    &scan_result.diagnostics,
-                    &progress,
-                }) catch |err| switch (err) {
-                    error.TooManyObjects => {
-                        try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
-                        return @as(anyerror!void, err);
-                    },
-                    else => return @as(anyerror!void, err),
-                };
-            };
-            defer catalog_result.deinit(allocator);
-            log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
 
             const classes_path = blk: {
                 var span = profiling.begin(io, "writeClasses");
@@ -208,6 +195,29 @@ pub fn runIndexCommand(
             };
             defer edge_result.deinit(allocator);
             log.debug("stage: emit_edges complete", .{});
+
+            progress.nextStep("sorting catalog");
+            log.debug("stage: sorting catalog", .{});
+            var catalog_result = blk: {
+                var span = profiling.begin(io, "sort_catalog");
+                defer span.end(io);
+                break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe, .{
+                    allocator,
+                    io,
+                    job,
+                    scan_result.catalog_path,
+                    &scan_result.diagnostics,
+                    &progress,
+                }) catch |err| switch (err) {
+                    error.TooManyObjects => {
+                        try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
+                        return @as(anyerror!void, err);
+                    },
+                    else => return @as(anyerror!void, err),
+                };
+            };
+            defer catalog_result.deinit(allocator);
+            log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
 
             progress.nextStep("resolving references");
             log.debug("stage: resolving references", .{});
@@ -259,11 +269,14 @@ pub fn runIndexCommand(
             var dominator_total_retained: u64 = 0;
             var dominator_iterations: u32 = 0;
             var dominator_shortcut_nodes: u64 = 0;
+            var dominator_eval_calls: u64 = 0;
+            var dominator_compress_steps: u64 = 0;
             if (compute_dominators) {
                 progress.nextStep("computing dominators");
                 log.debug("stage: computing dominators", .{});
                 const V = catalog_result.n_objects + 1;
-                const required_conservative: u64 = @intCast(@as(u128, Dominator.chkBytesPerNode()) * V + 8 * V);
+                const stack_bytes_per_node: u64 = if (dominator_algorithm == .lt) 12 else 8;
+                const required_conservative: u64 = @intCast(@as(u128, Dominator.bytesPerNode(dominator_algorithm)) * V + stack_bytes_per_node * V);
                 var dominator_result = blk: {
                     var span = profiling.begin(io, "dominators");
                     defer span.end(io);
@@ -279,7 +292,7 @@ pub fn runIndexCommand(
                         catalog_result.n_objects,
                         join_result.n_edges,
                         &scan_result.diagnostics,
-                        @as(Dominator.Backend.Options, .{}),
+                        @as(Dominator.Backend.Options, .{ .algorithm = dominator_algorithm }),
                     }) catch |err| {
                         if (err == error.DominatorBudgetExceeded) {
                             Dominator.formatBudgetError(V, required_conservative, job.dominator_budget_bytes, stderr) catch {};
@@ -293,7 +306,6 @@ pub fn runIndexCommand(
                 dominator_total_retained = dominator_result.total_retained_bytes;
                 dominator_iterations = dominator_result.stats.iterations;
                 dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
-
                 profiling.counter("dominator_iterations", dominator_result.stats.iterations);
                 profiling.counter("dominator_nodes_changed", dominator_result.stats.nodes_changed);
                 profiling.counter("dominator_shortcut_nodes", dominator_result.stats.shortcut_nodes);
@@ -301,6 +313,9 @@ pub fn runIndexCommand(
                 profiling.counter("dominator_intersect_steps_max", dominator_result.stats.intersect_steps_max);
                 profiling.counter("dominator_reachable_nodes", dominator_result.n_reachable);
                 profiling.counter("dominator_unreachable_objects", dominator_result.unreachable_objects);
+
+                dominator_eval_calls = dominator_result.stats.eval_calls;
+                dominator_compress_steps = dominator_result.stats.compress_steps;
             }
 
             progress.nextStep("validating index");
@@ -331,6 +346,7 @@ pub fn runIndexCommand(
                 .diagnostics = scan_result.diagnostics,
                 .source_path = try allocator.dupe(u8, path),
                 .has_dominators = compute_dominators,
+                .dominator_algorithm = try allocator.dupe(u8, @tagName(dominator_algorithm)),
                 .n_dominator_nodes = dominator_n_reachable,
                 .retained_total_bytes = dominator_total_retained,
             };
@@ -354,8 +370,10 @@ pub fn runIndexCommand(
 
             progress.stop("index complete");
             log.debug("index complete: n_objects={d}, n_classes={d}, n_edges={d}, n_roots={d}", .{ n_objects, n_classes, n_edges, n_roots });
-            const dominator_algorithm = if (compute_dominators) "chk" else "none";
-            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"dominator_algorithm\":\"{s}\",\"dominator_iterations\":{d},\"dominator_shortcut_nodes\":{d},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}},\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
+            // Split into two prints: Zig format calls take at most 32
+            // arguments, and the single-JSON-object output would exceed that.
+            const dominator_algorithm_label = if (compute_dominators) @tagName(dominator_algorithm) else "none";
+            try stdout.print("{{\"status\":\"complete\",\"index_dir\":\"{s}\",\"n_objects\":{d},\"n_classes\":{d},\"n_edges\":{d},\"n_roots\":{d},\"virtual_root_ordinal\":{d},\"has_dominators\":{},\"dominator_algorithm\":\"{s}\",\"dominator_iterations\":{d},\"dominator_shortcut_nodes\":{d},\"dominator_eval_calls\":{d},\"dominator_compress_steps\":{d},\"n_dominator_nodes\":{d},\"retained_total_bytes\":{d},\"diagnostics\":{{\"duplicate_object_ids\":{d},\"skipped_constant_pool_refs\":{d},\"dangling_source_edges\":{d},\"dangling_target_edges\":{d},\"missing_superclass\":{d},\"superclass_cycle\":{d},\"unknown_root_kind\":{d},\"missing_layout\":{d},\"dangling_root_targets\":{d},\"unreachable_objects\":{d}}}", .{
                 escaped_index_dir,
                 n_objects,
                 n_classes,
@@ -363,9 +381,11 @@ pub fn runIndexCommand(
                 n_roots,
                 virtual_root_ordinal,
                 compute_dominators,
-                dominator_algorithm,
+                dominator_algorithm_label,
                 dominator_iterations,
                 dominator_shortcut_nodes,
+                dominator_eval_calls,
+                dominator_compress_steps,
                 dominator_n_reachable,
                 dominator_total_retained,
                 scan_result.diagnostics.duplicate_object_ids,
@@ -378,6 +398,8 @@ pub fn runIndexCommand(
                 scan_result.diagnostics.missing_layout,
                 scan_result.diagnostics.dangling_root_targets,
                 scan_result.diagnostics.unreachable_objects,
+            });
+            try stdout.print(",\"elapsed_ms\":{{\"scan\":{d},\"sort_catalog\":{d},\"layouts\":{d},\"emit_edges\":{d},\"join\":{d},\"csr\":{d},\"dominators\":{d},\"validate\":{d},\"publish\":{d}}},\"index_bytes\":{d}}}\n", .{
                 elapsed.scan,
                 elapsed.sort_catalog,
                 elapsed.layouts,
@@ -451,6 +473,9 @@ pub fn runOverviewCommand(
     var mm = try Io.File.MemoryMap.create(io, file, .{
         .len = file_len,
         .protection = .{ .read = true, .write = false },
+        // Demand paging: the fingerprint only reads the header and the
+        // first/last block, so prefaulting the whole dump would be a
+        // full-file read for nothing.
         .populate = false,
     });
     defer mm.destroy(io);
@@ -531,6 +556,7 @@ pub fn parseIndexArgs(
     var index_dir_opt: ?[]const u8 = null;
     var sorting_budget_mb: ?u32 = null;
     var dominator_budget_mb: ?u32 = null;
+    var dominator_algorithm: ?[]const u8 = null;
     var compute_dominators = true;
     var force = false;
     var no_progress = false;
@@ -554,6 +580,14 @@ pub fn parseIndexArgs(
             const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
             i += 1;
             dominator_budget_mb = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.eql(u8, arg, "--dominator-algorithm")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            if (Dominator.parseAlgorithmName(value) == null) {
+                try Cli.printError(stderr, "unknown dominator algorithm '{s}' (expected chk or lt)", .{value});
+                return error.InvalidArgument;
+            }
+            dominator_algorithm = value;
         } else if (std.mem.eql(u8, arg, "--no-dominators")) {
             compute_dominators = false;
         } else if (std.mem.eql(u8, arg, "--force")) {
@@ -587,6 +621,7 @@ pub fn parseIndexArgs(
         .no_progress = no_progress,
         .compute_dominators = compute_dominators,
         .dominator_budget_mb = dominator_budget_mb,
+        .dominator_algorithm = dominator_algorithm,
         .profile = profile,
     };
 }
@@ -878,7 +913,10 @@ fn deleteOldStagingDirs(
     index_dir: []const u8,
     stderr: *Io.Writer,
 ) void {
-    var dir = Io.Dir.cwd().openDir(io, index_dir, .{}) catch return;
+    // `iterate = true` is required: without it the platform layer opens the
+    // directory without read access and the first `next` seeks a handle that
+    // rejects it, panicking with BADF instead of listing the entries.
+    var dir = Io.Dir.cwd().openDir(io, index_dir, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
     var iter = dir.iterate();
