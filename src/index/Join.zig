@@ -27,6 +27,34 @@ const Scanner = @import("Scanner.zig");
 const ExtSort = @import("ExtSort.zig");
 const profiling = @import("profiling");
 
+/// Streaming merge-join I/O buffers. The joins hold one edge and one
+/// catalog row in flight, so buffers beyond a few mebibytes add only
+/// page-fault and init cost — measured at ~5 ms per MB of buffer —
+/// while the job budget is a memory ceiling for the external sort, not
+/// a request to touch this much per join pass.
+const join_buffer_min_bytes: usize = 4 * 1024;
+const join_buffer_cap_bytes: usize = 8 << 20;
+
+/// Buffer size for one merge-join stream: a third of the budget within
+/// the [join_buffer_min_bytes, join_buffer_cap_bytes] window, so small
+/// budgets stay small and the default 4 GiB budget does not translate
+/// into 1.4 GiB buffers per stream.
+fn joinBufferSize(budget_bytes: usize) usize {
+    const sized = budget_bytes / 3;
+    return @min(@max(sized, join_buffer_min_bytes), join_buffer_cap_bytes);
+}
+
+test "joinBufferSize floors, scales, and caps" {
+    // Below the floor: minimum buffering for one syscall round trip.
+    try std.testing.expectEqual(join_buffer_min_bytes, joinBufferSize(0));
+    try std.testing.expectEqual(join_buffer_min_bytes, joinBufferSize(8 * 1024));
+    // Inside the window: a third of the budget.
+    try std.testing.expectEqual(@as(usize, 12 << 20) / 3, joinBufferSize(12 << 20));
+    // At and beyond the cap: constant.
+    try std.testing.expectEqual(join_buffer_cap_bytes, joinBufferSize(3 * join_buffer_cap_bytes));
+    try std.testing.expectEqual(join_buffer_cap_bytes, joinBufferSize(4096 << 20));
+}
+
 /// Size in bytes of one source-resolved intermediate record:
 /// `source_ordinal u32` + `target_raw_id u64`.
 pub const source_resolved_record_size = 12;
@@ -299,7 +327,7 @@ fn resolveSourcesStreaming(
         return;
     }
 
-    const buffer_size = @max(budget_bytes / 3, 4 * 1024);
+    const buffer_size = joinBufferSize(budget_bytes);
 
     const edges_reader_buf = try allocator.alloc(u8, buffer_size);
     defer allocator.free(edges_reader_buf);
@@ -388,7 +416,7 @@ fn resolveTargetsStreaming(
         return 0;
     }
 
-    const buffer_size = @max(budget_bytes / 3, 4 * 1024);
+    const buffer_size = joinBufferSize(budget_bytes);
 
     const intermediate_reader_buf = try allocator.alloc(u8, buffer_size);
     defer allocator.free(intermediate_reader_buf);
