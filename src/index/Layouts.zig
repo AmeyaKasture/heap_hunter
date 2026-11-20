@@ -706,6 +706,7 @@ test "fields.bin parses and matches classes.bin on fixtures" {
             &job,
             scan_result.catalog_path,
             &sort_diagnostics,
+            null,
         );
         defer catalog_result.deinit(allocator);
 

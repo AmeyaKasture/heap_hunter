@@ -2083,6 +2083,7 @@ test {
 test {
     _ = @import("index/ExtSort.zig");
     _ = @import("index/Scanner.zig");
+    _ = @import("Progress.zig");
     _ = @import("index/CatalogSorter.zig");
     _ = @import("index/Layouts.zig");
     _ = @import("index/EdgeEmitter.zig");

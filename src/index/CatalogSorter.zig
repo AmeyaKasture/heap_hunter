@@ -7,6 +7,7 @@ const Preflight = @import("Preflight.zig");
 const Scanner = @import("Scanner.zig");
 const ExtSort = @import("ExtSort.zig");
 const profiling = @import("profiling");
+const Progress = @import("../Progress.zig").Progress;
 
 pub const catalog_row_size = Scanner.catalog_row_size;
 
@@ -42,6 +43,7 @@ pub fn sortAndDedupe(
     job: *const Preflight.Job,
     unsorted_path: []const u8,
     diagnostics: *Manifest.Diagnostics,
+    progress: ?*Progress,
 ) !Result {
     const sorted_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "catalog.sorted" });
     defer allocator.free(sorted_path);
@@ -52,6 +54,8 @@ pub fn sortAndDedupe(
         try ExtSort.sortStreaming(io, allocator, unsorted_path, sorted_path, .{
             .record_size = catalog_row_size,
             .budget_bytes = job.budget_bytes,
+            .progress = progress,
+            .progress_span = .{ .lo = 0, .hi = 1 },
         }, null, {}, catalogLessThan);
     }
 
@@ -266,7 +270,7 @@ test "sortAndDedupe removes duplicate raw IDs" {
     defer scan_result.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 3), result.n_objects);
@@ -419,7 +423,7 @@ test "fixture catalog count stable after sort and dedupe" {
         defer scan_result.deinit(allocator);
 
         var diagnostics: Manifest.Diagnostics = .{};
-        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics, null);
         defer result.deinit(allocator);
 
         const expected = analysis_index.total_objects + analysis_index.classes.count();

@@ -150,6 +150,7 @@ pub fn runIndexCommand(
                     job,
                     scan_result.catalog_path,
                     &scan_result.diagnostics,
+                    &progress,
                 }) catch |err| switch (err) {
                     error.TooManyObjects => {
                         try Cli.printError(stderr, "too many objects to index (>= u32.max - 1)", .{});
@@ -221,6 +222,7 @@ pub fn runIndexCommand(
                     catalog_result.catalog_path,
                     catalog_result.n_objects,
                     &scan_result.diagnostics,
+                    &progress,
                 });
             };
             defer join_result.deinit(allocator);

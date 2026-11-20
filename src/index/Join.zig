@@ -26,6 +26,27 @@ const EdgeEmitter = @import("EdgeEmitter.zig");
 const Scanner = @import("Scanner.zig");
 const ExtSort = @import("ExtSort.zig");
 const profiling = @import("profiling");
+const Progress = @import("../Progress.zig").Progress;
+
+/// Sub-phase windows within the join step. The two sorts move the full
+/// edge payload (read + write), so they get the larger share of the step;
+/// the merge-joins only stream through it. Values keep the reported
+/// fraction monotonic across the four sequential passes.
+const join_phase = struct {
+    const sort_source_end: f64 = 0.3;
+    const join_source_end: f64 = 0.5;
+    const sort_target_end: f64 = 0.8;
+};
+
+/// Granularity of merge-join progress reports.
+const join_report_step_bytes: u64 = 4 << 20;
+
+/// Cap on the streaming merge-joins' I/O buffers. These joins hold a few
+/// records in flight, so buffers beyond a few mebibytes add only page
+/// fault and init cost — measured at ~5 ms per MB of buffer — while the
+/// job budget remains a memory ceiling for the external sort, not a
+/// request to touch this much per pass.
+const join_buffer_cap_bytes: usize = 8 << 20;
 
 /// Size in bytes of one source-resolved intermediate record:
 /// `source_ordinal u32` + `target_raw_id u64`.
@@ -156,6 +177,7 @@ pub fn run(
     catalog_path: []const u8,
     n_objects: u64,
     diagnostics: *Manifest.Diagnostics,
+    progress: ?*Progress,
 ) !Result {
     // The virtual root is the synthetic vertex immediately after all real
     // catalog rows. It must fit in a u32 because all ordinals do.
@@ -171,6 +193,8 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, edges_path, edges_by_source_path, .{
             .record_size = EdgeEmitter.edge_record_size,
             .budget_bytes = job.budget_bytes,
+            .progress = progress,
+            .progress_span = .{ .lo = 0, .hi = join_phase.sort_source_end },
         }, null, {}, edgeLessBySource);
     }
 
@@ -190,6 +214,8 @@ pub fn run(
             virtual_root_ordinal,
             diagnostics,
             job.budget_bytes,
+            progress,
+            .{ .lo = join_phase.sort_source_end, .hi = join_phase.join_source_end },
         );
     }
 
@@ -203,6 +229,8 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, source_resolved_path, edges_by_target_path, .{
             .record_size = source_resolved_record_size,
             .budget_bytes = job.budget_bytes,
+            .progress = progress,
+            .progress_span = .{ .lo = join_phase.join_source_end, .hi = join_phase.sort_target_end },
         }, null, {}, sourceResolvedLessByTarget);
     }
 
@@ -221,6 +249,8 @@ pub fn run(
             resolved_path,
             diagnostics,
             job.budget_bytes,
+            progress,
+            .{ .lo = join_phase.sort_target_end, .hi = 1.0 },
         );
     };
 
@@ -282,6 +312,8 @@ fn resolveSourcesStreaming(
     virtual_root_ordinal: u32,
     diagnostics: *Manifest.Diagnostics,
     budget_bytes: usize,
+    progress: ?*Progress,
+    span: Progress.Span,
 ) !void {
     const dir = Io.Dir.cwd();
 
@@ -299,7 +331,7 @@ fn resolveSourcesStreaming(
         return;
     }
 
-    const buffer_size = @max(budget_bytes / 3, 4 * 1024);
+    const buffer_size = @max(@min(budget_bytes / 3, join_buffer_cap_bytes), 4 * 1024);
 
     const edges_reader_buf = try allocator.alloc(u8, buffer_size);
     defer allocator.free(edges_reader_buf);
@@ -327,7 +359,19 @@ fn resolveSourcesStreaming(
     var current_catalog: ?CatalogRowWithOrdinal = try readNextCatalogRow(&catalog_reader, &next_ordinal);
     var dangling_sources: u64 = 0;
 
+    var consumed: u64 = 0;
+    var next_report: u64 = join_report_step_bytes;
     while (try readNextEdgeRecord(&edges_reader)) |edge| {
+        consumed += EdgeEmitter.edge_record_size;
+        if (progress) |p| {
+            if (consumed >= next_report) {
+                next_report = consumed + join_report_step_bytes;
+                const frac: f64 = @floatFromInt(@min(consumed, edges_len));
+                const total: f64 = @floatFromInt(@max(edges_len, 1));
+                p.setFraction(span.lo + (span.hi - span.lo) * (frac / total));
+            }
+        }
+
         if (edge.source_raw_id == EdgeEmitter.virtual_root_sentinel) {
             try writeSourceResolvedRecord(out_writer, .{
                 .source_ordinal = virtual_root_ordinal,
@@ -372,6 +416,8 @@ fn resolveTargetsStreaming(
     output_path: []const u8,
     diagnostics: *Manifest.Diagnostics,
     budget_bytes: usize,
+    progress: ?*Progress,
+    span: Progress.Span,
 ) !u64 {
     const dir = Io.Dir.cwd();
 
@@ -388,7 +434,7 @@ fn resolveTargetsStreaming(
         return 0;
     }
 
-    const buffer_size = @max(budget_bytes / 3, 4 * 1024);
+    const buffer_size = @max(@min(budget_bytes / 3, join_buffer_cap_bytes), 4 * 1024);
 
     const intermediate_reader_buf = try allocator.alloc(u8, buffer_size);
     defer allocator.free(intermediate_reader_buf);
@@ -415,7 +461,19 @@ fn resolveTargetsStreaming(
     var dangling_targets: u64 = 0;
     var n_edges: u64 = 0;
 
+    var consumed: u64 = 0;
+    var next_report: u64 = join_report_step_bytes;
     while (try readNextSourceResolvedRecord(&intermediate_reader)) |inter| {
+        consumed += source_resolved_record_size;
+        if (progress) |p| {
+            if (consumed >= next_report) {
+                next_report = consumed + join_report_step_bytes;
+                const frac: f64 = @floatFromInt(@min(consumed, intermediate_len));
+                const total: f64 = @floatFromInt(@max(intermediate_len, 1));
+                p.setFraction(span.lo + (span.hi - span.lo) * (frac / total));
+            }
+        }
+
         const target_raw_id = inter.target_raw_id;
 
         // Advance catalog pointer until the current catalog row's raw ID is
@@ -781,7 +839,7 @@ test "Stage 5 worked example verbatim" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 2), result.n_edges);
@@ -823,7 +881,7 @@ test "virtual root edge resolves to virtual root ordinal" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 1), result.n_edges);
@@ -865,7 +923,7 @@ test "dangling source is dropped and counted" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 1), result.n_edges);
@@ -907,7 +965,7 @@ test "dangling target is dropped and counted" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 2, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 1), result.n_edges);
@@ -945,7 +1003,7 @@ test "empty edges produce empty resolved file" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 1, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 1, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 0), result.n_edges);
@@ -988,7 +1046,7 @@ test "multiple edges from same source" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics);
+    var result = try run(allocator, io_arg, &job, files.edges_path, files.catalog_path, 3, &diagnostics, null);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 3), result.n_edges);
@@ -1033,7 +1091,7 @@ test "fixtures produce resolved edges" {
         defer scan_result.deinit(allocator);
 
         var sort_diagnostics: Manifest.Diagnostics = .{};
-        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io_arg, &job, scan_result.catalog_path, &sort_diagnostics);
+        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io_arg, &job, scan_result.catalog_path, &sort_diagnostics, null);
         defer catalog_result.deinit(allocator);
 
         const classes_path = try CatalogSorter.writeClasses(allocator, io_arg, job.staging_dir, &scan_result.class_table);
@@ -1055,7 +1113,7 @@ test "fixtures produce resolved edges" {
         defer edge_result.deinit(allocator);
 
         var join_diagnostics: Manifest.Diagnostics = .{};
-        var join_result = try run(allocator, io_arg, &job, edge_result.edges_path, catalog_result.catalog_path, catalog_result.n_objects, &join_diagnostics);
+        var join_result = try run(allocator, io_arg, &job, edge_result.edges_path, catalog_result.catalog_path, catalog_result.n_objects, &join_diagnostics, null);
         defer join_result.deinit(allocator);
 
         try std.testing.expect(join_result.n_edges > 0);

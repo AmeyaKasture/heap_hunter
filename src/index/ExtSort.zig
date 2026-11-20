@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const profiling = @import("profiling");
+const Progress = @import("../Progress.zig").Progress;
 
 pub const Options = struct {
     /// Size of each record in bytes. Must be greater than zero.
@@ -17,6 +18,12 @@ pub const Options = struct {
     /// Maximum number of runs merged in a single pass. When the number of
     /// runs exceeds this, merging proceeds in multiple passes.
     max_fanout: usize = 64,
+
+    /// Optional progress reporter mapped onto a sub-range of the calling
+    /// stage's window; external sorts report run generation and merge
+    /// phases through it. In-memory fast paths do not report.
+    progress: ?*Progress = null,
+    progress_span: Progress.Span = .{},
 };
 
 pub const Error = error{
@@ -72,7 +79,7 @@ pub fn sort(
     });
     defer input_mm.destroy(io);
 
-    const runs = try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan);
+    const runs = try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan, null, .{});
     defer {
         for (runs) |run_path| {
             allocator.free(run_path);
@@ -163,6 +170,8 @@ fn generateRuns(
     budget_bytes: usize,
     context: anytype,
     comptime lessThan: fn (@TypeOf(context), []const u8, []const u8) bool,
+    progress: ?*Progress,
+    span: Progress.Span,
 ) ![]const []const u8 {
     const n_records = input.len / record_size;
     if (n_records == 0) {
@@ -223,6 +232,16 @@ fn generateRuns(
             try out.writeAll(chunk[rec_idx * record_size ..][0..record_size]);
         }
         try out_writer.flush();
+
+        // Report after the chunk is sorted and written: chunk boundaries
+        // are the finest signal the in-chunk sort can offer.
+        if (progress) |p| {
+            if (input.len > 0) {
+                const frac: f64 = @floatFromInt(end);
+                const total: f64 = @floatFromInt(input.len);
+                p.setFraction(span.lo + (span.hi - span.lo) * (frac / total));
+            }
+        }
 
         offset = end;
     }
@@ -780,6 +799,8 @@ fn mergeRunGroupStreaming(
     record_size: usize,
     context: anytype,
     comptime lessThan: fn (@TypeOf(context), []const u8, []const u8) bool,
+    progress: ?*Progress,
+    span: Progress.Span,
 ) !void {
     if (run_paths.len == 0) {
         const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
@@ -796,10 +817,12 @@ fn mergeRunGroupStreaming(
     }
 
     // Open each run and eagerly read its first record.
+    var total_bytes: u64 = 0;
     for (run_paths, 0..) |path, i| {
         const buf = try allocator.alloc(u8, record_size);
         sr[i] = .{ .file = undefined, .offset = 0, .buf = buf };
         sr[i].file = try Io.Dir.cwd().openFile(io, path, .{});
+        total_bytes += try sr[i].file.length(io);
         sr_open += 1;
     }
 
@@ -825,6 +848,8 @@ fn mergeRunGroupStreaming(
         // If n < record_size the run file is empty – leave it out of the heap.
     }
 
+    var consumed: u64 = 0;
+    var next_report: u64 = merge_report_step_bytes;
     while (heap.len() > 0) {
         const idx = heap.removeMin();
         const r = &sr[idx];
@@ -836,10 +861,24 @@ fn mergeRunGroupStreaming(
             try heap.add(allocator, idx);
         }
         // Otherwise this run is exhausted – leave it out of the heap.
+
+        consumed += record_size;
+        if (progress) |p| {
+            if (consumed >= next_report) {
+                next_report = consumed + merge_report_step_bytes;
+                const frac: f64 = @floatFromInt(@min(consumed, total_bytes));
+                const total: f64 = @floatFromInt(@max(total_bytes, 1));
+                p.setFraction(span.lo + (span.hi - span.lo) * (frac / total));
+            }
+        }
     }
 
     try out_writer.flush();
 }
+
+/// Granularity of merge progress reports: one update per few mebibytes
+/// keeps the positional-read hot loop free of float math per record.
+const merge_report_step_bytes: u64 = 4 << 20;
 
 /// Merge a collection of sorted run files using bounded streaming reads.
 ///
@@ -854,6 +893,8 @@ fn mergeRunsStreaming(
     max_fanout: usize,
     context: anytype,
     comptime lessThan: fn (@TypeOf(context), []const u8, []const u8) bool,
+    progress: ?*Progress,
+    span: Progress.Span,
 ) !void {
     if (runs.len == 0) {
         const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
@@ -862,7 +903,7 @@ fn mergeRunsStreaming(
     }
     std.debug.assert(max_fanout >= 2);
     if (runs.len <= max_fanout) {
-        return mergeRunGroupStreaming(io, allocator, runs, output_path, record_size, context, lessThan);
+        return mergeRunGroupStreaming(io, allocator, runs, output_path, record_size, context, lessThan, progress, span);
     }
 
     const staging_parent = std.fs.path.dirname(output_path) orelse ".";
@@ -875,6 +916,13 @@ fn mergeRunsStreaming(
         }
         allocator.free(current);
     };
+
+    // Reduction passes plus the final merge are one work unit each; each
+    // group within a pass splits its pass's unit evenly. Coarse, but
+    // monotonic, and the leaf merges report per record.
+    const n_passes = estimateMergePasses(runs.len, max_fanout);
+    const units: f64 = @floatFromInt(n_passes + 1);
+    const unit_width: f64 = (span.hi - span.lo) / units;
 
     var pass: usize = 0;
     while (current.len > max_fanout) : (pass += 1) {
@@ -897,7 +945,13 @@ fn mergeRunsStreaming(
             const group = current[start..end];
             const out_path = try std.fmt.allocPrint(allocator, "{s}/.merge-stream-{d}-{d}", .{ staging_parent, pass, g });
             next[g] = out_path;
-            try mergeRunGroupStreaming(io, allocator, group, out_path, record_size, context, lessThan);
+            const pass_lo = span.lo + unit_width * @as(f64, @floatFromInt(pass));
+            const groups: f64 = @floatFromInt(n_groups);
+            const group_span = Progress.Span{
+                .lo = pass_lo + unit_width * @as(f64, @floatFromInt(g)) / groups,
+                .hi = pass_lo + unit_width * @as(f64, @floatFromInt(g + 1)) / groups,
+            };
+            try mergeRunGroupStreaming(io, allocator, group, out_path, record_size, context, lessThan, progress, group_span);
         }
 
         if (current_owned) {
@@ -911,7 +965,19 @@ fn mergeRunsStreaming(
         current_owned = true;
     }
 
-    try mergeRunGroupStreaming(io, allocator, current, output_path, record_size, context, lessThan);
+    const final_lo = span.lo + unit_width * @as(f64, @floatFromInt(n_passes));
+    try mergeRunGroupStreaming(io, allocator, current, output_path, record_size, context, lessThan, progress, .{ .lo = final_lo, .hi = span.hi });
+}
+
+/// Number of reduction passes a multi-pass merge needs before the final
+/// single merge, given `fanout` runs merged per pass.
+fn estimateMergePasses(n_runs: usize, fanout: usize) usize {
+    var passes: usize = 0;
+    var runs = n_runs;
+    while (runs > fanout) : (passes += 1) {
+        runs = (runs + fanout - 1) / fanout;
+    }
+    return passes;
 }
 
 /// Sort the file at `input_path` and write the result to `output_path` using a
@@ -986,7 +1052,10 @@ pub fn sortStreaming(
     const runs = blk: {
         var span = profiling.begin(io, "runs");
         defer span.end(io);
-        break :blk try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan);
+        break :blk try generateRuns(io, allocator, input_mm.memory, staging_dir, record_size, options.budget_bytes, context, lessThan, options.progress, .{
+            .lo = options.progress_span.lo,
+            .hi = options.progress_span.lo + (options.progress_span.hi - options.progress_span.lo) / 2,
+        });
     };
     defer {
         for (runs) |run_path| allocator.free(run_path);
@@ -997,7 +1066,10 @@ pub fn sortStreaming(
     {
         var span = profiling.begin(io, "merge");
         defer span.end(io);
-        try mergeRunsStreaming(io, allocator, runs, output_path, record_size, fanout, context, lessThan);
+        try mergeRunsStreaming(io, allocator, runs, output_path, record_size, fanout, context, lessThan, options.progress, .{
+            .lo = options.progress_span.lo + (options.progress_span.hi - options.progress_span.lo) / 2,
+            .hi = options.progress_span.hi,
+        });
     }
 }
 

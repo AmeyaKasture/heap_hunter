@@ -403,7 +403,15 @@ pub fn run(
                 },
                 else => {},
             }
-            if (progress) |p| p.tick();
+            // Non-TTY consumers (the cloudhunter service piping stderr) need
+            // the record-walk position, not just step boundaries.
+            if (progress) |p| {
+                const total: f64 = @floatFromInt(reader.cursor.buf.len);
+                if (total > 0) {
+                    const scanned: f64 = @floatFromInt(reader.cursor.pos);
+                    p.setFraction(scan_phase.records_span * scanned / total);
+                }
+            }
         }
     }
 
@@ -483,6 +491,111 @@ pub fn run(
 /// below this the inline path is faster than thread startup.
 const min_segments_per_worker: usize = 32;
 
+/// Intra-step fraction landmarks for the scan step. Pass 1 walks record
+/// headers, the segment scan parses heap records (the dominant cost on
+/// large dumps), and the merge streams worker spill files; the spans keep
+/// the reported fraction monotonic across the phase transitions.
+const scan_phase = struct {
+    /// Fraction covered by the pass-1 record walk.
+    const records_span: f64 = 0.2;
+    /// Fraction covered by the heap segment scan.
+    const segments_span: f64 = 0.75;
+    /// Fraction covered by the spill-file merge.
+    const merge_span: f64 = 0.05;
+
+    /// Fraction reached when every segment record has been scanned.
+    const segments_end: f64 = records_span + segments_span;
+};
+
+/// Shared byte counter for the segment scan. Worker threads bump it from
+/// their own tickers; the calling thread (or the monitor thread it spawns)
+/// is the only one that turns it into progress updates.
+const ScanByteCounter = struct {
+    done: std.atomic.Value(u64) = .init(0),
+};
+
+/// Granularity of atomic publishes: coarse enough that the shared counter
+/// is never contended, fine enough for a smooth progress bar.
+const scan_publish_step_bytes: u64 = 4 << 20;
+
+/// Per-caller accumulator over a ScanByteCounter. When `progress` is set
+/// (single-threaded scanning), publishing also drives the bar; worker
+/// tickers leave it null and only bump the shared counter.
+const ScanTicker = struct {
+    counter: *ScanByteCounter,
+    progress: ?*Progress = null,
+    span_lo: f64 = 0,
+    span_hi: f64 = 0,
+    total_bytes: u64 = 0,
+    pending: u64 = 0,
+    published: u64 = 0,
+
+    fn add(self: *ScanTicker, n: u64) void {
+        self.pending += n;
+        if (self.pending < scan_publish_step_bytes) return;
+        self.publish();
+    }
+
+    fn flush(self: *ScanTicker) void {
+        if (self.pending > 0) self.publish();
+    }
+
+    fn publish(self: *ScanTicker) void {
+        _ = self.counter.done.fetchAdd(self.pending, .monotonic);
+        self.published += self.pending;
+        self.pending = 0;
+        if (self.progress) |p| p.setFraction(self.fractionDone());
+    }
+
+    /// Intra-step fraction for the bytes published so far, mapped onto
+    /// [span_lo, span_hi].
+    fn fractionDone(self: *ScanTicker) f64 {
+        if (self.total_bytes == 0) return self.span_hi;
+        const done: f64 = @floatFromInt(self.published);
+        const total: f64 = @floatFromInt(self.total_bytes);
+        const frac = @min(done / total, 1.0);
+        return self.span_lo + (self.span_hi - self.span_lo) * frac;
+    }
+};
+
+/// Poll interval of the parallel-scan progress monitor.
+const scan_monitor_poll_ms: i64 = 200;
+
+/// Shared state between the calling thread and the progress monitor it
+/// spawns while worker threads scan segments.
+const ScanMonitorState = struct {
+    io: Io,
+    progress: *Progress,
+    counter: *ScanByteCounter,
+    total_bytes: u64,
+    span_lo: f64,
+    span_hi: f64,
+    stop: std.atomic.Value(bool) = .init(false),
+};
+
+/// Reflects the shared scan counter in the progress bar while worker
+/// threads scan. Runs alone: the calling thread is blocked joining
+/// workers, so only this thread touches Progress.
+fn scanProgressMonitor(state: *ScanMonitorState) void {
+    while (!state.stop.load(.acquire)) {
+        const total: f64 = @floatFromInt(state.total_bytes);
+        const done: f64 = @floatFromInt(state.counter.done.load(.monotonic));
+        const frac = if (state.total_bytes == 0)
+            state.span_hi
+        else
+            @min(done / total, 1.0);
+        state.progress.setFraction(state.span_lo + (state.span_hi - state.span_lo) * frac);
+        Io.sleep(state.io, Io.Duration.fromMilliseconds(scan_monitor_poll_ms), .awake) catch return;
+    }
+}
+
+/// Total bytes across segment ranges; the denominator of scan progress.
+fn segmentBytesTotal(segments: []const SegmentRange) u64 {
+    var total: u64 = 0;
+    for (segments) |seg| total += seg.len;
+    return total;
+}
+
 /// Scan the collected heap dump segment ranges. Large dumps are fanned out
 /// over worker threads (LPT-partitioned by segment length); small dumps run
 /// inline on the calling thread. Workers stream rows to per-worker spill
@@ -555,6 +668,16 @@ fn scanSegmentsDispatched(
     if (segments.len == 0) return;
 
     if (n_workers <= 1) {
+        // Single-threaded: the ticker drives the bar directly as bytes are
+        // published, so huge segments still yield smooth progress.
+        var scan_counter = ScanByteCounter{};
+        var ticker = ScanTicker{
+            .counter = &scan_counter,
+            .progress = progress,
+            .span_lo = scan_phase.records_span,
+            .span_hi = scan_phase.segments_end,
+            .total_bytes = segmentBytesTotal(segments),
+        };
         for (segments) |seg| {
             const end: usize = @intCast(seg.offset + seg.len);
             const body = source_data[@intCast(seg.offset)..end];
@@ -574,9 +697,11 @@ fn scanSegmentsDispatched(
                 diagnostics,
                 prim_histogram,
                 accs,
+                &ticker,
             );
-            if (progress) |p| p.tick();
+            ticker.flush();
         }
+        if (progress) |p| p.setFraction(scan_phase.segments_end);
         return;
     }
 
@@ -585,6 +710,11 @@ fn scanSegmentsDispatched(
         for (buckets) |*b| b.deinit(allocator);
         allocator.free(buckets);
     }
+
+    // Shared across worker threads; each worker publishes its scanned
+    // bytes in coarse steps so the atomic is never contended.
+    var scan_counter = ScanByteCounter{};
+    const scan_total_bytes = segmentBytesTotal(segments);
 
     const workers = try allocator.alloc(WorkerState, n_workers);
     defer allocator.free(workers);
@@ -602,6 +732,7 @@ fn scanSegmentsDispatched(
     };
     for (buckets, 0..) |*b, i| {
         workers[i] = try WorkerState.init(allocator, io, job, source_data, b.items, i);
+        workers[i].scan_ticker = .{ .counter = &scan_counter };
         n_inited += 1;
     }
 
@@ -619,10 +750,37 @@ fn scanSegmentsDispatched(
             return e;
         };
     }
+
+    // The join below blocks the calling thread, so a dedicated monitor
+    // reflects the workers' shared counter in the progress bar. The
+    // deferred stop covers every early return between spawn and the
+    // explicit stop after the join.
+    var monitor_state = ScanMonitorState{
+        .io = io,
+        .progress = undefined,
+        .counter = &scan_counter,
+        .total_bytes = scan_total_bytes,
+        .span_lo = scan_phase.records_span,
+        .span_hi = scan_phase.segments_end,
+    };
+    var monitor_thread: ?std.Thread = null;
+    var monitor_stopped = false;
+    defer if (!monitor_stopped) {
+        monitor_state.stop.store(true, .release);
+        if (monitor_thread) |t| t.join();
+    };
+    if (progress) |p| {
+        monitor_state.progress = p;
+        monitor_thread = std.Thread.spawn(.{}, scanProgressMonitor, .{&monitor_state}) catch null;
+    }
     for (threads.items[n_joined..]) |t| {
         t.join();
         n_joined += 1;
     }
+    monitor_state.stop.store(true, .release);
+    if (monitor_thread) |t| t.join();
+    monitor_stopped = true;
+    if (progress) |p| p.setFraction(scan_phase.segments_end);
 
     // Flush bytes still sitting in the workers' write buffers and close the
     // spill files so the merge can read them back. A flush failure (e.g. disk
@@ -645,16 +803,16 @@ fn scanSegmentsDispatched(
     // spill file into the final outputs, then remove the spill files.
     const merge_dir = Io.Dir.cwd();
     var merge_buf: [worker_io_buffer_size]u8 = undefined;
-    for (workers) |*w| {
+    for (workers, 0..) |*w, i| {
         try streamSpillFile(io, w.catalog_spill_path, catalog_writer, &merge_buf);
         try streamSpillFile(io, w.roots_spill_path, roots_writer, &merge_buf);
         try merge_dir.deleteFile(io, w.catalog_spill_path);
         try merge_dir.deleteFile(io, w.roots_spill_path);
         n_catalog_rows.* += w.n_catalog_rows;
         n_roots.* += w.n_roots;
-        for (w.prim_histogram, 0..) |entry, i| {
-            prim_histogram[i].count += entry.count;
-            prim_histogram[i].bytes += entry.bytes;
+        for (w.prim_histogram, 0..) |entry, hist_idx| {
+            prim_histogram[hist_idx].count += entry.count;
+            prim_histogram[hist_idx].bytes += entry.bytes;
         }
         mergeDiagnostics(diagnostics, &w.diagnostics);
         for (w.class_dumps.items) |cd| {
@@ -663,7 +821,10 @@ fn scanSegmentsDispatched(
         for (w.thread_roots.items) |tr| {
             try thread_traces.addThreadRoot(tr.thread_object_id, tr.thread_serial, tr.stack_trace_serial);
         }
-        if (progress) |p| p.tick();
+        if (progress) |p| {
+            const step: f64 = @as(f64, @floatFromInt(i + 1)) / @as(f64, @floatFromInt(workers.len));
+            p.setFraction(scan_phase.segments_end + scan_phase.merge_span * step);
+        }
         w.deinit();
         n_finalized += 1;
     }
@@ -926,6 +1087,9 @@ const WorkerState = struct {
     n_catalog_rows: u64 = 0,
     n_roots: u64 = 0,
     err: ?anyerror = null,
+    /// Publishes this worker's scanned bytes into the shared counter;
+    /// never touches Progress (workers run off-thread).
+    scan_ticker: ScanTicker = .{ .counter = undefined },
 
     /// Open the spill files and wire their writers. The writers only point at
     /// heap memory and copied file handles, so the by-value return is safe.
@@ -1013,7 +1177,9 @@ const WorkerState = struct {
                 &self.diagnostics,
                 &self.prim_histogram,
                 null,
+                &self.scan_ticker,
             );
+            self.scan_ticker.flush();
         }
     }
 };
@@ -1059,8 +1225,17 @@ fn scanHeapDump(
     diagnostics: *Manifest.Diagnostics,
     prim_histogram: []PrimHistogramEntry,
     accs: ?*ScanAccs,
+    ticker: ?*ScanTicker,
 ) !void {
-    while (try hr.nextWithOffset()) |item| {
+    // The while-optional form cannot observe the cursor before each read;
+    // this explicit form tracks record sizes for the progress ticker.
+    while (true) {
+        const pos_before = hr.cursor.pos;
+        const next = try hr.nextWithOffset();
+        const item = next orelse break;
+        defer {
+            if (ticker) |t| t.add(hr.cursor.pos - pos_before);
+        }
         switch (item.record) {
             .gc_class_dump => |cd| {
                 if (accs) |a| a.classes.start(io, "classes");

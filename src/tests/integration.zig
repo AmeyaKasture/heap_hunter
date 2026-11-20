@@ -170,3 +170,47 @@ test "overview --profile emits timing tree to stderr" {
     const stderr_text = overview_stderr.buffered();
     try std.testing.expect(std.mem.indexOf(u8, stderr_text, "timings:") != null);
 }
+
+test "index progress checkpoints carry intra-step percent on non-TTY stderr" {
+    // A terminal renders the live bar instead of per-line checkpoints, so
+    // the line-format assertion only applies when stderr is piped.
+    if (@import("../Cli.zig").isStderrTty(std.testing.io)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    const config_load: Config.LoadResult = .{};
+
+    var index_stdout_buf: [4096]u8 = undefined;
+    var index_stdout: Io.Writer = Io.Writer.fixed(&index_stdout_buf);
+    var index_stderr_buf: [16384]u8 = undefined;
+    var index_stderr: Io.Writer = Io.Writer.fixed(&index_stderr_buf);
+
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = "fixtures/heapforge.hprof",
+        .index_dir = tmp_path_z[0..tmp_path_z.len],
+        .no_progress = false,
+        .profile = false,
+    }, &index_stdout, &index_stderr, config_load, null, null);
+
+    try index_stderr.flush();
+    const stderr_text = index_stderr.buffered();
+
+    // Step boundaries still land as plain checkpoint lines.
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "] scanning heap dump") != null);
+    // The scan step reports its position, appending the command-wide
+    // percent to the label.
+    var it = std.mem.splitScalar(u8, stderr_text, '\n');
+    var found_percent_line = false;
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "scanning heap dump") != null and std.mem.endsWith(u8, line, "%")) {
+            found_percent_line = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_percent_line);
+}

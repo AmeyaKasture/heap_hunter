@@ -962,7 +962,7 @@ test "fixture end-to-end produces consistent CSR" {
         defer scan_result.deinit(allocator);
 
         var sort_diagnostics: Manifest.Diagnostics = .{};
-        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &sort_diagnostics);
+        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &sort_diagnostics, null);
         defer catalog_result.deinit(allocator);
 
         const classes_path = try CatalogSorter.writeClasses(allocator, io, job.staging_dir, &scan_result.class_table);
@@ -984,7 +984,7 @@ test "fixture end-to-end produces consistent CSR" {
         defer edge_result.deinit(allocator);
 
         var join_diagnostics: Manifest.Diagnostics = .{};
-        var join_result = try Join.run(allocator, io, &job, edge_result.edges_path, catalog_result.catalog_path, catalog_result.n_objects, &join_diagnostics);
+        var join_result = try Join.run(allocator, io, &job, edge_result.edges_path, catalog_result.catalog_path, catalog_result.n_objects, &join_diagnostics, null);
         defer join_result.deinit(allocator);
 
         var csr_diagnostics: Manifest.Diagnostics = .{};
