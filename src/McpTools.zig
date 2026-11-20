@@ -222,6 +222,32 @@ pub const tool_definitions = .{
             .required = .{ "index_dir", "id" },
         },
     },
+    .{
+        .name = "retained_size",
+        .description = "Get the retained size and dominator chain for an object.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
+                .id = .{ .type = "string", .description = "Object ID to inspect." },
+            },
+            .required = .{ "index_dir", "id" },
+        },
+    },
+    .{
+        .name = "top_retainers",
+        .description = "List the objects with the largest retained size, ordered by retained size descending.",
+        .inputSchema = .{
+            .type = "object",
+            .properties = .{
+                .index_dir = .{ .type = "string", .description = "Directory containing the heap index." },
+                .source = .{ .type = "string", .description = "Optional path to the source .hprof (overrides manifest source_path)." },
+                .top = .{ .type = "integer", .description = "Number of objects to report.", .default = 10 },
+            },
+            .required = .{"index_dir"},
+        },
+    },
 };
 
 /// Dispatch an MCP tool call to the appropriate handler.
@@ -257,6 +283,10 @@ pub fn dispatch(
         return try findRoots(allocator, io, arguments);
     } else if (std.mem.eql(u8, name, "reference_tree")) {
         return try referenceTree(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "retained_size")) {
+        return try retainedSize(allocator, io, arguments);
+    } else if (std.mem.eql(u8, name, "top_retainers")) {
+        return try topRetainers(allocator, io, arguments);
     } else {
         return Result{ .failure = .{
             .message = "Unknown tool",
@@ -611,6 +641,14 @@ fn referenceTree(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value
     return try runQueryTool(allocator, io, arguments, "tree");
 }
 
+fn retainedSize(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    return try runQueryTool(allocator, io, arguments, "retained");
+}
+
+fn topRetainers(allocator: std.mem.Allocator, io: Io, arguments: std.json.Value) !Result {
+    return try runQueryTool(allocator, io, arguments, "retainers");
+}
+
 fn runQueryTool(
     allocator: std.mem.Allocator,
     io: Io,
@@ -698,6 +736,27 @@ fn runQueryTool(
         if (getOptionalU32(arguments, "depth")) |v| opts.depth = v;
         if (getOptionalU32(arguments, "max_nodes")) |v| opts.max_nodes = v;
         try IndexReader.writeTree(&reader, &buf.writer, raw_id, opts);
+    } else if (std.mem.eql(u8, tool, "retained")) {
+        const raw_id = try parseRequiredId(arguments, "id");
+        if (!reader.hasDominators()) {
+            return noRetainedDataFailure();
+        }
+        IndexReader.writeRetained(&reader, &buf.writer, raw_id) catch |err| switch (err) {
+            error.ObjectNotFound => return Result{
+                .failure = .{
+                    .message = "Object id not found in index",
+                    .error_type = "ObjectNotFound",
+                },
+            },
+            else => return mapError(err, "retained_size failed"),
+        };
+    } else if (std.mem.eql(u8, tool, "retainers")) {
+        if (!reader.hasDominators()) {
+            return noRetainedDataFailure();
+        }
+        var opts: IndexReader.RetainersOptions = .{};
+        if (getOptionalU32(arguments, "top")) |v| opts.top = v;
+        try IndexReader.writeRetainers(&reader, &buf.writer, opts);
     }
 
     return Result{ .success = try allocator.dupe(u8, buf.writer.buffer[0..buf.writer.end]) };
@@ -864,6 +923,40 @@ test "dispatch list_threads missing index_dir returns failure" {
     defer result.deinit(allocator);
     try std.testing.expect(result == .failure);
     try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch retained_size missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "retained_size", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+test "dispatch top_retainers missing index_dir returns failure" {
+    const allocator = std.testing.allocator;
+    var config_load: Config.LoadResult = .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = try dispatch(allocator, std.testing.io, &config_load, "top_retainers", parsed.value, .{});
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .failure);
+    try std.testing.expectEqualStrings("InvalidArgument", result.failure.error_type);
+}
+
+/// A clean failure for tools that need dominator data on an index built
+/// without it, instead of surfacing the raw error name.
+fn noRetainedDataFailure() Result {
+    return Result{
+        .failure = .{
+            .message = "This index was built without dominator data, so retained sizes are not available.",
+            .error_type = "NoRetainedData",
+            .suggestion = "Re-run analyze_heap_dump to rebuild the index with dominators enabled (the default).",
+        },
+    };
 }
 
 fn mapError(err: anyerror, context: []const u8) Result {
