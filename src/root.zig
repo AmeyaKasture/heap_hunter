@@ -118,10 +118,16 @@ pub fn runCli(
         std.mem.eql(u8, command, "roots") or
         std.mem.eql(u8, command, "tree") or
         std.mem.eql(u8, command, "dominator") or
-        std.mem.eql(u8, command, "dominator-tree"))
+        std.mem.eql(u8, command, "dominator-tree") or
+        std.mem.eql(u8, command, "retained"))
     {
         log.debug("dispatching to runQueryCommand ({s})", .{command});
         return runQueryCommand(allocator, io, command, shifted, stdout, stderr, config_load);
+    }
+
+    if (std.mem.eql(u8, command, "retainers")) {
+        log.debug("dispatching to runRetainersCommand", .{});
+        return runRetainersCommand(allocator, io, shifted, stdout, stderr, config_load);
     }
 
     const is_histogram = std.mem.eql(u8, command, "histogram");
@@ -435,10 +441,103 @@ fn runQueryCommand(
         try IndexReader.writeTree(&reader, stdout, raw_id, tree_opts);
     } else if (std.mem.eql(u8, command, "dominator-tree")) {
         try Commands.runDominatorTreeCommand(allocator, io, index_dir, source_override, raw_id, dom_tree_opts, stdout, stderr);
+    } else if (std.mem.eql(u8, command, "retained")) {
+        if (dom_tree_opts.depth != null or dom_tree_opts.max_nodes != null) {
+            try Cli.printError(stderr, "retained does not support --depth or --max-nodes; use hunt dominator-tree", .{});
+            return error.InvalidArgument;
+        }
+        if (!reader.hasDominators()) {
+            try Cli.printError(stderr, "index was built without dominators; re-index with dominators enabled", .{});
+            return error.NoRetainedData;
+        }
+        try IndexReader.writeRetained(&reader, stdout, raw_id);
     } else {
         unreachable;
     }
 
+    try stdout.flush();
+}
+
+/// `hunt retainers` — list the objects with the largest retained size. Unlike
+/// the other query commands there is no object id; the whole index is scanned.
+fn runRetainersCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    config_load: Config.LoadResult,
+) anyerror!void {
+    errdefer |err| {
+        log.traceError(err);
+    }
+
+    const command = "retainers";
+    const usage = "hunt retainers [file.hprof] [options]";
+
+    var index_dir_opt: ?[]const u8 = null;
+    var dump_path_opt: ?[]const u8 = null;
+    var source_override: ?[]const u8 = null;
+    var opts: IndexReader.RetainersOptions = .{};
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (Cli.isHelpFlag(arg)) {
+            try Cli.printCommandHelp(stdout, command);
+            return;
+        } else if (std.mem.eql(u8, arg, "--index-dir")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            index_dir_opt = value;
+        } else if (std.mem.eql(u8, arg, "--source")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            source_override = value;
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            const value = try Cli.expectNextArg(stderr, command, usage, arg, args, i);
+            i += 1;
+            opts.top = try Cli.parseUnsigned(u32, stderr, command, usage, arg, value);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try Cli.printUnknownOption(stderr, command, usage, arg);
+            return error.InvalidArgument;
+        } else {
+            if (dump_path_opt == null and std.mem.endsWith(u8, arg, ".hprof")) {
+                dump_path_opt = arg;
+            } else {
+                try Cli.printError(stderr, "unexpected positional argument: {s}", .{arg});
+                return error.InvalidArgument;
+            }
+        }
+    }
+
+    var index_dir_owned = false;
+    const index_dir = (try Commands.resolveIndexDir(allocator, config_load, index_dir_opt, dump_path_opt, &index_dir_owned)) orelse {
+        try Cli.printMissingConfig(stderr, config_load.candidates_checked, config_load.explicit_path);
+        return error.InvalidArgument;
+    };
+    defer if (index_dir_owned) allocator.free(index_dir);
+
+    log.debug("retainers: loading index from {s}", .{index_dir});
+
+    var progress = Progress.create(stderr, io, 1, false);
+    defer progress.stop(null);
+    progress.nextStep("loading index");
+
+    var reader = IndexReader.open(allocator, io, index_dir, source_override) catch |err| {
+        log.err("failed to open index: {s}", .{@errorName(err)});
+        try Cli.printError(stderr, "failed to open index: {s}", .{@errorName(err)});
+        return @as(anyerror!void, err);
+    };
+    progress.stop("index loaded");
+    defer reader.deinit();
+
+    if (!reader.hasDominators()) {
+        try Cli.printError(stderr, "index was built without dominators; re-index with dominators enabled", .{});
+        return error.NoRetainedData;
+    }
+
+    try IndexReader.writeRetainers(&reader, stdout, opts);
     try stdout.flush();
 }
 
@@ -2204,4 +2303,179 @@ test "object query decodes string values, scalar types, and array previews" {
         try std.testing.expect(std.mem.indexOf(u8, out, "\"element_type\":\"int\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "\"preview\"") == null);
     }
+}
+
+/// Shared fixture for the retained/retainers CLI tests: two linked instances
+/// (0x3000 -> 0x3001) under a GC root, indexed into `tmp_path`. The caller
+/// owns the tmpDir so the files stay alive for the whole test.
+fn buildRetainedCliFixture(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tmp_path: []const u8,
+    compute_dominators: bool,
+) !struct { dump_path: [:0]u8, index_dir: [:0]u8 } {
+    const HprofBuilder = @import("tests/HprofBuilder.zig");
+
+    var b = HprofBuilder.Builder.init(allocator, 4);
+    defer b.deinit();
+    try b.header(0);
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.utf8(0x1001, "com/shop/Node");
+    try b.utf8(0x1010, "next");
+    try b.loadClass(1, 0x2000, 0x1000);
+    try b.loadClass(2, 0x2001, 0x1001);
+    var heap = try b.heapDump();
+    _ = try heap.rootUnknown(0x3000);
+    _ = try heap.classDump(.{
+        .class_id = 0x2001,
+        .super_class_id = 0x2000,
+        .instance_size = 4,
+        .instance_fields = &.{
+            .{ .name_id = 0x1010, .type = .object },
+        },
+    });
+    var ref_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ref_bytes, 0x3001, .big);
+    _ = try heap.instanceDump(0x3000, 0x2001, &ref_bytes);
+    _ = try heap.instanceDump(0x3001, 0x2001, &[_]u8{ 0, 0, 0, 0 });
+    heap.end();
+    const dump_bytes = try b.finish();
+    defer allocator.free(dump_bytes);
+
+    const dump_path_tmp = try std.fs.path.join(allocator, &.{ tmp_path, "test.hprof" });
+    defer allocator.free(dump_path_tmp);
+    const dump_path = try allocator.dupeZ(u8, dump_path_tmp);
+    errdefer allocator.free(dump_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dump_path, .data = dump_bytes });
+
+    const index_dir_tmp = try std.fs.path.join(allocator, &.{ tmp_path, "index" });
+    defer allocator.free(index_dir_tmp);
+    const index_dir = try allocator.dupeZ(u8, index_dir_tmp);
+    errdefer allocator.free(index_dir);
+
+    var config_load: Config.LoadResult = .{};
+    defer config_load.deinit(allocator);
+    var stdout = Io.Writer.Allocating.init(allocator);
+    defer stdout.deinit();
+    var stderr = Io.Writer.Allocating.init(allocator);
+    defer stderr.deinit();
+    try Commands.runIndexCommand(allocator, io, .{
+        .hprof_path = dump_path,
+        .index_dir = index_dir,
+        .no_progress = true,
+        .compute_dominators = compute_dominators,
+    }, &stdout.writer, &stderr.writer, config_load, null, null);
+
+    return .{ .dump_path = dump_path, .index_dir = index_dir };
+}
+
+const CapturedCliResult = struct {
+    err: ?anyerror = null,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: *const CapturedCliResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+};
+
+/// Run `hunt` with the given argv, capturing stdout and stderr and reporting
+/// the resulting error (if any) so tests can assert on both channels.
+fn runCliCaptured(
+    allocator: std.mem.Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+) !CapturedCliResult {
+    var stdout = Io.Writer.Allocating.init(allocator);
+    defer stdout.deinit();
+    var stderr = Io.Writer.Allocating.init(allocator);
+    defer stderr.deinit();
+
+    var failure: ?anyerror = null;
+    runCli(allocator, io, args, &stdout.writer, &stderr.writer, null) catch |e| {
+        failure = e;
+    };
+    try stdout.writer.flush();
+    try stderr.writer.flush();
+
+    return .{
+        .err = failure,
+        .stdout = try allocator.dupe(u8, stdout.writer.buffer[0..stdout.writer.end]),
+        .stderr = try allocator.dupe(u8, stderr.writer.buffer[0..stderr.writer.end]),
+    };
+}
+
+test "retained command prints the retained size for an object" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const fixture = try buildRetainedCliFixture(allocator, io, tmp_path, true);
+    defer allocator.free(fixture.dump_path);
+    defer allocator.free(fixture.index_dir);
+
+    const result = try runCliCaptured(allocator, io, &[_][:0]const u8{
+        "hunt", "retained", fixture.dump_path, "0x3001", "--index-dir", fixture.index_dir,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(?anyerror, null), result.err);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"id\":\"0x0000000000003001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"retained_bytes\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"retained_delta_bytes\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"dom_depth\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"dominators\":[{\"id\":\"0x0000000000003000\",\"class\":\"com/shop/Node\",\"retained_bytes\":") != null);
+}
+
+test "retainers command lists the largest retainers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const fixture = try buildRetainedCliFixture(allocator, io, tmp_path, true);
+    defer allocator.free(fixture.dump_path);
+    defer allocator.free(fixture.index_dir);
+
+    const result = try runCliCaptured(allocator, io, &[_][:0]const u8{
+        "hunt", "retainers", fixture.dump_path, "--top", "10", "--index-dir", fixture.index_dir,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(?anyerror, null), result.err);
+
+    try std.testing.expect(std.mem.startsWith(u8, result.stdout, "{\"top\":10,\"items\":["));
+    const pos_first = std.mem.indexOf(u8, result.stdout, "\"id\":\"0x0000000000003000\"").?;
+    const pos_second = std.mem.indexOf(u8, result.stdout, "\"id\":\"0x0000000000003001\"").?;
+    try std.testing.expect(pos_first < pos_second);
+}
+
+test "retained command fails cleanly on an index without dominators" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const fixture = try buildRetainedCliFixture(allocator, io, tmp_path, false);
+    defer allocator.free(fixture.dump_path);
+    defer allocator.free(fixture.index_dir);
+
+    const result = try runCliCaptured(allocator, io, &[_][:0]const u8{
+        "hunt", "retained", fixture.dump_path, "0x3001", "--index-dir", fixture.index_dir,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(?anyerror, error.NoRetainedData), result.err);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "dominators") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Trace") == null);
 }

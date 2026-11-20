@@ -607,6 +607,56 @@ pub const commands = [_]Command{
         },
         .see_also = &.{ "dominator", "refs-to", "roots" },
     },
+    .{
+        .name = "retained",
+        .description = "Show retained size and retention chain for an object.",
+        .long_description = "Prints the retained byte size, shallow size, retained delta, dominator " ++
+            "depth, and the dominator chain for the object with the given raw ID. " ++
+            "Each chain entry is the object's immediate dominator together with " ++
+            "its retained size, ordered from the object up to the top of the " ++
+            "reachable graph. Requires an index built with dominators (the " ++
+            "default for hunt index).",
+        .usage = "hunt retained [file.hprof] <id> [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
+            .{ .flags = "--source", .argument = "<file.hprof>", .description = "Override the HPROF source path stored in the index." },
+        },
+        .examples = &.{
+            "hunt retained heapdump.hprof 0x3000",
+            "hunt retained 0x3000 --index-dir ./idx",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Retained size printed." },
+            .{ .code = 1, .description = "Invalid argument, object not found, missing index, or no dominator data." },
+        },
+        .see_also = &.{ "retainers", "dominator", "dominator-tree" },
+    },
+    .{
+        .name = "retainers",
+        .description = "List objects with the largest retained size.",
+        .long_description = "Scans the index and lists the objects with the largest retained byte " ++
+            "sizes, each with its shallow size, retained delta, and dominator " ++
+            "depth. Output is ordered by retained size descending with the " ++
+            "object ordinal as a deterministic tiebreak. Requires an index " ++
+            "built with dominators (the default for hunt index).",
+        .usage = "hunt retainers [file.hprof] [options]",
+        .options = &.{
+            .{ .flags = "<file.hprof>", .argument = null, .description = "Optional HPROF file; if given, the index directory is derived from config as <base>/<stem>.idx/." },
+            .{ .flags = "--index-dir", .argument = "<dir>", .description = "Directory containing the heap index. Overrides the derived/default index directory." },
+            .{ .flags = "--source", .argument = "<file.hprof>", .description = "Override the HPROF source path stored in the index." },
+            .{ .flags = "--top", .argument = "<n>", .description = "Number of objects to report.", .default_value = "10" },
+        },
+        .examples = &.{
+            "hunt retainers heapdump.hprof --top 20",
+            "hunt retainers --index-dir ./idx --top 5",
+        },
+        .exit_codes = &.{
+            .{ .code = 0, .description = "Retainers printed." },
+            .{ .code = 1, .description = "Invalid argument, missing index, or no dominator data." },
+        },
+        .see_also = &.{ "retained", "dominator", "dominator-tree" },
+    },
 };
 
 pub fn findCommand(name: []const u8) ?Command {
@@ -647,7 +697,7 @@ pub fn printGlobalHelp(writer: *Io.Writer) !void {
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Query commands:\n");
-    try printCommandGroup(writer, &.{ "objects", "sample", "object", "threads", "refs-from", "refs-to", "roots", "tree", "dominator", "dominator-tree" });
+    try printCommandGroup(writer, &.{ "objects", "sample", "object", "threads", "refs-from", "refs-to", "roots", "tree", "dominator", "dominator-tree", "retained", "retainers" });
 
     try writer.writeAll("\n");
     try writeStyled(writer, Style.bold, "Global options:\n");

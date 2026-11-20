@@ -295,6 +295,8 @@ The config file's `index-dir` is used as the default base directory when
 | `list_threads` | Threads with names, states, priorities, daemon flags, and stack traces decoded on demand from the dump. |
 | `find_roots` | Shortest path from an object to a GC root. |
 | `reference_tree` | Bounded reference tree expansion from an object. |
+| `retained_size` | Retained size, shallow size, retained delta, dominator depth, and dominator chain for one object. Requires dominators. |
+| `top_retainers` | Objects with the largest retained sizes. Requires dominators; use the `top` argument to bound the result. |
 
 ### Example session
 
@@ -394,8 +396,14 @@ JSON error payload inside the content block.
 |---------|-------------|
 | `dominator [file.hprof] <id> [options]` | Immediate dominator and retained size of an object. |
 | `dominator-tree [file.hprof] <id> [options]` | Dominator chain from an object up to the top of the reachable graph. |
+| `retained [file.hprof] <id> [options]` | Retained size, shallow size, retained delta, dominator depth, and dominator chain for one object. |
+| `retainers [file.hprof] [options]` | Objects with the largest retained sizes. |
 
-`dominator` accepts `--index-dir` and `--source`. `dominator-tree` additionally accepts `--depth` and `--max-nodes` to bound the pre-computed dominator chain exactly like `hunt tree` bounds a graph walk.
+`dominator`, `dominator-tree`, and `retained` accept `--index-dir` and `--source`.
+`retainers` accepts `--index-dir`, `--source`, and `--top N`. `dominator-tree`
+additionally accepts `--depth` and `--max-nodes` to bound the pre-computed
+dominator chain exactly like `hunt tree` bounds a graph walk. `retained` has no
+depth bound; use `dominator-tree` when a bounded chain is needed.
 
 `--depth N` follows at most `N` dominator links, yielding at most `N + 1` nodes. `--max-nodes N` yields at most `N` nodes. When both are given, the tighter bound wins.
 
@@ -413,6 +421,7 @@ When a bound cuts the chain short, the output carries `"truncated": true`, match
 | `--min-instance-size <n>` | `classes` | Drop classes with instance size below `n`. |
 | `--sort-instances` | `histogram` | Sort by instance count instead of by bytes. |
 | `--limit <n>` | list and tracing commands | Maximum items to emit. |
+| `--top <n>` | `retainers` | Number of largest-retained objects to report (default 10). |
 | `--offset <n>` | list and tracing commands | Skip the first `n` items. |
 | `--reverse` | `objects`, `sample` | Emit items in reverse ordinal order. |
 | `--depth <n>` | `tree`, `dominator-tree` | Maximum depth of the expanded tree or dominator chain. |
@@ -633,6 +642,58 @@ $ hunt dominator-tree 0x0000000708800840 --depth 2
   ]
 }
 ```
+
+### `hunt retained 0x3000` (JSON, abbreviated)
+
+```json
+{
+  "id": "0x0000000708800840",
+  "ordinal": 58,
+  "class": "java/lang/ClassLoader",
+  "shallow_bytes": 48,
+  "retained_bytes": 1770,
+  "retained_delta_bytes": 1722,
+  "dom_depth": 3,
+  "dominators": [
+    { "id": "0x0000000708803d78", "class": "java/lang/ClassLoader", "retained_bytes": 37413 }
+  ]
+}
+```
+
+`retained_delta_bytes` is `retained_bytes - shallow_bytes`, and `dominators`
+walks upward from the object to the top of the reachable graph.
+
+### `hunt retainers --top 2` (JSON, abbreviated)
+
+```json
+{
+  "top": 2,
+  "items": [
+    {
+      "id": "0x0000000708803d78",
+      "ordinal": 358,
+      "class": "java/lang/ClassLoader",
+      "shallow_bytes": 48,
+      "retained_bytes": 37461,
+      "retained_delta_bytes": 37413,
+      "dom_depth": 1
+    },
+    {
+      "id": "0x0000000708c2c430",
+      "ordinal": 57734,
+      "class": "java/lang/ClassLoader",
+      "shallow_bytes": 48,
+      "retained_bytes": 37413,
+      "retained_delta_bytes": 37365,
+      "dom_depth": 2
+    }
+  ]
+}
+```
+
+Results are ordered by `retained_bytes` descending, with the object ordinal as
+a deterministic tiebreak. Both commands fail cleanly when the index was built
+with `--no-dominators`.
 
 ### `hunt threads` (plain text, excerpt)
 
