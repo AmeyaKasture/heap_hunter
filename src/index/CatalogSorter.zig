@@ -52,6 +52,9 @@ pub fn sortAndDedupe(
         try ExtSort.sortStreaming(io, allocator, unsorted_path, sorted_path, .{
             .record_size = catalog_row_size,
             .budget_bytes = job.budget_bytes,
+            // (id, source offset): both u64 LE. The offset tiebreak makes
+            // the order independent of scan worker order.
+            .key_spec = .{ .parts = &.{ 0, 8 } },
         }, null, {}, catalogLessThan);
     }
 

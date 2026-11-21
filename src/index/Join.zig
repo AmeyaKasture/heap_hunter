@@ -199,6 +199,8 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, edges_path, edges_by_source_path, .{
             .record_size = EdgeEmitter.edge_record_size,
             .budget_bytes = job.budget_bytes,
+            // source_raw_id: u64 LE at bytes [0..8).
+            .key_spec = .{ .parts = &.{0} },
         }, null, {}, edgeLessBySource);
     }
 
@@ -231,6 +233,8 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, source_resolved_path, edges_by_target_path, .{
             .record_size = source_resolved_record_size,
             .budget_bytes = job.budget_bytes,
+            // target_raw_id: u64 LE at bytes [4..12).
+            .key_spec = .{ .parts = &.{4} },
         }, null, {}, sourceResolvedLessByTarget);
     }
 

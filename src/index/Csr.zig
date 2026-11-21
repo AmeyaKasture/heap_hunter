@@ -307,6 +307,9 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, resolved_path, sorted_by_source, .{
             .record_size = Join.resolved_record_size,
             .budget_bytes = job.budget_bytes,
+            // (source_ordinal, target_ordinal): two u32 LE at bytes
+            // [0..8), i.e. one packed u64 key.
+            .key_spec = .{ .parts = &.{0} },
         }, null, {}, lessBySource);
     }
 
