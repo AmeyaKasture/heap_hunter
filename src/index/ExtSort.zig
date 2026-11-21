@@ -925,23 +925,55 @@ test "external sort removes multi-pass merge intermediates" {
 // Streaming merge implementation (memory-bounded alternative to mergeRuns)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-run state used by the streaming merger.
+/// Per-run state used by the streaming merger. Each run is read through a
+/// fixed-size block buffer instead of one positional read per record: a
+/// spilled sort of n records previously cost n syscalls moving
+/// `record_size` bytes each.
+const merge_run_buffer_bytes = 256 * 1024;
+
 const StreamingRun = struct {
     file: Io.File,
-    /// Current byte offset into the run file (advances by record_size each pop).
+    /// Current byte offset into the run file (advances by one buffer per
+    /// refill).
     offset: u64,
-    /// Heap-owned buffer holding the current record for this run.
+    /// Refill buffer holding up to `buf_capacity` records.
     buf: []u8,
+    /// Records that fit in `buf`.
+    buf_capacity: usize,
+    /// Records currently valid in `buf` (short at the end of a run).
+    buf_len: usize,
+    /// Records of `buf` already consumed.
+    buf_pos: usize,
+
+    /// The record the merge heap currently compares for this run.
+    fn current(self: *const StreamingRun, record_size: usize) []const u8 {
+        return self.buf[self.buf_pos * record_size ..][0..record_size];
+    }
+
+    /// Make sure `current` is valid. Returns false when the run is
+    /// exhausted.
+    fn refill(self: *StreamingRun, io: Io, record_size: usize) !bool {
+        if (self.buf_pos < self.buf_len) return true;
+        const want = self.buf_capacity * record_size;
+        const n = try self.file.readPositionalAll(io, self.buf[0..want], self.offset);
+        self.buf_len = n / record_size;
+        self.buf_pos = 0;
+        self.offset += n;
+        return self.buf_len > 0;
+    }
 };
 
 fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []const u8) bool) type {
     return struct {
         runs: []StreamingRun,
+        record_size: usize,
         context: C,
 
         pub fn less(self: @This(), a: usize, b: usize) bool {
-            if (lt(self.context, self.runs[a].buf, self.runs[b].buf)) return true;
-            if (lt(self.context, self.runs[b].buf, self.runs[a].buf)) return false;
+            const rec_a = self.runs[a].current(self.record_size);
+            const rec_b = self.runs[b].current(self.record_size);
+            if (lt(self.context, rec_a, rec_b)) return true;
+            if (lt(self.context, rec_b, rec_a)) return false;
             // Equal records: prefer the earlier run (input order) so the
             // streaming merge is stable, matching the in-memory blockSort
             // path and the mmap merge above.
@@ -952,12 +984,14 @@ fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []cons
 
 /// Memory-bounded merge of a group of run files.
 ///
-/// Instead of memory-mapping every file, each run is read one record at a time
-/// using positional reads.  The total heap-allocated record storage is:
+/// Instead of memory-mapping every file, each run is read through a
+/// `merge_run_buffer_bytes` block buffer. The total heap-allocated record
+/// storage is:
 ///
-///   `run_paths.len × record_size`
+///   `run_paths.len × merge_run_buffer_bytes`
 ///
-/// which is always bounded by `fanout × record_size` ≤ `budget_bytes`.
+/// which is bounded by `fanout × 256 KiB` (16 MiB at the default fanout
+/// cap of 64) regardless of budget.
 fn mergeRunGroupStreaming(
     io: Io,
     allocator: std.mem.Allocator,
@@ -981,10 +1015,19 @@ fn mergeRunGroupStreaming(
         allocator.free(sr);
     }
 
-    // Open each run and eagerly read its first record.
+    const buf_capacity = @max(merge_run_buffer_bytes / record_size, 1);
+
+    // Open each run, allocate its refill buffer, and prime the first block.
     for (run_paths, 0..) |path, i| {
-        const buf = try allocator.alloc(u8, record_size);
-        sr[i] = .{ .file = undefined, .offset = 0, .buf = buf };
+        const buf = try allocator.alloc(u8, buf_capacity * record_size);
+        sr[i] = .{
+            .file = undefined,
+            .offset = 0,
+            .buf = buf,
+            .buf_capacity = buf_capacity,
+            .buf_len = 0,
+            .buf_pos = 0,
+        };
         sr[i].file = try Io.Dir.cwd().openFile(io, path, .{});
         sr_open += 1;
     }
@@ -997,31 +1040,27 @@ fn mergeRunGroupStreaming(
 
     const C = @TypeOf(context);
     const Ctx = StreamingHeapContext(C, lessThan);
-    const heap_ctx = Ctx{ .runs = sr, .context = context };
+    const heap_ctx = Ctx{ .runs = sr, .record_size = record_size, .context = context };
     var heap = BinaryHeap(usize, Ctx, Ctx.less).init(allocator, heap_ctx);
     defer heap.deinit(allocator);
 
     // Prime the heap: push runs that have at least one record.
     for (sr, 0..) |*r, i| {
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
+        if (try r.refill(io, record_size)) {
             try heap.add(allocator, i);
         }
-        // If n < record_size the run file is empty – leave it out of the heap.
     }
 
     while (heap.len() > 0) {
         const idx = heap.removeMin();
         const r = &sr[idx];
-        try out.writeAll(r.buf);
-        // Advance and attempt to read the next record.
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
+        try out.writeAll(r.current(record_size));
+        // Consume one record and push the run back if its buffer (or the
+        // run file behind it) still has records.
+        r.buf_pos += 1;
+        if (try r.refill(io, record_size)) {
             try heap.add(allocator, idx);
         }
-        // Otherwise this run is exhausted – leave it out of the heap.
     }
 
     try out_writer.flush();
