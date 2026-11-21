@@ -328,7 +328,12 @@ fn MergeHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []const u8
             const run_b = self.runs[b];
             const rec_a = run_a.data[run_a.cursor..][0..self.record_size];
             const rec_b = run_b.data[run_b.cursor..][0..self.record_size];
-            return lt(self.context, rec_a, rec_b);
+            if (lt(self.context, rec_a, rec_b)) return true;
+            if (lt(self.context, rec_b, rec_a)) return false;
+            // Equal records: prefer the earlier run. Run files are
+            // generated in input order, so this makes the merge stable and
+            // byte-identical to the in-memory path's stable blockSort.
+            return a < b;
         }
     };
 }
@@ -776,7 +781,12 @@ fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []cons
         context: C,
 
         pub fn less(self: @This(), a: usize, b: usize) bool {
-            return lt(self.context, self.runs[a].buf, self.runs[b].buf);
+            if (lt(self.context, self.runs[a].buf, self.runs[b].buf)) return true;
+            if (lt(self.context, self.runs[b].buf, self.runs[a].buf)) return false;
+            // Equal records: prefer the earlier run (input order) so the
+            // streaming merge is stable, matching the in-memory blockSort
+            // path and the mmap merge above.
+            return a < b;
         }
     };
 }
@@ -1171,4 +1181,117 @@ test "streaming sort: rejects misaligned input" {
     }, null, {}, lexLess);
 
     try std.testing.expectError(error.InvalidRecordFile, result);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tie-stability tests: the in-memory path (stable blockSort) and the external
+// runs+merge path must produce byte-identical output for tie-heavy inputs.
+// The payload of each record is its input position, so any tie reordering is
+// visible in the output bytes. These tests guard the sort-kernel swap work:
+// a replacement kernel is only correct if it preserves this invariant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn numericKeyLess(_: void, a: []const u8, b: []const u8) bool {
+    const a_key = std.mem.readInt(u32, a[0..4], .little);
+    const b_key = std.mem.readInt(u32, b[0..4], .little);
+    return a_key < b_key;
+}
+
+const TiePattern = enum { all_equal, modulo_four, skewed, ascending, descending, random };
+
+fn fillTieRecords(rnd: std.Random, input: []u8, record_size: usize, pattern: TiePattern) void {
+    const count = input.len / record_size;
+    for (0..count) |i| {
+        const rec = input[i * record_size ..][0..record_size];
+        const key: u32 = switch (pattern) {
+            .all_equal => 42,
+            .modulo_four => @intCast(i % 4),
+            .skewed => if (i % 20 == 0) @as(u32, @intCast(i % 97)) else 0,
+            .ascending => @intCast(i),
+            .descending => @intCast(count - 1 - i),
+            .random => rnd.int(u32),
+        };
+        std.mem.writeInt(u32, rec[0..4], key, .little);
+        std.mem.writeInt(u32, rec[4..8], @intCast(i), .little);
+        if (record_size > 8) rnd.bytes(rec[8..record_size]);
+    }
+}
+
+fn testSortStabilityCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    record_size: usize,
+    count: usize,
+    pattern: TiePattern,
+    ext_budget_bytes: usize,
+    ext_fanout: usize,
+) !void {
+    const input_len = record_size * count;
+    const input = try allocator.alloc(u8, input_len);
+    defer allocator.free(input);
+
+    var prng = std.Random.DefaultPrng.init(0x5eed1234);
+    fillTieRecords(prng.random(), input, record_size, pattern);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_path, "input.bin" });
+    defer allocator.free(input_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = input_path, .data = input });
+
+    const mem_path = try std.fs.path.join(allocator, &.{ tmp_path, "mem.bin" });
+    defer allocator.free(mem_path);
+    const ext_path = try std.fs.path.join(allocator, &.{ tmp_path, "ext.bin" });
+    defer allocator.free(ext_path);
+
+    // In-memory fast path (budget larger than the input).
+    try sortStreaming(io, allocator, input_path, mem_path, .{
+        .record_size = record_size,
+        .budget_bytes = input_len + 1,
+        .max_fanout = 64,
+    }, null, {}, numericKeyLess);
+
+    // External path: tiny budget forces many runs; explicit fanout forces
+    // multi-pass merging when it is below the run count.
+    try sortStreaming(io, allocator, input_path, ext_path, .{
+        .record_size = record_size,
+        .budget_bytes = ext_budget_bytes,
+        .max_fanout = 64,
+    }, ext_fanout, {}, numericKeyLess);
+
+    const mem = try Io.Dir.cwd().readFileAlloc(io, mem_path, allocator, .limited(input_len + 1));
+    defer allocator.free(mem);
+    const ext = try Io.Dir.cwd().readFileAlloc(io, ext_path, allocator, .limited(input_len + 1));
+    defer allocator.free(ext);
+
+    try std.testing.expectEqualSlices(u8, mem, ext);
+    // Stability means ties keep input order; for the all-equal pattern the
+    // sorted output is therefore the input itself, byte for byte.
+    if (pattern == .all_equal) {
+        try std.testing.expectEqualSlices(u8, input, mem);
+    }
+}
+
+test "streaming sort: tie-heavy inputs are stable and path-independent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // record_size, count, pattern, ext budget, ext fanout
+    const cases = .{
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 64 },
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 2 },
+        .{ .rs = 12, .count = 600, .pattern = TiePattern.modulo_four, .budget = 480, .fanout = 64 },
+        .{ .rs = 16, .count = 500, .pattern = TiePattern.skewed, .budget = 500, .fanout = 2 },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.ascending, .budget = 240, .fanout = 64 },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.descending, .budget = 240, .fanout = 2 },
+        .{ .rs = 16, .count = 1000, .pattern = TiePattern.random, .budget = 1000, .fanout = 64 },
+        .{ .rs = 12, .count = 1, .pattern = TiePattern.random, .budget = 24, .fanout = 64 },
+    };
+
+    inline for (cases) |c| {
+        try testSortStabilityCase(allocator, io, c.rs, c.count, c.pattern, c.budget, c.fanout);
+    }
 }
