@@ -16,6 +16,9 @@ const TestSupport = @import("dominator/TestSupport.zig");
 
 pub const NONE = std.math.maxInt(u32);
 
+/// Host byte order, for the little-endian fast path in the output writers.
+const native_endian = @import("builtin").cpu.arch.endian();
+
 /// Parses a user-facing algorithm name; see Backend.parseAlgorithm.
 pub const parseAlgorithmName = Backend.parseAlgorithm;
 
@@ -200,10 +203,13 @@ pub fn run(
     numbering.releaseDfsTree(allocator);
 
     // 7. Read shallow sizes from the catalog (demand-paged, one sequential
-    // pass; see the mapping rationale in step 2). The catalog mapping is
-    // dead after this phase, so the whole phase is block-scoped.
-    const shallow = try allocator.alloc(u64, V);
-    defer allocator.free(shallow);
+    // pass; see the mapping rationale in step 2) straight into `retained`,
+    // which the sweep below accumulates in place. The write-once `shallow`
+    // copy this replaces saved nothing and cost the orchestrator 8 B/node
+    // of peak. The catalog mapping is dead after this phase, so only the
+    // file handling is block-scoped.
+    const retained = try allocator.alloc(u64, V);
+    defer allocator.free(retained);
     var total_shallow_reachable: u64 = 0;
     {
         var span = profiling.begin(io, "read_shallow");
@@ -217,47 +223,31 @@ pub fn run(
         var v: u32 = 0;
         while (v < n_objects) : (v += 1) {
             const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
-            shallow[v] = row.shallow_size;
-            if (numbering.reachable[v]) {
+            retained[v] = row.shallow_size;
+            if (numbering.isReachable(v)) {
                 total_shallow_reachable += row.shallow_size;
             }
         }
     }
-    shallow[root] = 0;
+    retained[root] = 0;
 
-    // 8. Build dom_parent (root -> NONE) and retained (reverse RPO sweep).
-    // The arrays live on to the write phase, so only the computation sits
-    // inside the span block.
-    const dom_parent = try allocator.alloc(u32, V);
-    defer allocator.free(dom_parent);
-    const retained = try allocator.alloc(u64, V);
-    defer allocator.free(retained);
+    // 8. Accumulate retained sizes up the dominator tree (reverse RPO).
+    // The sweep reads the backend's `idom` directly instead of a
+    // materialized `dom_parent` array, so this phase allocates nothing;
+    // `dom_parent.bin` is derived per entry while it is written in step 9.
+    // Root-dominated and self-dominated nodes (the latter cannot occur for
+    // a reachable node) keep their own total: the root's entry is assigned
+    // from `total_shallow_reachable` below.
     {
         var span = profiling.begin(io, "retained_sweep");
         defer span.end(io);
-        @memset(dom_parent, NONE);
-
-        for (0..V) |i| {
-            retained[i] = shallow[i];
-        }
-        retained[root] = 0;
-
-        var v: u32 = 0;
-        while (v < V) : (v += 1) {
-            if (!numbering.reachable[v] or v == root) {
-                dom_parent[v] = NONE;
-                continue;
-            }
-            const idom = backend_result.idom[v];
-            dom_parent[v] = if (idom == v or idom == root) NONE else idom;
-        }
 
         var rpo_slot: u32 = numbering.n_reachable;
         while (rpo_slot > 1) {
             rpo_slot -= 1;
             const node = numbering.rpo_vertex[rpo_slot];
-            const p = dom_parent[node];
-            if (p != NONE) {
+            const p = backend_result.idom[node];
+            if (p != NONE and p != root and p != node) {
                 retained[p] += retained[node];
             }
         }
@@ -275,7 +265,28 @@ pub fn run(
     {
         var span = profiling.begin(io, "write_outputs");
         defer span.end(io);
-        try writeU32File(io, dom_parent_path, dom_parent);
+        // dom_parent.bin, streamed: one entry per ordinal, derived from
+        // `idom` on the fly (NONE for unreachable ordinals, the virtual
+        // root, and root- or self-dominated nodes) instead of a
+        // materialized 4 B/node array.
+        {
+            const f = try Io.Dir.cwd().createFile(io, dom_parent_path, .{});
+            defer f.close(io);
+            var buf: [65536]u8 = undefined;
+            var writer: Io.File.Writer = .init(f, io, &buf);
+            var v: u32 = 0;
+            while (v < V) : (v += 1) {
+                var entry: u32 = NONE;
+                if (v != root and numbering.isReachable(v)) {
+                    const idom = backend_result.idom[v];
+                    if (idom != NONE and idom != v and idom != root) entry = idom;
+                }
+                var bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes, entry, .little);
+                try writer.interface.writeAll(&bytes);
+            }
+            try writer.flush();
+        }
         try writeU32File(io, dom_order_path, numbering.rpo_vertex[0..numbering.n_reachable]);
         try writeU64File(io, retained_path, retained);
     }
@@ -354,23 +365,29 @@ pub fn formatBudgetError(V: u64, required: u64, budget: usize, writer: anytype) 
 
 /// Anonymous bytes per node the stage's peak phase needs, by algorithm.
 /// The model must cover every phase's live arrays, including the
-/// orchestrator's (which is why `shallow` counts 8, not 4). The CSR and
-/// catalog bytes are deliberately excluded: they are demand-paged,
-/// file-backed mappings whose clean pages evict under pressure, not
-/// anonymous allocations the budget must reserve for.
+/// orchestrator's. The CSR and catalog bytes are deliberately excluded:
+/// they are demand-paged, file-backed mappings whose clean pages evict
+/// under pressure, not anonymous allocations the budget must reserve for.
+/// `reachable` counts 1 per node even though the bitset needs 1/8, so
+/// every figure is a whole-byte upper bound.
 pub fn bytesPerNode(algorithm: Backend.Algorithm) u64 {
     return switch (algorithm) {
-        // Backend phase: rpo_num 4 + rpo_vertex 4 + reachable 1 +
-        // idom 4 + sole_pred 4 = 17. Orchestrator phase (rpo_num is freed
-        // only at scope end): rpo_num 4 + rpo_vertex 4 + reachable 1 +
-        // idom 4 + shallow 8 + retained 8 + dom_parent 4 = 33.
-        .chk => 4 + 4 + 1 + 4 + 8 + 8 + 4,
+        // Backend phase: rpo_num 4 + rpo_vertex 4 + reachable 1 + idom 4 +
+        // sole_pred 4 = 17. Orchestrator phase (rpo_num is freed only at
+        // scope end; `shallow` is read straight into `retained` and
+        // `dom_parent` is streamed during the write, so neither exists as
+        // an array): rpo_num 4 + rpo_vertex 4 + reachable 1 + idom 4 +
+        // retained 8 = 21.
+        .chk => 4 + 4 + 1 + 4 + 8,
         // Main-loop phase (peak): rpo_vertex 4 + dfn 4 + dfn_vertex 4 +
-        // parent 4 + reachable 1 + sdom 4 + doms 4 + anc 4 + label 4 +
-        // bucket_head 4 + bucket_next 4 = 41. The backend frees its
-        // scratch before returning and the orchestrator releases the
-        // DFS-tree products, so its phase is 29.
-        .lt => 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 4,
+        // parent 4 + reachable 1 + idom 4 + sdom 4 + doms 4 + anc 4 +
+        // label 4 + bucket_head 4 + bucket_next 4 = 45. `idom` is
+        // allocated before the scratch arrays and stays live through the
+        // loop, so the peak includes it. The backend frees its scratch
+        // before returning and the orchestrator releases the DFS-tree
+        // products, so the orchestrator phase is rpo_vertex 4 + reachable
+        // 1 + idom 4 + retained 8 = 17.
+        .lt => 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 4 + 4 + 4 + 4,
     };
 }
 
@@ -379,10 +396,17 @@ fn writeU32File(io: Io, path: []const u8, values: []const u32) !void {
     defer f.close(io);
     var buf: [65536]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
-    for (values) |value| {
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, value, .little);
-        try writer.interface.writeAll(&bytes);
+    // The file format is little-endian: on a little-endian host the
+    // array's memory image is the file image, and one bulk write beats
+    // V per-element byte swaps.
+    if (comptime native_endian == .little) {
+        try writer.interface.writeAll(std.mem.sliceAsBytes(values));
+    } else {
+        for (values) |value| {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, value, .little);
+            try writer.interface.writeAll(&bytes);
+        }
     }
     try writer.flush();
 }
@@ -392,10 +416,14 @@ fn writeU64File(io: Io, path: []const u8, values: []const u64) !void {
     defer f.close(io);
     var buf: [65536]u8 = undefined;
     var writer: Io.File.Writer = .init(f, io, &buf);
-    for (values) |value| {
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, value, .little);
-        try writer.interface.writeAll(&bytes);
+    if (comptime native_endian == .little) {
+        try writer.interface.writeAll(std.mem.sliceAsBytes(values));
+    } else {
+        for (values) |value| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, value, .little);
+            try writer.interface.writeAll(&bytes);
+        }
     }
     try writer.flush();
 }
@@ -537,6 +565,16 @@ test "dominator engine writes all three output files" {
     try std.testing.expectEqual(@as(u32, 3), dom_order[0]);
     try std.testing.expectEqual(NONE, dom_parent[3]);
     try std.testing.expectEqual(@as(u64, 40), retained[3]);
+
+    // The join's only strict dominator is the virtual root, so every real
+    // node's on-disk parent is NONE, and each node's retained size equals
+    // its own shallow total.
+    try std.testing.expectEqual(NONE, dom_parent[0]);
+    try std.testing.expectEqual(NONE, dom_parent[1]);
+    try std.testing.expectEqual(NONE, dom_parent[2]);
+    try std.testing.expectEqual(@as(u64, 10), retained[0]);
+    try std.testing.expectEqual(@as(u64, 10), retained[1]);
+    try std.testing.expectEqual(@as(u64, 20), retained[2]);
 }
 
 test "dominator engine marks unreachable objects with NONE" {
@@ -627,6 +665,12 @@ test "dominator engine reconciles retained bytes with the reachable shallow tota
 
     try std.testing.expectEqual(@as(u64, 21), retained[3]); // virtual root retains all reachable shallow bytes
     try std.testing.expectEqual(@as(u64, 21), result.total_retained_bytes);
+
+    // The sweep propagates each descendant's bytes up through `idom`:
+    // 0 dominates 1 and 2, and 1 dominates 2.
+    try std.testing.expectEqual(@as(u64, 21), retained[0]);
+    try std.testing.expectEqual(@as(u64, 14), retained[1]);
+    try std.testing.expectEqual(@as(u64, 7), retained[2]);
 }
 
 test "dominator engine rejects a mismatched edge count" {
@@ -792,11 +836,14 @@ test "declared budget figure is at least the real allocation" {
         // rejects a budget the real check accepts.
         try std.testing.expect(numbering_bytes_per_node + 8 <= bytes_per_node);
 
-        // The declared per-node figure also covers each phase's arrays:
-        // CHK backend 17, CHK orchestrator 33, LT main loop 41,
-        // LT orchestrator 29.
-        try std.testing.expect(bytes_per_node >= 17);
-        try std.testing.expect(bytes_per_node >= 33);
+        // The declared per-node figure also covers each phase's live
+        // arrays: CHK backend 17, CHK orchestrator 21, LT main loop 45
+        // (including `idom`, allocated before the scratch arrays), LT
+        // orchestrator 17.
+        switch (algorithm) {
+            .chk => try std.testing.expect(bytes_per_node >= 21),
+            .lt => try std.testing.expect(bytes_per_node >= 45),
+        }
     }
 }
 
@@ -804,12 +851,13 @@ test "dominator budget gate is phase-aware" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // 4-node diamond. LT: pre-check 4 x 25 = 100 B, real check 4 x 41 +
-    // 3 x 12 = 200 B. CHK: pre-check 4 x 17 = 68 B, real check 4 x 33 +
-    // 3 x 8 = 156 B. For both, a 150 B budget passes the pre-check and is
+    // 4-node diamond. LT: pre-check 4 x 25 = 100 B, real check 4 x 45 +
+    // 3 x 12 = 216 B. CHK: pre-check 4 x 17 = 68 B, real check 4 x 21 +
+    // 3 x 8 = 108 B. For both, a 100 B budget passes the pre-check and is
     // then rejected by the real check with the honest figure, and 250 B
-    // fits both — even though a whole-stage conservative gate (4 x 53 B)
-    // would have rejected a budget the stage can actually run in.
+    // fits both — a whole-stage conservative gate would instead have to
+    // reserve the LT peak plus the stack cushion (4 x 57 B = 228 B) up
+    // front, rejecting a 150 B budget in which CHK (108 B) fits easily.
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
@@ -829,7 +877,7 @@ test "dominator budget gate is phase-aware" {
     defer job.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    job.dominator_budget_bytes = 150;
+    job.dominator_budget_bytes = 100;
     try std.testing.expectError(error.DominatorBudgetExceeded, runDominatorTest(
         allocator,
         io,

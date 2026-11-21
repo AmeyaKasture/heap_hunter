@@ -484,13 +484,15 @@ fn dropStageFileCache(allocator: std.mem.Allocator, io: Io, index_dir: []const u
 
 fn estimateEdgesProcessed(
     in_view: *const CsrView,
-    reachable: []const bool,
+    /// Reachability bitset over ordinals; see `Numbering.reachable`.
+    reachable: []const u8,
     V: u32,
 ) u64 {
     var total: u64 = 0;
     for (0..V) |v| {
-        if (!reachable[v]) continue;
-        total += in_view.edges(@intCast(v)).len;
+        const v32: u32 = @intCast(v);
+        if ((reachable[v32 >> 3] & (@as(u8, 1) << @intCast(v32 & 7))) == 0) continue;
+        total += in_view.edges(v32).len;
     }
     return total;
 }
