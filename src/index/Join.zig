@@ -200,7 +200,8 @@ pub fn run(
             .record_size = EdgeEmitter.edge_record_size,
             .budget_bytes = job.budget_bytes,
             // source_raw_id: u64 LE at bytes [0..8).
-            .key_spec = .{ .parts = &.{0} },
+            .key_spec = .{ .parts = &.{.{ .offset = 0 }} },
+            .kernel = .pdq_atoms,
         }, null, {}, edgeLessBySource);
     }
 
@@ -234,7 +235,8 @@ pub fn run(
             .record_size = source_resolved_record_size,
             .budget_bytes = job.budget_bytes,
             // target_raw_id: u64 LE at bytes [4..12).
-            .key_spec = .{ .parts = &.{4} },
+            .key_spec = .{ .parts = &.{.{ .offset = 4 }} },
+            .kernel = .pdq_atoms,
         }, null, {}, sourceResolvedLessByTarget);
     }
 

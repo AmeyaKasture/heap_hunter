@@ -54,7 +54,8 @@ pub fn sortAndDedupe(
             .budget_bytes = job.budget_bytes,
             // (id, source offset): both u64 LE. The offset tiebreak makes
             // the order independent of scan worker order.
-            .key_spec = .{ .parts = &.{ 0, 8 } },
+            .key_spec = .{ .parts = &.{ .{ .offset = 0 }, .{ .offset = 8 } } },
+            .kernel = .pdq_atoms,
         }, null, {}, catalogLessThan);
     }
 
