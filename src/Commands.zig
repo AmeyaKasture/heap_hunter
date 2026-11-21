@@ -44,6 +44,33 @@ pub const OverviewOptions = struct {
     profile: bool = false,
 };
 
+/// A page-backed, stage-scoped arena. `deinit` munmaps every allocation,
+/// returning a stage's scratch memory to the OS; the process-lifetime
+/// allocator only keeps small things (stage output paths, manifest).
+///
+/// The index pipeline runs each stage in its own StageArena so a stage's
+/// working set does not stay resident for the rest of the process. Strings
+/// that later stages consume are duped to the caller's allocator before the
+/// arena is released.
+const StageArena = struct {
+    arena: std.heap.ArenaAllocator,
+    deinit_done: bool = false,
+
+    fn init() StageArena {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    }
+
+    fn allocator(self: *StageArena) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn deinitOnce(self: *StageArena) void {
+        if (self.deinit_done) return;
+        self.deinit_done = true;
+        self.arena.deinit();
+    }
+};
+
 pub fn runIndexCommand(
     allocator: std.mem.Allocator,
     io: Io,
@@ -139,27 +166,32 @@ pub fn runIndexCommand(
 
             var elapsed = std.mem.zeroes(StageTimings);
 
+            // Bucket 1: scan + classes + layouts + edge emission. The
+            // in-memory class tables, scan worker state, and layout scratch
+            // are all dead once edges are emitted, so they share one stage
+            // arena that is returned to the OS before the sort stages begin.
+            var scan_stage = StageArena.init();
+            defer scan_stage.deinitOnce();
+
             progress.nextStep("scanning heap dump");
             log.debug("stage: scanning heap dump", .{});
             var scan_result = blk: {
                 var span = profiling.begin(io, "scan");
                 defer span.end(io);
-                break :blk stageTimed(io, "scan", &elapsed, try Scanner.run(allocator, io, job, source_mm.memory, &progress));
+                break :blk stageTimed(io, "scan", &elapsed, try Scanner.run(scan_stage.allocator(), io, job, source_mm.memory, &progress));
             };
-            defer scan_result.deinit(allocator);
             log.debug("stage: scan complete, n_objects approx {d}, diagnostics={any}", .{ scan_result.diagnostics.duplicate_object_ids, scan_result.diagnostics });
 
             const classes_path = blk: {
                 var span = profiling.begin(io, "writeClasses");
                 defer span.end(io);
                 break :blk try CatalogSorter.writeClasses(
-                    allocator,
+                    scan_stage.allocator(),
                     io,
                     job.staging_dir,
                     &scan_result.class_table,
                 );
             };
-            defer allocator.free(classes_path);
             log.debug("stage: classes written to {s}", .{classes_path});
 
             progress.nextStep("building layouts");
@@ -168,7 +200,7 @@ pub fn runIndexCommand(
                 var span = profiling.begin(io, "layouts");
                 defer span.end(io);
                 break :blk stageTimed(io, "layouts", &elapsed, try Layouts.writeFields(
-                    allocator,
+                    scan_stage.allocator(),
                     io,
                     job.staging_dir,
                     &scan_result.class_table,
@@ -176,16 +208,15 @@ pub fn runIndexCommand(
                     &scan_result.diagnostics,
                 ));
             };
-            defer layout_table.deinit();
             log.debug("stage: layouts complete, n_classes={d}", .{layout_table.layouts.len});
 
             progress.nextStep("emitting edges");
             log.debug("stage: emitting edges", .{});
-            var edge_result = blk: {
+            const edge_result = blk: {
                 var span = profiling.begin(io, "emit_edges");
                 defer span.end(io);
                 break :blk stageTimed(io, "emit_edges", &elapsed, try EdgeEmitter.run(
-                    allocator,
+                    scan_stage.allocator(),
                     io,
                     job,
                     source_mm.memory,
@@ -193,19 +224,33 @@ pub fn runIndexCommand(
                     &scan_result.diagnostics,
                 ));
             };
-            defer edge_result.deinit(allocator);
             log.debug("stage: emit_edges complete", .{});
+
+            // Capture everything later stages consume from bucket 1, then
+            // release the bucket. Scalars live in the stack structs and stay
+            // valid; the class tables and their strings do not.
+            const edges_raw_path = try allocator.dupe(u8, edge_result.edges_path);
+            defer allocator.free(edges_raw_path);
+            const catalog_unsorted_path = try allocator.dupe(u8, scan_result.catalog_path);
+            defer allocator.free(catalog_unsorted_path);
+            const roots_raw_path = try allocator.dupe(u8, scan_result.roots_path);
+            defer allocator.free(roots_raw_path);
+            const scan_n_roots = scan_result.n_roots;
+            const n_classes = layout_table.layouts.len;
+            scan_stage.deinitOnce();
 
             progress.nextStep("sorting catalog");
             log.debug("stage: sorting catalog", .{});
-            var catalog_result = blk: {
+            var catalog_stage = StageArena.init();
+            defer catalog_stage.deinitOnce();
+            const catalog_result = blk: {
                 var span = profiling.begin(io, "sort_catalog");
                 defer span.end(io);
                 break :blk stageTimed(io, "sort_catalog", &elapsed, CatalogSorter.sortAndDedupe(
-                    allocator,
+                    catalog_stage.allocator(),
                     io,
                     job,
-                    scan_result.catalog_path,
+                    catalog_unsorted_path,
                     &scan_result.diagnostics,
                 ) catch |err| switch (err) {
                     error.TooManyObjects => {
@@ -215,52 +260,69 @@ pub fn runIndexCommand(
                     else => return @as(anyerror!void, err),
                 });
             };
-            defer catalog_result.deinit(allocator);
-            log.debug("stage: sort_catalog complete, n_objects={d}", .{catalog_result.n_objects});
+            const catalog_sorted_path = try allocator.dupe(u8, catalog_result.catalog_path);
+            defer allocator.free(catalog_sorted_path);
+            const n_objects = catalog_result.n_objects;
+            catalog_stage.deinitOnce();
+            log.debug("stage: sort_catalog complete, n_objects={d}", .{n_objects});
 
             progress.nextStep("resolving references");
             log.debug("stage: resolving references", .{});
-            var join_result = blk: {
+            var join_stage = StageArena.init();
+            defer join_stage.deinitOnce();
+            const join_result = blk: {
                 var span = profiling.begin(io, "join");
                 defer span.end(io);
                 break :blk stageTimed(io, "join", &elapsed, try Join.run(
-                    allocator,
+                    join_stage.allocator(),
                     io,
                     job,
-                    edge_result.edges_path,
-                    catalog_result.catalog_path,
-                    catalog_result.n_objects,
+                    edges_raw_path,
+                    catalog_sorted_path,
+                    n_objects,
                     &scan_result.diagnostics,
                 ));
             };
-            defer join_result.deinit(allocator);
-            log.debug("stage: join complete, n_edges={d}", .{join_result.n_edges});
+            const edges_resolved_path = try allocator.dupe(u8, join_result.resolved_path);
+            defer allocator.free(edges_resolved_path);
+            const n_edges = join_result.n_edges;
+            join_stage.deinitOnce();
+            log.debug("stage: join complete, n_edges={d}", .{n_edges});
 
             progress.nextStep("building graph");
             log.debug("stage: building graph", .{});
-            var csr_result = blk: {
+            var csr_stage = StageArena.init();
+            defer csr_stage.deinitOnce();
+            const csr_result = blk: {
                 var span = profiling.begin(io, "csr");
                 defer span.end(io);
                 break :blk stageTimed(io, "csr", &elapsed, try Csr.run(
-                    allocator,
+                    csr_stage.allocator(),
                     io,
                     job,
-                    join_result.resolved_path,
-                    scan_result.roots_path,
-                    catalog_result.catalog_path,
-                    catalog_result.n_objects,
-                    join_result.n_edges,
-                    scan_result.n_roots,
+                    edges_resolved_path,
+                    roots_raw_path,
+                    catalog_sorted_path,
+                    n_objects,
+                    n_edges,
+                    scan_n_roots,
                     &scan_result.diagnostics,
                 ));
             };
-            defer csr_result.deinit(allocator);
-            log.debug("stage: csr complete, n_roots={d}", .{csr_result.n_roots});
-
-            const n_classes = layout_table.layouts.len;
-            const n_objects = catalog_result.n_objects;
-            const n_edges = join_result.n_edges;
+            // The dominator stage consumes the four CSR paths; capture them
+            // before releasing the bucket.
+            const csr_out_offsets_path = try allocator.dupe(u8, csr_result.out_offsets_path);
+            defer allocator.free(csr_out_offsets_path);
+            const csr_out_targets_path = try allocator.dupe(u8, csr_result.out_targets_path);
+            defer allocator.free(csr_out_targets_path);
+            const csr_in_offsets_path = try allocator.dupe(u8, csr_result.in_offsets_path);
+            defer allocator.free(csr_in_offsets_path);
+            const csr_in_sources_path = try allocator.dupe(u8, csr_result.in_sources_path);
+            defer allocator.free(csr_in_sources_path);
             const n_roots = csr_result.n_roots;
+            csr_stage.deinitOnce();
+            log.debug("stage: csr complete, n_roots={d}", .{n_roots});
+
             const virtual_root_ordinal = n_objects;
 
             var dominator_n_reachable: u64 = 0;
@@ -272,23 +334,25 @@ pub fn runIndexCommand(
             if (compute_dominators) {
                 progress.nextStep("computing dominators");
                 log.debug("stage: computing dominators", .{});
-                const V = catalog_result.n_objects + 1;
+                const V = n_objects + 1;
                 const stack_bytes_per_node: u64 = if (dominator_algorithm == .lt) 12 else 8;
                 const required_conservative: u64 = @intCast(@as(u128, Dominator.bytesPerNode(dominator_algorithm)) * V + stack_bytes_per_node * V);
-                var dominator_result = blk: {
+                var dominator_stage = StageArena.init();
+                defer dominator_stage.deinitOnce();
+                const dominator_result = blk: {
                     var span = profiling.begin(io, "dominators");
                     defer span.end(io);
                     break :blk stageTimed(io, "dominators", &elapsed, Dominator.run(
-                        allocator,
+                        dominator_stage.allocator(),
                         io,
                         job,
-                        csr_result.out_offsets_path,
-                        csr_result.out_targets_path,
-                        csr_result.in_offsets_path,
-                        csr_result.in_sources_path,
-                        catalog_result.catalog_path,
-                        catalog_result.n_objects,
-                        join_result.n_edges,
+                        csr_out_offsets_path,
+                        csr_out_targets_path,
+                        csr_in_offsets_path,
+                        csr_in_sources_path,
+                        catalog_sorted_path,
+                        n_objects,
+                        n_edges,
                         &scan_result.diagnostics,
                         .{ .algorithm = dominator_algorithm },
                     ) catch |err| {
@@ -299,22 +363,27 @@ pub fn runIndexCommand(
                         return @as(anyerror!void, err);
                     });
                 };
-                defer dominator_result.deinit(allocator);
                 dominator_n_reachable = dominator_result.n_reachable;
                 dominator_total_retained = dominator_result.total_retained_bytes;
                 dominator_iterations = dominator_result.stats.iterations;
                 dominator_shortcut_nodes = dominator_result.stats.shortcut_nodes;
                 dominator_eval_calls = dominator_result.stats.eval_calls;
                 dominator_compress_steps = dominator_result.stats.compress_steps;
+                // No later stage consumes the dominator output paths (validate
+                // re-derives them from the staging directory), so release
+                // the numbering/backend scratch now instead of at exit.
+                dominator_stage.deinitOnce();
             }
 
             progress.nextStep("validating index");
             log.debug("stage: validating index", .{});
             {
+                var validate_stage = StageArena.init();
+                defer validate_stage.deinitOnce();
                 var span = profiling.begin(io, "validate");
                 defer span.end(io);
                 stageTimed(io, "validate", &elapsed, try Validate.validate(
-                    allocator,
+                    validate_stage.allocator(),
                     io,
                     job.staging_dir,
                     n_objects,
@@ -324,6 +393,7 @@ pub fn runIndexCommand(
                     compute_dominators,
                     stderr,
                 ));
+                validate_stage.deinitOnce();
             }
             log.debug("stage: validate complete", .{});
 
