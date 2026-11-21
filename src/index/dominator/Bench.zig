@@ -3,6 +3,12 @@
 //! Usage:
 //!   zig build bench -- dominator --dump <path.hprof> --algorithm chk|lt|both
 //!       --cache cold|warm [--reuse-index] --json out.json
+//!   zig build bench -- dominator --synthetic <n_nodes> --algorithm chk|lt|both
+//!       --json out.json
+//!
+//! `--synthetic` writes the stage files for a deterministic dense random
+//! graph with `n_nodes` ordinals (no hprof, no scan), so the stage can be
+//! measured at a chosen scale without a dump.
 //!
 //! Per algorithm this reports two measurements:
 //!   * `backend_ms`: the backend alone, running on CSR data already read
@@ -27,10 +33,12 @@ const Commands = @import("../../Commands.zig");
 const Config = @import("../../Config.zig").Config;
 const CsrView = @import("CsrView.zig").CsrView;
 const Dominator = @import("../Dominator.zig");
+const Graphs = @import("Graphs.zig");
 const Lt = @import("Lt.zig");
 const Manifest = @import("../Manifest.zig");
 const Numbering = @import("Numbering.zig");
 const Preflight = @import("../Preflight.zig");
+const TestSupport = @import("TestSupport.zig");
 
 const NONE = std.math.maxInt(u32);
 
@@ -52,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     var cache_mode: []const u8 = "warm";
     var algorithm_arg: []const u8 = "both";
     var reuse_index = false;
+    var synthetic_nodes: ?u32 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -60,6 +69,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             dump_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--synthetic")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            synthetic_nodes = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--json")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
@@ -77,8 +90,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const dump = dump_path orelse {
-        std.debug.print("usage: bench dominator --dump <path.hprof> --json out.json [--algorithm chk|lt|both] [--cache cold|warm] [--reuse-index]\n", .{});
+    const dump: []const u8 = if (dump_path) |p| p else if (synthetic_nodes) |n| blk: {
+        break :blk try std.fmt.allocPrint(allocator, "synthetic-{d}-nodes", .{n});
+    } else {
+        std.debug.print("usage: bench dominator --dump <path.hprof> | --synthetic <n> --json out.json [--algorithm chk|lt|both] [--cache cold|warm] [--reuse-index]\n", .{});
         return error.InvalidArgument;
     };
     const out_path = json_path orelse {
@@ -103,17 +118,22 @@ pub fn main(init: std.process.Init) !void {
     // /tmp/bench_dominator: the pipeline buffers are the peak of this
     // process's memory, and re-paying them just to re-measure backends can
     // push a small box over its limit.
+    var manifest: Manifest.IndexManifest = undefined;
     if (reuse_index) {
         std.debug.print("reusing existing index at {s}\n", .{index_dir});
+        manifest = try readManifest(allocator, io, index_dir);
+    } else if (synthetic_nodes) |n| {
+        try Io.Dir.cwd().deleteTree(io, index_dir);
+        try Io.Dir.cwd().createDirPath(io, index_dir);
+        manifest = try buildSyntheticIndex(allocator, io, index_dir, n);
     } else {
         try Io.Dir.cwd().deleteTree(io, index_dir);
         try Io.Dir.cwd().createDirPath(io, index_dir);
 
         // Build the index so the CSR files exist.
         try runHuntIndex(allocator, io, dump, index_dir);
+        manifest = try readManifest(allocator, io, index_dir);
     }
-
-    const manifest = try readManifest(allocator, io, index_dir);
 
     const V = manifest.n_objects + 1;
 
@@ -249,6 +269,36 @@ fn readManifest(
     const data = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
     defer allocator.free(data);
     return try Manifest.IndexManifest.parse(allocator, data);
+}
+
+/// Builds the stage files for a dense synthetic tier directly (no hprof, no
+/// scan): a deterministic random graph with `n_nodes` ordinals and
+/// `n_nodes + n_nodes/8` edges, the edges-per-object ratio of the reference
+/// dumps. The DFS depth profile (a random recursive tree, depth ~ln n),
+/// CSR sizes, and catalog rows are representative of a dense heap at the
+/// chosen scale, and identical across runs for a fixed seed.
+fn buildSyntheticIndex(
+    allocator: std.mem.Allocator,
+    io: Io,
+    index_dir: []const u8,
+    n_nodes: u32,
+) !Manifest.IndexManifest {
+    if (n_nodes < 2) return error.InvalidArgument;
+    const n_edges: u32 = n_nodes + n_nodes / 8;
+    var graph = try Graphs.randomGraph(allocator, n_nodes, n_edges, 0x5eed_c0de);
+    defer graph.deinit(allocator);
+    try TestSupport.writeCsrAndCatalog(allocator, io, index_dir, graph);
+
+    const hprof = @import("../../hprof.zig");
+    const header: hprof.Header.Header = .{ .id_size = 8, .timestamp = 0 };
+    return .{
+        .fingerprint = try Manifest.computeFingerprint(allocator, "", header, 0),
+        .n_objects = n_nodes - 1,
+        .n_edges = n_edges,
+        .virtual_root_ordinal = n_nodes - 1,
+        .source_path = null,
+        .has_dominators = false,
+    };
 }
 
 const Timing = struct {
