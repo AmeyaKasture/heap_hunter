@@ -845,7 +845,7 @@ pub fn printCommandHelp(writer: *Io.Writer, name: []const u8) !void {
 pub fn printVersion(writer: *Io.Writer) !void {
     try writeStyled(writer, Style.bold ++ Style.cyan, "hunt");
     try writer.writeAll(" version ");
-    try writeStyled(writer, Style.yellow, "0.1.0");
+    try writeStyled(writer, Style.yellow, "1.0.0-rc.1");
     try writer.writeAll("\n");
 }
 

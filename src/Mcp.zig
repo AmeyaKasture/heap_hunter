@@ -128,7 +128,7 @@ pub const Server = struct {
             },
             .serverInfo = .{
                 .name = "hunt",
-                .version = "0.1.0",
+                .version = "1.0.0-rc.1",
             },
         };
         try sendResult(stdout, id, result);
@@ -481,7 +481,7 @@ test "handleMessage initialize returns server info" {
 
     const server_info = result.get("serverInfo").?.object;
     try std.testing.expectEqualStrings("hunt", server_info.get("name").?.string);
-    try std.testing.expectEqualStrings("0.1.0", server_info.get("version").?.string);
+    try std.testing.expectEqualStrings("1.0.0-rc.1", server_info.get("version").?.string);
 
     const capabilities = result.get("capabilities").?.object;
     try std.testing.expect(capabilities.get("tools").?.object.get("listChanged").?.bool == false);
