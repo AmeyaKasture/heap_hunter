@@ -201,7 +201,7 @@ pub fn run(
             .budget_bytes = job.budget_bytes,
             // source_raw_id: u64 LE at bytes [0..8).
             .key_spec = .{ .parts = &.{.{ .offset = 0 }} },
-            .kernel = .pdq_atoms,
+            .kernel = .radix_lsd,
         }, null, {}, edgeLessBySource);
     }
 
@@ -236,7 +236,7 @@ pub fn run(
             .budget_bytes = job.budget_bytes,
             // target_raw_id: u64 LE at bytes [4..12).
             .key_spec = .{ .parts = &.{.{ .offset = 4 }} },
-            .kernel = .pdq_atoms,
+            .kernel = .radix_lsd,
         }, null, {}, sourceResolvedLessByTarget);
     }
 
