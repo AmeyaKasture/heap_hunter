@@ -274,6 +274,9 @@ const FaultCounters = struct {
 };
 
 fn faultCounters() FaultCounters {
+    // rusage fault counters are POSIX-only; the bench is a dev tool, so
+    // Windows builds report zeros instead of the real deltas.
+    if (builtin.os.tag == .windows) return .{ .minor = 0, .major = 0 };
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     return .{
         .minor = @intCast(@max(usage.minflt, 0)),
@@ -519,6 +522,7 @@ fn readFileBytes(
 }
 
 fn getPeakRss() u64 {
+    if (builtin.os.tag == .windows) return 0;
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     return @intCast(usage.maxrss);
 }
