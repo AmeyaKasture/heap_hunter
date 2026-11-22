@@ -307,6 +307,14 @@ pub fn run(
         try ExtSort.sortStreaming(io, allocator, resolved_path, sorted_by_source, .{
             .record_size = Join.resolved_record_size,
             .budget_bytes = job.budget_bytes,
+            // (source_ordinal, target_ordinal): two u32s at bytes [0..8).
+            // Declared as two .u32 parts so they compare source-first; a
+            // single .u64 at 0 would order by the target (high half) first.
+            .key_spec = .{ .parts = &.{
+                .{ .offset = 0, .width = .u32 },
+                .{ .offset = 4, .width = .u32 },
+            } },
+            .kernel = .pdq_atoms,
         }, null, {}, lessBySource);
     }
 

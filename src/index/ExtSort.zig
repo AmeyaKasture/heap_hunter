@@ -2,7 +2,9 @@
 //!
 //! Sorts a file of `record_size`-byte records using a bounded in-memory budget.
 //! Records are opaque bytes; ordering is determined by a caller-supplied
-//! comparator over `[]const u8` record slices.
+//! comparator over `[]const u8` record slices, optionally paired with a
+//! `KeySpec` that describes the same ordering as primitive little-endian u64
+//! key parts so key-based kernels can avoid comparator indirection.
 const std = @import("std");
 const Io = std.Io;
 const profiling = @import("profiling");
@@ -17,12 +19,169 @@ pub const Options = struct {
     /// Maximum number of runs merged in a single pass. When the number of
     /// runs exceeds this, merging proceeds in multiple passes.
     max_fanout: usize = 64,
+
+    /// Declares the integer view of `lessThan`'s ordering: byte offsets of
+    /// little-endian u64 parts compared lexicographically, including
+    /// tiebreak fields. Optional; the `index_blocksort` kernel ignores it,
+    /// key-based kernels require it.
+    key_spec: ?KeySpec = null,
+
+    /// Which kernel sorts the records. All kernels must produce identical
+    /// output; the selection exists so callers (and benchmarks) can switch
+    /// implementations without touching call sites.
+    kernel: Kernel = .index_blocksort,
+};
+
+/// One u64 slot of a sort key: a little-endian integer loaded from a fixed
+/// offset inside each record.
+pub const KeyPartSpec = struct {
+    /// Byte offset of the part within a record.
+    offset: u32,
+
+    /// Width of the part. `u32` parts are zero-extended to u64 before
+    /// comparing, so a record with two packed u32 fields `[primary@0,
+    /// secondary@4]` must declare them as two `.u32` parts (`{0}, {4}`);
+    /// loading them as one `.u64` at offset 0 would order by the SECONDARY
+    /// (high) half first.
+    width: enum { u32, u64 } = .u64,
+};
+
+/// Byte offsets and widths of a record's sort-key parts. All parts are
+/// loaded as little-endian integers and compared in order. A `KeySpec` must
+/// describe the exact same ordering as the call site's `lessThan` (including
+/// tiebreaks); records that still compare equal are ordered by input
+/// position, matching the stable `index_blocksort` kernel. The equivalence
+/// tests below enforce this contract for every production key shape.
+pub const KeySpec = struct {
+    /// Key parts, compared lexicographically.
+    parts: []const KeyPartSpec,
+};
+
+/// Sort kernel selection.
+pub const Kernel = enum {
+    /// Original kernel: stable blockSort over a `usize` index array.
+    index_blocksort,
+    /// Packed-atom pdqsort: loads `(key parts, input index)` atoms once,
+    /// sorts the dense atom array with pdqsort (comparisons touch adjacent
+    /// atoms instead of jumping through the record mapping), then gathers
+    /// records in atom order. Requires `options.key_spec`.
+    pdq_atoms,
 };
 
 pub const Error = error{
     /// The input file length is not a multiple of `record_size`.
     InvalidRecordFile,
+    /// `key_spec` parts extend beyond `record_size`.
+    InvalidKeySpec,
+    /// Records whose input position does not fit a u32 atom index.
+    TooManyRecords,
 };
+
+/// The pdq-atom kernel, comptime-specialized on the key-part count.
+///
+/// Sorts by loading `(key parts, input index)` atoms once (one sequential
+/// pass over the input mapping), sorting the dense atom array with pdqsort,
+/// and gathering records in atom order. Comparisons read adjacent atoms
+/// instead of jumping through the record mapping, which is what makes this
+/// kernel fast on large inputs.
+///
+/// The `(key parts, input index)` tuple is a strict total order, so pdqsort
+/// being unstable cannot change the output; for records equal under the key
+/// parts it reproduces the stable input order, matching `index_blocksort`.
+fn AtomSorter(comptime n_parts: usize) type {
+    return struct {
+        const Atom = struct {
+            p: [n_parts]u64,
+            idx: u32,
+        };
+
+        const atom_size = @sizeOf(Atom);
+
+        fn atomLess(_: void, a: Atom, b: Atom) bool {
+            inline for (0..n_parts) |i| {
+                if (a.p[i] != b.p[i]) return a.p[i] < b.p[i];
+            }
+            return a.idx < b.idx;
+        }
+
+        fn run(
+            io: Io,
+            allocator: std.mem.Allocator,
+            input: []const u8,
+            n_records: usize,
+            output_path: []const u8,
+            record_size: usize,
+            parts: []const KeyPartSpec,
+        ) !void {
+            const atoms = try allocator.alloc(Atom, n_records);
+            defer allocator.free(atoms);
+            for (0..n_records) |i| {
+                const rec = input[i * record_size ..][0..record_size];
+                var p: [n_parts]u64 = undefined;
+                inline for (0..n_parts) |k| {
+                    p[k] = switch (parts[k].width) {
+                        .u32 => std.mem.readInt(u32, rec[parts[k].offset..][0..4], .little),
+                        .u64 => std.mem.readInt(u64, rec[parts[k].offset..][0..8], .little),
+                    };
+                }
+                atoms[i] = .{ .p = p, .idx = @intCast(i) };
+            }
+            std.sort.pdq(Atom, atoms, {}, atomLess);
+
+            var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
+            defer out_file.close(io);
+            var out_buf: [65536]u8 = undefined;
+            var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
+            const out = &out_writer.interface;
+            for (atoms) |atom| {
+                try out.writeAll(input[atom.idx * record_size ..][0..record_size]);
+            }
+            try out_writer.flush();
+        }
+    };
+}
+
+/// Byte size of one atom for a key with `n_parts` u64 parts.
+fn atomBytes(n_parts: usize) usize {
+    return if (n_parts == 1) AtomSorter(1).atom_size else AtomSorter(2).atom_size;
+}
+
+/// In-memory fast path of the `pdq_atoms` kernel. `spec.parts.len` must be
+/// 1 or 2 (all production key shapes); callers route here only when the
+/// atom array fits `budget_bytes`.
+fn sortInMemoryAtoms(
+    io: Io,
+    allocator: std.mem.Allocator,
+    input_file: Io.File,
+    input_len: usize,
+    output_path: []const u8,
+    record_size: usize,
+    spec: KeySpec,
+) !void {
+    if (input_len == 0) {
+        const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
+        out_file.close(io);
+        return;
+    }
+
+    const n_records = input_len / record_size;
+    if (n_records > std.math.maxInt(u32)) return error.TooManyRecords;
+
+    // Demand-paged, never prefaulted: the mapping is consumed once
+    // sequentially while atoms are extracted and once more in atom order
+    // during the gather, so readahead serves both passes.
+    var input_mm = try Io.File.MemoryMap.create(io, input_file, .{
+        .len = input_len,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    defer input_mm.destroy(io);
+
+    if (spec.parts.len == 1) {
+        return AtomSorter(1).run(io, allocator, input_mm.memory, n_records, output_path, record_size, spec.parts);
+    }
+    return AtomSorter(2).run(io, allocator, input_mm.memory, n_records, output_path, record_size, spec.parts);
+}
 
 /// Sort the file at `input_path` and write the result to `output_path`.
 ///
@@ -328,7 +487,12 @@ fn MergeHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []const u8
             const run_b = self.runs[b];
             const rec_a = run_a.data[run_a.cursor..][0..self.record_size];
             const rec_b = run_b.data[run_b.cursor..][0..self.record_size];
-            return lt(self.context, rec_a, rec_b);
+            if (lt(self.context, rec_a, rec_b)) return true;
+            if (lt(self.context, rec_b, rec_a)) return false;
+            // Equal records: prefer the earlier run. Run files are
+            // generated in input order, so this makes the merge stable and
+            // byte-identical to the in-memory path's stable blockSort.
+            return a < b;
         }
     };
 }
@@ -761,34 +925,73 @@ test "external sort removes multi-pass merge intermediates" {
 // Streaming merge implementation (memory-bounded alternative to mergeRuns)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-run state used by the streaming merger.
+/// Per-run state used by the streaming merger. Each run is read through a
+/// fixed-size block buffer instead of one positional read per record: a
+/// spilled sort of n records previously cost n syscalls moving
+/// `record_size` bytes each.
+const merge_run_buffer_bytes = 256 * 1024;
+
 const StreamingRun = struct {
     file: Io.File,
-    /// Current byte offset into the run file (advances by record_size each pop).
+    /// Current byte offset into the run file (advances by one buffer per
+    /// refill).
     offset: u64,
-    /// Heap-owned buffer holding the current record for this run.
+    /// Refill buffer holding up to `buf_capacity` records.
     buf: []u8,
+    /// Records that fit in `buf`.
+    buf_capacity: usize,
+    /// Records currently valid in `buf` (short at the end of a run).
+    buf_len: usize,
+    /// Records of `buf` already consumed.
+    buf_pos: usize,
+
+    /// The record the merge heap currently compares for this run.
+    fn current(self: *const StreamingRun, record_size: usize) []const u8 {
+        return self.buf[self.buf_pos * record_size ..][0..record_size];
+    }
+
+    /// Make sure `current` is valid. Returns false when the run is
+    /// exhausted.
+    fn refill(self: *StreamingRun, io: Io, record_size: usize) !bool {
+        if (self.buf_pos < self.buf_len) return true;
+        const want = self.buf_capacity * record_size;
+        const n = try self.file.readPositionalAll(io, self.buf[0..want], self.offset);
+        self.buf_len = n / record_size;
+        self.buf_pos = 0;
+        self.offset += n;
+        return self.buf_len > 0;
+    }
 };
 
 fn StreamingHeapContext(comptime C: type, comptime lt: fn (C, []const u8, []const u8) bool) type {
     return struct {
         runs: []StreamingRun,
+        record_size: usize,
         context: C,
 
         pub fn less(self: @This(), a: usize, b: usize) bool {
-            return lt(self.context, self.runs[a].buf, self.runs[b].buf);
+            const rec_a = self.runs[a].current(self.record_size);
+            const rec_b = self.runs[b].current(self.record_size);
+            if (lt(self.context, rec_a, rec_b)) return true;
+            if (lt(self.context, rec_b, rec_a)) return false;
+            // Equal records: prefer the earlier run (input order) so the
+            // streaming merge is stable, matching the in-memory blockSort
+            // path and the mmap merge above.
+            return a < b;
         }
     };
 }
 
 /// Memory-bounded merge of a group of run files.
 ///
-/// Instead of memory-mapping every file, each run is read one record at a time
-/// using positional reads.  The total heap-allocated record storage is:
+/// Instead of memory-mapping every file, each run is read through a
+/// `merge_run_buffer_bytes` block buffer. The total heap-allocated record
+/// storage is:
 ///
-///   `run_paths.len × record_size`
+///   `run_paths.len × merge_run_buffer_bytes`
 ///
-/// which is always bounded by `fanout × record_size` ≤ `budget_bytes`.
+/// which is bounded by `fanout × 256 KiB` (16 MiB at the default fanout
+/// cap of 64) regardless of budget.
 fn mergeRunGroupStreaming(
     io: Io,
     allocator: std.mem.Allocator,
@@ -812,10 +1015,19 @@ fn mergeRunGroupStreaming(
         allocator.free(sr);
     }
 
-    // Open each run and eagerly read its first record.
+    const buf_capacity = @max(merge_run_buffer_bytes / record_size, 1);
+
+    // Open each run, allocate its refill buffer, and prime the first block.
     for (run_paths, 0..) |path, i| {
-        const buf = try allocator.alloc(u8, record_size);
-        sr[i] = .{ .file = undefined, .offset = 0, .buf = buf };
+        const buf = try allocator.alloc(u8, buf_capacity * record_size);
+        sr[i] = .{
+            .file = undefined,
+            .offset = 0,
+            .buf = buf,
+            .buf_capacity = buf_capacity,
+            .buf_len = 0,
+            .buf_pos = 0,
+        };
         sr[i].file = try Io.Dir.cwd().openFile(io, path, .{});
         sr_open += 1;
     }
@@ -828,31 +1040,27 @@ fn mergeRunGroupStreaming(
 
     const C = @TypeOf(context);
     const Ctx = StreamingHeapContext(C, lessThan);
-    const heap_ctx = Ctx{ .runs = sr, .context = context };
+    const heap_ctx = Ctx{ .runs = sr, .record_size = record_size, .context = context };
     var heap = BinaryHeap(usize, Ctx, Ctx.less).init(allocator, heap_ctx);
     defer heap.deinit(allocator);
 
     // Prime the heap: push runs that have at least one record.
     for (sr, 0..) |*r, i| {
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
+        if (try r.refill(io, record_size)) {
             try heap.add(allocator, i);
         }
-        // If n < record_size the run file is empty – leave it out of the heap.
     }
 
     while (heap.len() > 0) {
         const idx = heap.removeMin();
         const r = &sr[idx];
-        try out.writeAll(r.buf);
-        // Advance and attempt to read the next record.
-        const n = try r.file.readPositionalAll(io, r.buf, r.offset);
-        if (n == record_size) {
-            r.offset += record_size;
+        try out.writeAll(r.current(record_size));
+        // Consume one record and push the run back if its buffer (or the
+        // run file behind it) still has records.
+        r.buf_pos += 1;
+        if (try r.refill(io, record_size)) {
             try heap.add(allocator, idx);
         }
-        // Otherwise this run is exhausted – leave it out of the heap.
     }
 
     try out_writer.flush();
@@ -967,6 +1175,16 @@ pub fn sortStreaming(
     std.debug.assert(options.record_size > 0);
     const record_size = options.record_size;
 
+    if (options.key_spec) |spec| {
+        for (spec.parts) |part| {
+            const part_bytes: usize = if (part.width == .u32) 4 else 8;
+            if (part.offset + part_bytes > record_size) return error.InvalidKeySpec;
+        }
+    } else if (options.kernel == .pdq_atoms) {
+        // Key-based kernels load their comparisons from the key parts.
+        return error.InvalidKeySpec;
+    }
+
     const dir = Io.Dir.cwd();
     var input_file = try dir.openFile(io, input_path, .{});
     defer input_file.close(io);
@@ -974,9 +1192,29 @@ pub fn sortStreaming(
     const input_len = try input_file.length(io);
     if (input_len % record_size != 0) return error.InvalidRecordFile;
 
-    // Fast path: fits in memory.
-    if (input_len <= options.budget_bytes) {
-        return sortInMemory(io, allocator, input_file, input_len, output_path, record_size, context, lessThan);
+    // Fast path: fits in memory. The gate depends on the kernel: the
+    // original kernel holds the whole input mapping plus one usize index
+    // per record, while the atom kernel's anonymous footprint is just the
+    // dense atom array (records are consumed through a demand-paged
+    // mapping).
+    switch (options.kernel) {
+        .index_blocksort => {
+            if (input_len <= options.budget_bytes) {
+                return sortInMemory(io, allocator, input_file, input_len, output_path, record_size, context, lessThan);
+            }
+        },
+        .pdq_atoms => {
+            const spec = options.key_spec.?;
+            if (spec.parts.len == 0 or spec.parts.len > 2) return error.InvalidKeySpec;
+            const n_records = input_len / record_size;
+            const atom_bytes = n_records * atomBytes(spec.parts.len);
+            if (atom_bytes <= options.budget_bytes) {
+                return sortInMemoryAtoms(io, allocator, input_file, input_len, output_path, record_size, spec);
+            }
+            // The atom array does not fit the budget: fall through to the
+            // external runs+merge path, which generates runs with the
+            // original kernel.
+        },
     }
 
     // Derive fanout if not explicitly provided.  Fanout must be at least 2:
@@ -1171,4 +1409,355 @@ test "streaming sort: rejects misaligned input" {
     }, null, {}, lexLess);
 
     try std.testing.expectError(error.InvalidRecordFile, result);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tie-stability tests: the in-memory path (stable blockSort) and the external
+// runs+merge path must produce byte-identical output for tie-heavy inputs.
+// The payload of each record is its input position, so any tie reordering is
+// visible in the output bytes. These tests guard the sort-kernel swap work:
+// a replacement kernel is only correct if it preserves this invariant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn numericKeyLess(_: void, a: []const u8, b: []const u8) bool {
+    const a_key = std.mem.readInt(u32, a[0..4], .little);
+    const b_key = std.mem.readInt(u32, b[0..4], .little);
+    return a_key < b_key;
+}
+
+const TiePattern = enum { all_equal, modulo_four, skewed, ascending, descending, random };
+
+fn fillTieRecords(rnd: std.Random, input: []u8, record_size: usize, pattern: TiePattern) void {
+    const count = input.len / record_size;
+    for (0..count) |i| {
+        const rec = input[i * record_size ..][0..record_size];
+        const key: u32 = switch (pattern) {
+            .all_equal => 42,
+            .modulo_four => @intCast(i % 4),
+            .skewed => if (i % 20 == 0) @as(u32, @intCast(i % 97)) else 0,
+            .ascending => @intCast(i),
+            .descending => @intCast(count - 1 - i),
+            .random => rnd.int(u32),
+        };
+        std.mem.writeInt(u32, rec[0..4], key, .little);
+        std.mem.writeInt(u32, rec[4..8], @intCast(i), .little);
+        if (record_size > 8) rnd.bytes(rec[8..record_size]);
+    }
+}
+
+fn testSortStabilityCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    record_size: usize,
+    count: usize,
+    pattern: TiePattern,
+    ext_budget_bytes: usize,
+    ext_fanout: usize,
+    kernel: Kernel,
+) !void {
+    const input_len = record_size * count;
+    const input = try allocator.alloc(u8, input_len);
+    defer allocator.free(input);
+
+    var prng = std.Random.DefaultPrng.init(0x5eed1234);
+    fillTieRecords(prng.random(), input, record_size, pattern);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_path, "input.bin" });
+    defer allocator.free(input_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = input_path, .data = input });
+
+    const mem_path = try std.fs.path.join(allocator, &.{ tmp_path, "mem.bin" });
+    defer allocator.free(mem_path);
+    const ext_path = try std.fs.path.join(allocator, &.{ tmp_path, "ext.bin" });
+    defer allocator.free(ext_path);
+
+    // In-memory fast path with the kernel under test. The key view mirrors
+    // these records' layout: primary u32 key at bytes [0..4), so the spec
+    // must declare it as a .u32 part (a .u64 at 0 would fold the payload
+    // u32 at [4..8) into the high half and reorder by it). The budget
+    // covers both kernels' in-memory gates (whole input for blockSort,
+    // atom array for pdq).
+    try sortStreaming(io, allocator, input_path, mem_path, .{
+        .record_size = record_size,
+        .budget_bytes = @max(input_len, count * 24) + 1,
+        .max_fanout = 64,
+        .key_spec = if (kernel == .pdq_atoms) .{ .parts = &.{.{ .offset = 0, .width = .u32 }} } else null,
+        .kernel = kernel,
+    }, null, {}, numericKeyLess);
+
+    // External path (kernel-independent): tiny budget forces many runs;
+    // explicit fanout forces multi-pass merging when it is below the run
+    // count.
+    try sortStreaming(io, allocator, input_path, ext_path, .{
+        .record_size = record_size,
+        .budget_bytes = ext_budget_bytes,
+        .max_fanout = 64,
+    }, ext_fanout, {}, numericKeyLess);
+
+    const mem = try Io.Dir.cwd().readFileAlloc(io, mem_path, allocator, .limited(input_len + 1));
+    defer allocator.free(mem);
+    const ext = try Io.Dir.cwd().readFileAlloc(io, ext_path, allocator, .limited(input_len + 1));
+    defer allocator.free(ext);
+
+    try std.testing.expectEqualSlices(u8, mem, ext);
+    // Stability means ties keep input order; for the all-equal pattern the
+    // sorted output is therefore the input itself, byte for byte.
+    if (pattern == .all_equal) {
+        try std.testing.expectEqualSlices(u8, input, mem);
+    }
+}
+
+test "streaming sort: tie-heavy inputs are stable and path-independent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // record_size, count, pattern, ext budget, ext fanout, kernel
+    const cases = .{
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 64, .kernel = Kernel.index_blocksort },
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 2, .kernel = Kernel.index_blocksort },
+        .{ .rs = 12, .count = 600, .pattern = TiePattern.modulo_four, .budget = 480, .fanout = 64, .kernel = Kernel.index_blocksort },
+        .{ .rs = 16, .count = 500, .pattern = TiePattern.skewed, .budget = 500, .fanout = 2, .kernel = Kernel.index_blocksort },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.ascending, .budget = 240, .fanout = 64, .kernel = Kernel.index_blocksort },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.descending, .budget = 240, .fanout = 2, .kernel = Kernel.index_blocksort },
+        .{ .rs = 16, .count = 1000, .pattern = TiePattern.random, .budget = 1000, .fanout = 64, .kernel = Kernel.index_blocksort },
+        .{ .rs = 12, .count = 1, .pattern = TiePattern.random, .budget = 24, .fanout = 64, .kernel = Kernel.index_blocksort },
+        // The same shapes through the pdq-atom kernel.
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 64, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 2, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 12, .count = 600, .pattern = TiePattern.modulo_four, .budget = 480, .fanout = 64, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 16, .count = 500, .pattern = TiePattern.skewed, .budget = 500, .fanout = 2, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.ascending, .budget = 240, .fanout = 64, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.descending, .budget = 240, .fanout = 2, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 16, .count = 1000, .pattern = TiePattern.random, .budget = 1000, .fanout = 64, .kernel = Kernel.pdq_atoms },
+        .{ .rs = 12, .count = 1, .pattern = TiePattern.random, .budget = 24, .fanout = 64, .kernel = Kernel.pdq_atoms },
+    };
+
+    inline for (cases) |c| {
+        try testSortStabilityCase(allocator, io, c.rs, c.count, c.pattern, c.budget, c.fanout, c.kernel);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KeySpec contract tests: for every production key shape, ordering by
+// (key parts, input index) must match the comparator's stable ordering
+// byte-for-byte. This is the exact semantics the pdq-atom kernel will
+// implement, locked in ahead of the kernel change.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Comparator view matching a KeySpec: compares the parts lexicographically
+/// with u32 parts zero-extended; equal records fall back to input position
+/// (stability), which is what the reference gather below reproduces.
+fn keyViewLess(parts: []const KeyPartSpec, a: []const u8, b: []const u8) bool {
+    for (parts) |part| {
+        const a_k: u64 = switch (part.width) {
+            .u32 => std.mem.readInt(u32, a[part.offset..][0..4], .little),
+            .u64 => std.mem.readInt(u64, a[part.offset..][0..8], .little),
+        };
+        const b_k: u64 = switch (part.width) {
+            .u32 => std.mem.readInt(u32, b[part.offset..][0..4], .little),
+            .u64 => std.mem.readInt(u64, b[part.offset..][0..8], .little),
+        };
+        if (a_k != b_k) return a_k < b_k;
+    }
+    return false;
+}
+
+const KeyAtom = struct { p0: u64, p1: u64, idx: u32 };
+
+fn testKeySpecEquivalenceCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    record_size: usize,
+    parts: []const KeyPartSpec,
+    count: usize,
+    payload: bool,
+) !void {
+    const input_len = record_size * count;
+    const input = try allocator.alloc(u8, input_len);
+    defer allocator.free(input);
+
+    // Small key spaces force plenty of ties; the payload is the input
+    // position so any ordering divergence is visible in the bytes.
+    var prng = std.Random.DefaultPrng.init(0xabc777);
+    const rnd = prng.random();
+    for (0..count) |i| {
+        const rec = input[i * record_size ..][0..record_size];
+        for (parts, 0..) |part, part_no| {
+            const key: u64 = if (part_no == 0) rnd.uintLessThan(u64, 7) else rnd.uintLessThan(u64, 3);
+            switch (part.width) {
+                .u32 => std.mem.writeInt(u32, rec[part.offset..][0..4], @truncate(key), .little),
+                .u64 => std.mem.writeInt(u64, rec[part.offset..][0..8], key, .little),
+            }
+        }
+        // The input-position payload makes tie divergence visible, but only
+        // when it does not overlap a key part (some shapes fill the record).
+        if (payload) {
+            std.mem.writeInt(u32, rec[record_size - 4 ..][0..4], @intCast(i), .little);
+        }
+    }
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_path, "input.bin" });
+    defer allocator.free(input_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = input_path, .data = input });
+
+    const got_path = try std.fs.path.join(allocator, &.{ tmp_path, "got.bin" });
+    defer allocator.free(got_path);
+
+    // Comparator sort with both kernels: whichever kernel sorts, the
+    // (key parts, input index) reference ordering must hold byte-for-byte.
+    // The budget covers both kernels' in-memory gates.
+    inline for (.{ Kernel.index_blocksort, Kernel.pdq_atoms }) |kernel| {
+        try sortStreaming(io, allocator, input_path, got_path, .{
+            .record_size = record_size,
+            .budget_bytes = @max(input_len, count * 24) + 1,
+            .key_spec = .{ .parts = parts },
+            .kernel = kernel,
+        }, null, parts, keyViewLess);
+
+        // Reference: sort (key parts, input index) atoms and gather.
+        var atoms = try allocator.alloc(KeyAtom, count);
+        defer allocator.free(atoms);
+        for (0..count) |i| {
+            const rec = input[i * record_size ..][0..record_size];
+            atoms[i] = .{
+                .p0 = switch (parts[0].width) {
+                    .u32 => std.mem.readInt(u32, rec[parts[0].offset..][0..4], .little),
+                    .u64 => std.mem.readInt(u64, rec[parts[0].offset..][0..8], .little),
+                },
+                .p1 = if (parts.len > 1) switch (parts[1].width) {
+                    .u32 => std.mem.readInt(u32, rec[parts[1].offset..][0..4], .little),
+                    .u64 => std.mem.readInt(u64, rec[parts[1].offset..][0..8], .little),
+                } else 0,
+                .idx = @intCast(i),
+            };
+        }
+        const AtomLess = struct {
+            fn less(_: void, a: KeyAtom, b: KeyAtom) bool {
+                if (a.p0 != b.p0) return a.p0 < b.p0;
+                if (a.p1 != b.p1) return a.p1 < b.p1;
+                return a.idx < b.idx;
+            }
+        };
+        std.mem.sort(KeyAtom, atoms, {}, AtomLess.less);
+
+        var expected = try allocator.alloc(u8, input_len);
+        defer allocator.free(expected);
+        for (atoms, 0..) |atom, out_i| {
+            const src = input[atom.idx * record_size ..][0..record_size];
+            @memcpy(expected[out_i * record_size ..][0..record_size], src);
+        }
+
+        const got = try Io.Dir.cwd().readFileAlloc(io, got_path, allocator, .limited(input_len + 1));
+        defer allocator.free(got);
+
+        try std.testing.expectEqualSlices(u8, expected, got);
+    }
+}
+
+test "key spec ordering matches comparator ordering for production key shapes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // The four production shapes: edges by source (u64 at 0, 16-byte
+    // records), resolved edges by target (u64 at 4, 12-byte records, no
+    // payload room), CSR edge pairs (two u32 parts at 0 and 4, 8-byte
+    // records, no payload room), catalog rows by (id, offset) (u64s at 0
+    // and 8, 32-byte records).
+    const cases = .{
+        .{ .rs = 16, .parts = &[_]KeyPartSpec{.{ .offset = 0 }}, .count = 600, .payload = true },
+        .{ .rs = 12, .parts = &[_]KeyPartSpec{.{ .offset = 4 }}, .count = 600, .payload = false },
+        .{ .rs = 8, .parts = &[_]KeyPartSpec{ .{ .offset = 0, .width = .u32 }, .{ .offset = 4, .width = .u32 } }, .count = 600, .payload = false },
+        .{ .rs = 32, .parts = &[_]KeyPartSpec{ .{ .offset = 0 }, .{ .offset = 8 } }, .count = 400, .payload = true },
+    };
+
+    inline for (cases) |c| {
+        try testKeySpecEquivalenceCase(allocator, io, c.rs, c.parts, c.count, c.payload);
+    }
+}
+
+test "key spec validation rejects out-of-range offsets and missing specs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_path, "input.bin" });
+    defer allocator.free(input_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = input_path, .data = &[_]u8{0} ** 16 });
+
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "output.bin" });
+    defer allocator.free(output_path);
+
+    // A u64 part at offset 9 does not fit 8-byte records.
+    {
+        const result = sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{.{ .offset = 9 }} },
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // The offset fits only if the record is large enough.
+    {
+        const result = sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{.{ .offset = 0 }} },
+        }, null, {}, lexLess);
+        try result;
+    }
+    // A u32 part at offset 6 overruns an 8-byte record.
+    {
+        const result = sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{.{ .offset = 6, .width = .u32 }} },
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // The atom kernel is not selectable without a key spec...
+    {
+        const result = sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .kernel = .pdq_atoms,
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // ...requires 1 or 2 key parts (the production shapes)...
+    {
+        const input3_path = try std.fs.path.join(allocator, &.{ tmp_path, "input3.bin" });
+        defer allocator.free(input3_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = input3_path, .data = &[_]u8{0} ** 32 });
+
+        const result = sortStreaming(io, allocator, input3_path, output_path, .{
+            .record_size = 32,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{ .{ .offset = 0 }, .{ .offset = 8 }, .{ .offset = 16 } } },
+            .kernel = .pdq_atoms,
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // ...and with a valid spec sorts the in-memory path successfully.
+    {
+        try sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{ .{ .offset = 0, .width = .u32 }, .{ .offset = 4, .width = .u32 } } },
+            .kernel = .pdq_atoms,
+        }, null, {}, lexLess);
+    }
 }
