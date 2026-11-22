@@ -66,6 +66,14 @@ pub const Kernel = enum {
     /// atoms instead of jumping through the record mapping), then gathers
     /// records in atom order. Requires `options.key_spec`.
     pdq_atoms,
+    /// Stable LSD radix over 12-byte `(key u64, idx u32)` atoms. Eligible
+    /// only when the key fits one u64 (total part bits <= 64); each of the
+    /// `bits/16` passes is a stable counting scatter on one 16-bit digit,
+    /// ping-ponging between two atom buffers, so equal keys retain input
+    /// order (the `(key, input index)` contract) without ever comparing.
+    /// No comparisons at all: ~4-5x faster than pdq on large inputs, at the
+    /// cost of the second atom buffer (the gate charges both).
+    radix_lsd,
 };
 
 pub const Error = error{
@@ -181,6 +189,137 @@ fn sortInMemoryAtoms(
         return AtomSorter(1).run(io, allocator, input_mm.memory, n_records, output_path, record_size, spec.parts);
     }
     return AtomSorter(2).run(io, allocator, input_mm.memory, n_records, output_path, record_size, spec.parts);
+}
+
+/// Atom layout for the radix kernel: `key u64` at bytes [0..8), `idx u32`
+/// at bytes [8..12). Packed to 12 bytes so the ping-pong pair stays inside
+/// the default budget at workbench scale (124M atoms -> 2.99 GB).
+const radix_atom_size = 12;
+const radix_digit_buckets = 65536;
+
+fn radixKeyBits(spec: KeySpec) usize {
+    var bits: usize = 0;
+    for (spec.parts) |part| bits += if (part.width == .u32) 32 else 64;
+    return bits;
+}
+
+/// Compose the single-u64 radix key for one record: parts are declared
+/// primary-first and packed high-to-low, so u64 comparison order equals the
+/// lexicographic part order. Valid radix specs are (u64), (u32), or
+/// (u32, u32); a u64 part always fills the whole key.
+fn radixComposeKey(rec: []const u8, spec: KeySpec) u64 {
+    var key: u64 = 0;
+    for (spec.parts) |part| {
+        const value: u64 = switch (part.width) {
+            .u32 => std.mem.readInt(u32, rec[part.offset..][0..4], .little),
+            .u64 => std.mem.readInt(u64, rec[part.offset..][0..8], .little),
+        };
+        if (part.width == .u32) {
+            key = (key << 32) | value;
+        } else {
+            key = value;
+        }
+    }
+    return key;
+}
+
+/// In-memory fast path of the `radix_lsd` kernel: stable least-significant-
+/// digit radix over the atom array. Each pass is a stable counting scatter
+/// on one 16-bit digit of the composed key, ping-ponging between two atom
+/// buffers; after `passes` digits the array is ordered by key with ties in
+/// input order, matching the blockSort and pdq-atom kernels byte-for-byte.
+fn sortInMemoryRadix(
+    io: Io,
+    allocator: std.mem.Allocator,
+    input_file: Io.File,
+    input_len: usize,
+    output_path: []const u8,
+    record_size: usize,
+    spec: KeySpec,
+) !void {
+    if (input_len == 0) {
+        const out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
+        out_file.close(io);
+        return;
+    }
+
+    if (radixKeyBits(spec) > 64) return error.InvalidKeySpec;
+    const passes = radixKeyBits(spec) / 16;
+    const n_records = input_len / record_size;
+    if (n_records > std.math.maxInt(u32)) return error.TooManyRecords;
+
+    // Demand-paged, never prefaulted: consumed once sequentially for atom
+    // extraction and once more in atom order during the gather.
+    var input_mm = try Io.File.MemoryMap.create(io, input_file, .{
+        .len = input_len,
+        .protection = .{ .read = true, .write = false },
+        .populate = false,
+    });
+    defer input_mm.destroy(io);
+    const input = input_mm.memory;
+
+    const atoms = try allocator.alloc(u8, n_records * radix_atom_size);
+    defer allocator.free(atoms);
+    const scratch = try allocator.alloc(u8, n_records * radix_atom_size);
+    defer allocator.free(scratch);
+    const hist = try allocator.alloc(u32, radix_digit_buckets);
+    defer allocator.free(hist);
+
+    // Extraction: one sequential pass composes (key, idx) atoms.
+    for (0..n_records) |i| {
+        const rec = input[i * record_size ..][0..record_size];
+        const atom = atoms[i * radix_atom_size ..][0..radix_atom_size];
+        std.mem.writeInt(u64, atom[0..8], radixComposeKey(rec, spec), .little);
+        std.mem.writeInt(u32, atom[8..12], @intCast(i), .little);
+    }
+
+    // LSD passes. Digit 0 is the least-significant 16 bits; the final pass
+    // covers the most-significant bits of the primary part, so the composed
+    // order ends lexicographic in the declared parts.
+    var src = atoms;
+    var dst = scratch;
+    var pass: usize = 0;
+    while (pass < passes) : (pass += 1) {
+        const shift: u6 = @intCast(pass * 16);
+        @memset(hist, 0);
+        for (0..n_records) |i| {
+            const key = std.mem.readInt(u64, src[i * radix_atom_size ..][0..8], .little);
+            hist[@intCast((key >> shift) & 0xFFFF)] += 1;
+        }
+        // Exclusive prefix sums turn counts into scatter offsets.
+        var running: u32 = 0;
+        for (0..radix_digit_buckets) |digit| {
+            const count = hist[digit];
+            hist[digit] = running;
+            running += count;
+        }
+        // Stable scatter: equal digits keep their relative order.
+        for (0..n_records) |i| {
+            const key = std.mem.readInt(u64, src[i * radix_atom_size ..][0..8], .little);
+            const digit: usize = @intCast((key >> shift) & 0xFFFF);
+            const out_i = hist[digit];
+            hist[digit] = out_i + 1;
+            @memcpy(
+                dst[out_i * radix_atom_size ..][0..radix_atom_size],
+                src[i * radix_atom_size ..][0..radix_atom_size],
+            );
+        }
+        const tmp = src;
+        src = dst;
+        dst = tmp;
+    }
+
+    // Gather records in atom order.
+    var out_file = try Io.Dir.cwd().createFile(io, output_path, .{});
+    defer out_file.close(io);
+    var out_buf: [65536]u8 = undefined;
+    var out_writer: Io.File.Writer = .init(out_file, io, &out_buf);
+    const out = &out_writer.interface;
+    for (0..n_records) |i| {
+        const idx = std.mem.readInt(u32, src[i * radix_atom_size + 8 ..][0..4], .little);
+        try out.writeAll(input[idx * record_size ..][0..record_size]);
+    }
+    try out_writer.flush();
 }
 
 /// Sort the file at `input_path` and write the result to `output_path`.
@@ -1180,7 +1319,7 @@ pub fn sortStreaming(
             const part_bytes: usize = if (part.width == .u32) 4 else 8;
             if (part.offset + part_bytes > record_size) return error.InvalidKeySpec;
         }
-    } else if (options.kernel == .pdq_atoms) {
+    } else if (options.kernel == .pdq_atoms or options.kernel == .radix_lsd) {
         // Key-based kernels load their comparisons from the key parts.
         return error.InvalidKeySpec;
     }
@@ -1212,6 +1351,20 @@ pub fn sortStreaming(
                 return sortInMemoryAtoms(io, allocator, input_file, input_len, output_path, record_size, spec);
             }
             // The atom array does not fit the budget: fall through to the
+            // external runs+merge path, which generates runs with the
+            // original kernel.
+        },
+        .radix_lsd => {
+            const spec = options.key_spec.?;
+            if (spec.parts.len == 0) return error.InvalidKeySpec;
+            if (radixKeyBits(spec) > 64) return error.InvalidKeySpec;
+            const n_records = input_len / record_size;
+            // The ping-pong pair is the kernel's whole anonymous footprint.
+            const atom_pair_bytes = n_records * radix_atom_size * 2;
+            if (atom_pair_bytes <= options.budget_bytes) {
+                return sortInMemoryRadix(io, allocator, input_file, input_len, output_path, record_size, spec);
+            }
+            // Both atom buffers do not fit the budget: fall through to the
             // external runs+merge path, which generates runs with the
             // original kernel.
         },
@@ -1486,7 +1639,7 @@ fn testSortStabilityCase(
         .record_size = record_size,
         .budget_bytes = @max(input_len, count * 24) + 1,
         .max_fanout = 64,
-        .key_spec = if (kernel == .pdq_atoms) .{ .parts = &.{.{ .offset = 0, .width = .u32 }} } else null,
+        .key_spec = if (kernel != .index_blocksort) .{ .parts = &.{.{ .offset = 0, .width = .u32 }} } else null,
         .kernel = kernel,
     }, null, {}, numericKeyLess);
 
@@ -1535,6 +1688,15 @@ test "streaming sort: tie-heavy inputs are stable and path-independent" {
         .{ .rs = 8, .count = 300, .pattern = TiePattern.descending, .budget = 240, .fanout = 2, .kernel = Kernel.pdq_atoms },
         .{ .rs = 16, .count = 1000, .pattern = TiePattern.random, .budget = 1000, .fanout = 64, .kernel = Kernel.pdq_atoms },
         .{ .rs = 12, .count = 1, .pattern = TiePattern.random, .budget = 24, .fanout = 64, .kernel = Kernel.pdq_atoms },
+        // The same shapes through the radix kernel.
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 64, .kernel = Kernel.radix_lsd },
+        .{ .rs = 8, .count = 400, .pattern = TiePattern.all_equal, .budget = 256, .fanout = 2, .kernel = Kernel.radix_lsd },
+        .{ .rs = 12, .count = 600, .pattern = TiePattern.modulo_four, .budget = 480, .fanout = 64, .kernel = Kernel.radix_lsd },
+        .{ .rs = 16, .count = 500, .pattern = TiePattern.skewed, .budget = 500, .fanout = 2, .kernel = Kernel.radix_lsd },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.ascending, .budget = 240, .fanout = 64, .kernel = Kernel.radix_lsd },
+        .{ .rs = 8, .count = 300, .pattern = TiePattern.descending, .budget = 240, .fanout = 2, .kernel = Kernel.radix_lsd },
+        .{ .rs = 16, .count = 1000, .pattern = TiePattern.random, .budget = 1000, .fanout = 64, .kernel = Kernel.radix_lsd },
+        .{ .rs = 12, .count = 1, .pattern = TiePattern.random, .budget = 24, .fanout = 64, .kernel = Kernel.radix_lsd },
     };
 
     inline for (cases) |c| {
@@ -1545,8 +1707,8 @@ test "streaming sort: tie-heavy inputs are stable and path-independent" {
 // ─────────────────────────────────────────────────────────────────────────────
 // KeySpec contract tests: for every production key shape, ordering by
 // (key parts, input index) must match the comparator's stable ordering
-// byte-for-byte. This is the exact semantics the pdq-atom kernel will
-// implement, locked in ahead of the kernel change.
+// byte-for-byte. Key-based kernels (pdq_atoms, radix) rely on this
+// contract; the tests lock it ahead of the kernel change.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Comparator view matching a KeySpec: compares the parts lexicographically
@@ -1613,55 +1775,84 @@ fn testKeySpecEquivalenceCase(
     const got_path = try std.fs.path.join(allocator, &.{ tmp_path, "got.bin" });
     defer allocator.free(got_path);
 
-    // Comparator sort with both kernels: whichever kernel sorts, the
+    // Comparator sort with every kernel: whichever kernel sorts, the
     // (key parts, input index) reference ordering must hold byte-for-byte.
-    // The budget covers both kernels' in-memory gates.
-    inline for (.{ Kernel.index_blocksort, Kernel.pdq_atoms }) |kernel| {
-        try sortStreaming(io, allocator, input_path, got_path, .{
-            .record_size = record_size,
-            .budget_bytes = @max(input_len, count * 24) + 1,
-            .key_spec = .{ .parts = parts },
-            .kernel = kernel,
-        }, null, parts, keyViewLess);
-
-        // Reference: sort (key parts, input index) atoms and gather.
-        var atoms = try allocator.alloc(KeyAtom, count);
-        defer allocator.free(atoms);
-        for (0..count) |i| {
-            const rec = input[i * record_size ..][0..record_size];
-            atoms[i] = .{
-                .p0 = switch (parts[0].width) {
-                    .u32 => std.mem.readInt(u32, rec[parts[0].offset..][0..4], .little),
-                    .u64 => std.mem.readInt(u64, rec[parts[0].offset..][0..8], .little),
-                },
-                .p1 = if (parts.len > 1) switch (parts[1].width) {
-                    .u32 => std.mem.readInt(u32, rec[parts[1].offset..][0..4], .little),
-                    .u64 => std.mem.readInt(u64, rec[parts[1].offset..][0..8], .little),
-                } else 0,
-                .idx = @intCast(i),
-            };
+    // Radix additionally rejects keys wider than one u64.
+    var radix_bits: usize = 0;
+    for (parts) |part| radix_bits += if (part.width == .u32) 32 else 64;
+    inline for (.{ Kernel.index_blocksort, Kernel.pdq_atoms, Kernel.radix_lsd }) |kernel| {
+        if (kernel == .radix_lsd and radix_bits > 64) {
+            const result = sortStreaming(io, allocator, input_path, got_path, .{
+                .record_size = record_size,
+                .budget_bytes = @max(input_len, count * 24) + 1,
+                .key_spec = .{ .parts = parts },
+                .kernel = kernel,
+            }, null, parts, keyViewLess);
+            try std.testing.expectError(error.InvalidKeySpec, result);
+        } else {
+            try testKeySpecKernelEquivalence(allocator, io, input, input_path, got_path, record_size, input_len, count, parts, kernel);
         }
-        const AtomLess = struct {
-            fn less(_: void, a: KeyAtom, b: KeyAtom) bool {
-                if (a.p0 != b.p0) return a.p0 < b.p0;
-                if (a.p1 != b.p1) return a.p1 < b.p1;
-                return a.idx < b.idx;
-            }
-        };
-        std.mem.sort(KeyAtom, atoms, {}, AtomLess.less);
-
-        var expected = try allocator.alloc(u8, input_len);
-        defer allocator.free(expected);
-        for (atoms, 0..) |atom, out_i| {
-            const src = input[atom.idx * record_size ..][0..record_size];
-            @memcpy(expected[out_i * record_size ..][0..record_size], src);
-        }
-
-        const got = try Io.Dir.cwd().readFileAlloc(io, got_path, allocator, .limited(input_len + 1));
-        defer allocator.free(got);
-
-        try std.testing.expectEqualSlices(u8, expected, got);
     }
+}
+
+/// Runs one kernel over the test input and asserts byte-identity against
+/// the (key parts, input index) reference ordering.
+fn testKeySpecKernelEquivalence(
+    allocator: std.mem.Allocator,
+    io: Io,
+    input: []const u8,
+    input_path: []const u8,
+    got_path: []const u8,
+    record_size: usize,
+    input_len: usize,
+    count: usize,
+    parts: []const KeyPartSpec,
+    kernel: Kernel,
+) !void {
+    try sortStreaming(io, allocator, input_path, got_path, .{
+        .record_size = record_size,
+        .budget_bytes = @max(input_len, count * 24) + 1,
+        .key_spec = .{ .parts = parts },
+        .kernel = kernel,
+    }, null, parts, keyViewLess);
+
+    // Reference: sort (key parts, input index) atoms and gather.
+    var atoms = try allocator.alloc(KeyAtom, count);
+    defer allocator.free(atoms);
+    for (0..count) |i| {
+        const rec = input[i * record_size ..][0..record_size];
+        atoms[i] = .{
+            .p0 = switch (parts[0].width) {
+                .u32 => std.mem.readInt(u32, rec[parts[0].offset..][0..4], .little),
+                .u64 => std.mem.readInt(u64, rec[parts[0].offset..][0..8], .little),
+            },
+            .p1 = if (parts.len > 1) switch (parts[1].width) {
+                .u32 => std.mem.readInt(u32, rec[parts[1].offset..][0..4], .little),
+                .u64 => std.mem.readInt(u64, rec[parts[1].offset..][0..8], .little),
+            } else 0,
+            .idx = @intCast(i),
+        };
+    }
+    const AtomLess = struct {
+        fn less(_: void, a: KeyAtom, b: KeyAtom) bool {
+            if (a.p0 != b.p0) return a.p0 < b.p0;
+            if (a.p1 != b.p1) return a.p1 < b.p1;
+            return a.idx < b.idx;
+        }
+    };
+    std.mem.sort(KeyAtom, atoms, {}, AtomLess.less);
+
+    var expected = try allocator.alloc(u8, input_len);
+    defer allocator.free(expected);
+    for (atoms, 0..) |atom, out_i| {
+        const src = input[atom.idx * record_size ..][0..record_size];
+        @memcpy(expected[out_i * record_size ..][0..record_size], src);
+    }
+
+    const got = try Io.Dir.cwd().readFileAlloc(io, got_path, allocator, .limited(input_len + 1));
+    defer allocator.free(got);
+
+    try std.testing.expectEqualSlices(u8, expected, got);
 }
 
 test "key spec ordering matches comparator ordering for production key shapes" {
@@ -1758,6 +1949,38 @@ test "key spec validation rejects out-of-range offsets and missing specs" {
             .budget_bytes = 1024,
             .key_spec = .{ .parts = &[_]KeyPartSpec{ .{ .offset = 0, .width = .u32 }, .{ .offset = 4, .width = .u32 } } },
             .kernel = .pdq_atoms,
+        }, null, {}, lexLess);
+    }
+    // The radix kernel also requires a key spec...
+    {
+        const result = sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .kernel = .radix_lsd,
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // ...whose parts fit a single u64 (two u64 parts do not)...
+    {
+        const input3_path = try std.fs.path.join(allocator, &.{ tmp_path, "input3.bin" });
+        defer allocator.free(input3_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = input3_path, .data = &[_]u8{0} ** 32 });
+
+        const result = sortStreaming(io, allocator, input3_path, output_path, .{
+            .record_size = 32,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{ .{ .offset = 0 }, .{ .offset = 8 } } },
+            .kernel = .radix_lsd,
+        }, null, {}, lexLess);
+        try std.testing.expectError(error.InvalidKeySpec, result);
+    }
+    // ...and sorts eligible in-memory inputs successfully.
+    {
+        try sortStreaming(io, allocator, input_path, output_path, .{
+            .record_size = 8,
+            .budget_bytes = 1024,
+            .key_spec = .{ .parts = &[_]KeyPartSpec{ .{ .offset = 0, .width = .u32 }, .{ .offset = 4, .width = .u32 } } },
+            .kernel = .radix_lsd,
         }, null, {}, lexLess);
     }
 }

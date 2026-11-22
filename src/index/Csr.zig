@@ -314,7 +314,7 @@ pub fn run(
                 .{ .offset = 0, .width = .u32 },
                 .{ .offset = 4, .width = .u32 },
             } },
-            .kernel = .pdq_atoms,
+            .kernel = .radix_lsd,
         }, null, {}, lessBySource);
     }
 
