@@ -1080,7 +1080,7 @@ test "fixtures produce resolved edges" {
         defer scan_result.deinit(allocator);
 
         var sort_diagnostics: Manifest.Diagnostics = .{};
-        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io_arg, &job, scan_result.catalog_path, &sort_diagnostics);
+        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io_arg, &job, scan_result.catalog_path, null, &sort_diagnostics);
         defer catalog_result.deinit(allocator);
 
         const classes_path = try CatalogSorter.writeClasses(allocator, io_arg, job.staging_dir, &scan_result.class_table);

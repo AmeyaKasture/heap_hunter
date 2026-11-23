@@ -980,7 +980,7 @@ test "fixture end-to-end produces consistent CSR" {
         defer scan_result.deinit(allocator);
 
         var sort_diagnostics: Manifest.Diagnostics = .{};
-        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &sort_diagnostics);
+        var catalog_result = try CatalogSorter.sortAndDedupe(allocator, io, &job, scan_result.catalog_path, null, &sort_diagnostics);
         defer catalog_result.deinit(allocator);
 
         const classes_path = try CatalogSorter.writeClasses(allocator, io, job.staging_dir, &scan_result.class_table);

@@ -496,6 +496,7 @@ fn runThroughLayouts(
         io,
         &job,
         scan_result.catalog_path,
+        null,
         &sort_diagnostics,
     );
     defer catalog_result.deinit(allocator);

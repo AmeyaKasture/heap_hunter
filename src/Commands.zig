@@ -210,6 +210,12 @@ pub fn runIndexCommand(
             };
             log.debug("stage: layouts complete, n_classes={d}", .{layout_table.layouts.len});
 
+            var instance_sizes = std.AutoHashMap(u64, u32).init(allocator);
+            defer instance_sizes.deinit();
+            for (layout_table.layouts) |*layout| {
+                try instance_sizes.put(layout.class_raw_id, Layouts.matInstanceSize(layout));
+            }
+
             progress.nextStep("emitting edges");
             log.debug("stage: emitting edges", .{});
             const edge_result = blk: {
@@ -251,6 +257,7 @@ pub fn runIndexCommand(
                     io,
                     job,
                     catalog_unsorted_path,
+                    &instance_sizes,
                     &scan_result.diagnostics,
                 ) catch |err| switch (err) {
                     error.TooManyObjects => {
