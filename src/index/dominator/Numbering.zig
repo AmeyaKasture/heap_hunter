@@ -24,7 +24,13 @@ pub const Numbering = struct {
     /// Reverse-postorder slot -> ordinal. Always emitted: the orchestrator
     /// writes dom_order.bin from it and sweeps retained sizes with it.
     rpo_vertex: []u32,
-    reachable: []bool,
+    /// Reachability bitset over ordinals: bit (v & 7) of byte (v >> 3) is
+    /// set iff ordinal v is reachable from the virtual root. One bit per
+    /// node instead of one bool: the DFS probes it once per edge and the
+    /// backends once per predecessor, and the 8x smaller array stays
+    /// cache-resident on dense graphs where the byte array would stream
+    /// from RAM.
+    reachable: []u8,
     max_depth: u32,
     // --- DFS-tree products (dfs-tree mode only) ---
     /// Ordinal -> preorder slot (NONE when unreachable).
@@ -55,6 +61,11 @@ pub const Numbering = struct {
         self.dfn_vertex = &.{};
         self.parent = &.{};
     }
+
+    /// True iff ordinal `v` was reached by the DFS.
+    pub inline fn isReachable(self: *const Numbering, v: u32) bool {
+        return (self.reachable[v >> 3] & (@as(u8, 1) << @intCast(v & 7))) != 0;
+    }
 };
 
 const StackFrame = struct {
@@ -72,9 +83,9 @@ pub fn compute(
 ) !Numbering {
     const emit_tree = options.emit_dfs_tree;
 
-    const reachable = try allocator.alloc(bool, n_nodes);
+    const reachable = try allocator.alloc(u8, (n_nodes + 7) / 8);
     errdefer allocator.free(reachable);
-    @memset(reachable, false);
+    @memset(reachable, 0);
 
     // Reverse-postorder products. `rpo_vertex` is needed by the orchestrator
     // regardless of backend; `rpo_num` is CHK-only and is skipped in
@@ -108,7 +119,7 @@ pub fn compute(
     errdefer allocator.free(rpo_vertex);
 
     const root = n_nodes - 1;
-    reachable[root] = true;
+    reachable[root >> 3] |= @as(u8, 1) << @intCast(root & 7);
 
     var stack = std.ArrayList(StackFrame).empty;
     errdefer stack.deinit(allocator);
@@ -136,8 +147,9 @@ pub fn compute(
             top.cursor += 1;
             if (w == top.node) continue;
             if (w >= n_nodes) continue;
-            if (reachable[w]) continue;
-            reachable[w] = true;
+            const w_bit = @as(u8, 1) << @intCast(w & 7);
+            if ((reachable[w >> 3] & w_bit) != 0) continue;
+            reachable[w >> 3] |= w_bit;
             if (emit_tree) {
                 // Assign the preorder slot at discovery; the parent's slot
                 // was assigned when the parent was pushed, so the tree

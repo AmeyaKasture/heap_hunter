@@ -53,7 +53,7 @@ fn computeShortcutDecisions(ctx: *const Context, sole_pred: []u32) void {
         var previous: u32 = NONE;
         for (preds) |p| {
             if (p == v) continue;
-            if (!ctx.reachable[p]) continue;
+            if (!ctx.isReachable(p)) continue;
             if (p == previous) continue;
             previous = p;
             count += 1;
@@ -87,7 +87,7 @@ fn sweep(
             const preds = ctx.in_edges.edges(v);
             for (preds) |p| {
                 if (p == v) continue;
-                if (!ctx.reachable[p]) continue;
+                if (!ctx.isReachable(p)) continue;
                 if (idom[p] == NONE) continue;
                 if (candidate == NONE) {
                     candidate = p;

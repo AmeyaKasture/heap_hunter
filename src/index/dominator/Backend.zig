@@ -43,7 +43,8 @@ pub const Context = struct {
     // --- DFS products (shared) ---
     /// Reverse-postorder slot -> ordinal. Always present.
     rpo_vertex: []u32,
-    reachable: []bool,
+    /// Reachability bitset over ordinals; see `Numbering.reachable`.
+    reachable: []u8,
     // --- Reverse-postorder products (CHK only) ---
     /// Ordinal -> reverse-postorder slot. Empty when the LT backend runs.
     rpo_num: []u32 = &.{},
@@ -64,6 +65,11 @@ pub const Context = struct {
     // --- CSR views ---
     out_edges: *const CsrView,
     in_edges: *const CsrView,
+
+    /// True iff ordinal `v` is reachable from the virtual root.
+    pub inline fn isReachable(self: *const Context, v: u32) bool {
+        return (self.reachable[v >> 3] & (@as(u8, 1) << @intCast(v & 7))) != 0;
+    }
 };
 
 pub const Backend = struct {
