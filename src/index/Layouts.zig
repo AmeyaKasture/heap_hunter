@@ -55,6 +55,30 @@ fn isReferenceType(ty: hprof.PrimitiveType) bool {
     return ty == .object or ty == .array_object;
 }
 
+/// HotSpot/MAT shallow size for one instance of the class behind `layout`.
+/// Mirrors MAT's `calculateSizeRecursive`: start from the 12-byte header
+/// (pointerSize + refSize), add each superclass level's declared fields,
+/// round the running total up to the 4-byte reference alignment at every
+/// level, then to the 8-byte object alignment at the end. Flat summation
+/// without the per-level rounding under-counts chains whose parents end
+/// mid-word (e.g. FinalizerThread: MAT 112, flat model 104).
+pub fn matInstanceSize(layout: *const Layout) u32 {
+    var size: u64 = Scanner.ShallowModel.instance_header_bytes;
+    // Fields are laid out subclass-first; walking backwards visits the
+    // root-most declaring level first.
+    var i: usize = layout.fields.len;
+    while (i > 0) {
+        var level_sum: u64 = 0;
+        const level_class = layout.fields[i - 1].declaring_class_raw_id;
+        while (i > 0 and layout.fields[i - 1].declaring_class_raw_id == level_class) {
+            level_sum += Scanner.ShallowModel.primitiveOrRefBytes(layout.fields[i - 1].type);
+            i -= 1;
+        }
+        size = Scanner.ShallowModel.alignUp4(size + level_sum);
+    }
+    return @intCast(Scanner.ShallowModel.alignUp8(size));
+}
+
 /// Resolve flattened instance-field layouts for every class in `class_table`,
 /// write `fields.bin` to `staging_dir`, and return an in-memory `LayoutTable`.
 ///
@@ -674,6 +698,95 @@ test "superclass cycle truncates chain" {
     try std.testing.expectEqual(@as(u64, 1), diagnostics.superclass_cycle);
 }
 
+test "matInstanceSize matches MAT hierarchical model" {
+    // java.lang.Object: no fields -> align8(align4(12)) = 16.
+    try std.testing.expectEqual(@as(u32, 16), matInstanceSize(&.{
+        .class_raw_id = 0x1,
+        .fields = &[_]Field{},
+        .reference_offsets = &[_]u32{},
+    }));
+
+    // Single level, String-like (ref + int + byte + byte):
+    // a4(12 + 10) = 24.
+    const string_fields = [_]Field{
+        .{ .name = "value", .type = .object, .byte_offset = 0, .declaring_class_raw_id = 0x20 },
+        .{ .name = "hash", .type = .int, .byte_offset = 0, .declaring_class_raw_id = 0x20 },
+        .{ .name = "coder", .type = .byte, .byte_offset = 0, .declaring_class_raw_id = 0x20 },
+        .{ .name = "hashIsZero", .type = .boolean, .byte_offset = 0, .declaring_class_raw_id = 0x20 },
+    };
+    try std.testing.expectEqual(@as(u32, 24), matInstanceSize(&.{
+        .class_raw_id = 0x20,
+        .fields = &string_fields,
+        .reference_offsets = &[_]u32{},
+    }));
+
+    // FinalizerThread: root level 89 B (11 longs + 1 byte), subclass 1 B.
+    // Flat summation would give 104; MAT's per-level rounding gives
+    // a4(a4(12 + 89) + 1) = 108 -> 112.
+    const ft_fields = comptime blk: {
+        var fs: [13]Field = undefined;
+        fs[0] = .{ .name = "subclass", .type = .boolean, .byte_offset = 0, .declaring_class_raw_id = 0x10 };
+        for (0..11) |i| {
+            fs[1 + i] = .{ .name = "root", .type = .long, .byte_offset = 0, .declaring_class_raw_id = 0x20 };
+        }
+        fs[12] = .{ .name = "root", .type = .byte, .byte_offset = 0, .declaring_class_raw_id = 0x20 };
+        break :blk fs;
+    };
+    try std.testing.expectEqual(@as(u32, 112), matInstanceSize(&.{
+        .class_raw_id = 0x10,
+        .fields = &ft_fields,
+        .reference_offsets = &[_]u32{},
+    }));
+
+    // DirectByteBuffer: levels (subclass-first) 8, 8, 12, 28
+    // -> 40 -> 52 -> 60 -> 68 -> align8 = 72.
+    const dbb_fields = comptime blk: {
+        var fs: [12]Field = undefined;
+        fs[0] = .{ .name = "f", .type = .long, .byte_offset = 0, .declaring_class_raw_id = 0x10 };
+        fs[1] = .{ .name = "f", .type = .long, .byte_offset = 0, .declaring_class_raw_id = 0x20 };
+        for (0..3) |i| {
+            fs[2 + i] = .{ .name = "f", .type = .int, .byte_offset = 0, .declaring_class_raw_id = 0x30 };
+        }
+        for (0..7) |i| {
+            fs[5 + i] = .{ .name = "f", .type = .int, .byte_offset = 0, .declaring_class_raw_id = 0x40 };
+        }
+        break :blk fs;
+    };
+    try std.testing.expectEqual(@as(u32, 72), matInstanceSize(&.{
+        .class_raw_id = 0x10,
+        .fields = &dbb_fields,
+        .reference_offsets = &[_]u32{},
+    }));
+
+    // Permissions: root 1 B, subclass 10 B (5 shorts)
+    // -> a4(13) = 16 -> a4(26) = 28 -> align8 = 32.
+    const perm_fields = comptime blk: {
+        var fs: [6]Field = undefined;
+        for (0..5) |i| {
+            fs[i] = .{ .name = "f", .type = .short, .byte_offset = 0, .declaring_class_raw_id = 0x10 };
+        }
+        fs[5] = .{ .name = "f", .type = .byte, .byte_offset = 0, .declaring_class_raw_id = 0x20 };
+        break :blk fs;
+    };
+    try std.testing.expectEqual(@as(u32, 32), matInstanceSize(&.{
+        .class_raw_id = 0x10,
+        .fields = &perm_fields,
+        .reference_offsets = &[_]u32{},
+    }));
+
+    // AllPermissionCollection: root 1 B, subclass 2 B
+    // -> a4(13) = 16 -> a4(18) = 20 -> align8 = 24.
+    const apc_fields = [_]Field{
+        .{ .name = "f", .type = .short, .byte_offset = 0, .declaring_class_raw_id = 0x10 },
+        .{ .name = "f", .type = .byte, .byte_offset = 0, .declaring_class_raw_id = 0x20 },
+    };
+    try std.testing.expectEqual(@as(u32, 24), matInstanceSize(&.{
+        .class_raw_id = 0x10,
+        .fields = &apc_fields,
+        .reference_offsets = &[_]u32{},
+    }));
+}
+
 test "fields.bin parses and matches classes.bin on fixtures" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -705,6 +818,7 @@ test "fields.bin parses and matches classes.bin on fixtures" {
             io,
             &job,
             scan_result.catalog_path,
+            null,
             &sort_diagnostics,
         );
         defer catalog_result.deinit(allocator);

@@ -36,11 +36,18 @@ fn catalogLessThan(_: void, a: []const u8, b: []const u8) bool {
 /// first occurrence), and write `catalog.bin`. Returns the path to the sorted
 /// catalog and the unique object count. Updates `diagnostics` with the number
 /// of dropped duplicates.
+///
+/// When `instance_sizes` is provided, every instance row's shallow size is
+/// rewritten to the HotSpot/MAT value for its class (12-byte header plus
+/// 4-byte compressed references, aligned) before it is written to
+/// `catalog.bin`; the raw scan-time value is an HPROF value-block length.
+/// Rows whose class is missing from the map keep their scan-time value.
 pub fn sortAndDedupe(
     allocator: std.mem.Allocator,
     io: Io,
     job: *const Preflight.Job,
     unsorted_path: []const u8,
+    instance_sizes: ?*const std.AutoHashMap(u64, u32),
     diagnostics: *Manifest.Diagnostics,
 ) !Result {
     const sorted_path = try std.fs.path.join(allocator, &.{ job.staging_dir, "catalog.sorted" });
@@ -103,6 +110,19 @@ pub fn sortAndDedupe(
                 continue;
             }
             last_id = raw_id;
+            if (instance_sizes) |sizes| {
+                if (record[28] == @intFromEnum(Scanner.CatalogKind.instance)) {
+                    const class_raw_id = std.mem.readInt(u64, record[16..24], .little);
+                    if (sizes.get(class_raw_id)) |fixed| {
+                        var row: [catalog_row_size]u8 = undefined;
+                        @memcpy(&row, record);
+                        std.mem.writeInt(u32, row[24..28], fixed, .little);
+                        try catalog_writer.writeAll(&row);
+                        n_written += 1;
+                        continue;
+                    }
+                }
+            }
             try catalog_writer.writeAll(record);
             n_written += 1;
         }
@@ -273,7 +293,7 @@ test "sortAndDedupe removes duplicate raw IDs" {
     defer scan_result.deinit(allocator);
 
     var diagnostics: Manifest.Diagnostics = .{};
-    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, null, &diagnostics);
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(u64, 3), result.n_objects);
@@ -291,6 +311,89 @@ test "sortAndDedupe removes duplicate raw IDs" {
     try std.testing.expectEqual(@as(hprof.Id, 0x2000), row0.raw_id);
     try std.testing.expectEqual(@as(hprof.Id, 0x3000), row1.raw_id);
     try std.testing.expectEqual(@as(hprof.Id, 0x4000), row2.raw_id);
+}
+
+test "sortAndDedupe rewrites instance sizes from the map" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path_z = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path_z);
+
+    var b = @import("../tests/HprofBuilder.zig").Builder.init(allocator, 4);
+    defer b.deinit();
+
+    try b.header(0);
+    try b.utf8(0x1000, "java/lang/Object");
+    try b.loadClass(1, 0x2000, 0x1000);
+    try b.utf8(0x1001, "com/example/Mapped");
+    try b.loadClass(2, 0x5000, 0x1001);
+
+    var heap = try b.heapDump();
+    _ = try heap.classDump(.{ .class_id = 0x2000, .instance_size = 8 });
+    _ = try heap.classDump(.{ .class_id = 0x5000, .instance_size = 8 });
+    _ = try heap.instanceDump(0x3000, 0x2000, &[_]u8{0} ** 8);
+    _ = try heap.instanceDump(0x3000, 0x2000, &[_]u8{0} ** 8); // duplicate raw id
+    _ = try heap.instanceDump(0x4000, 0x2000, &[_]u8{0} ** 8);
+    _ = try heap.instanceDump(0x6000, 0x5000, &[_]u8{0} ** 8);
+    heap.end();
+
+    const bytes = try b.finish();
+    defer allocator.free(bytes);
+
+    const job = try createTestJob(allocator, io, bytes, tmp_path_z[0..tmp_path_z.len]);
+    defer job.deinit(allocator);
+
+    var scan_result = try Scanner.run(allocator, io, &job, bytes, null);
+    defer scan_result.deinit(allocator);
+
+    var instance_sizes = std.AutoHashMap(u64, u32).init(allocator);
+    defer instance_sizes.deinit();
+    try instance_sizes.put(0x2000, 112);
+
+    var diagnostics: Manifest.Diagnostics = .{};
+    var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &instance_sizes, &diagnostics);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 5), result.n_objects);
+    try std.testing.expectEqual(@as(u64, 1), diagnostics.duplicate_object_ids);
+
+    const catalog_data = try Io.Dir.cwd().readFileAlloc(io, result.catalog_path, allocator, .limited(4096));
+    defer allocator.free(catalog_data);
+
+    try std.testing.expectEqual(@as(usize, 5 * catalog_row_size), catalog_data.len);
+
+    const row0 = try Scanner.readCatalogRow(catalog_data[0..catalog_row_size]);
+    const row1 = try Scanner.readCatalogRow(catalog_data[catalog_row_size..][0..catalog_row_size]);
+    const row2 = try Scanner.readCatalogRow(catalog_data[2 * catalog_row_size ..][0..catalog_row_size]);
+    const row3 = try Scanner.readCatalogRow(catalog_data[3 * catalog_row_size ..][0..catalog_row_size]);
+    const row4 = try Scanner.readCatalogRow(catalog_data[4 * catalog_row_size ..][0..catalog_row_size]);
+
+    // Sorted by raw id: class 0x2000, instances 0x3000/0x4000 of the mapped
+    // class, class 0x5000, instance 0x6000 whose class is missing from the
+    // map. Class rows are never rewritten; mapped instances carry the MAT
+    // value; unmapped instances keep the scan-time value-block length.
+    try std.testing.expectEqual(@as(hprof.Id, 0x2000), row0.raw_id);
+    try std.testing.expectEqual(@as(Scanner.CatalogKind, .class), row0.kind);
+    try std.testing.expectEqual(@as(u32, 8), row0.shallow_size);
+
+    try std.testing.expectEqual(@as(hprof.Id, 0x3000), row1.raw_id);
+    try std.testing.expectEqual(@as(Scanner.CatalogKind, .instance), row1.kind);
+    try std.testing.expectEqual(@as(u32, 112), row1.shallow_size);
+
+    try std.testing.expectEqual(@as(hprof.Id, 0x4000), row2.raw_id);
+    try std.testing.expectEqual(@as(Scanner.CatalogKind, .instance), row2.kind);
+    try std.testing.expectEqual(@as(u32, 112), row2.shallow_size);
+
+    try std.testing.expectEqual(@as(hprof.Id, 0x5000), row3.raw_id);
+    try std.testing.expectEqual(@as(Scanner.CatalogKind, .class), row3.kind);
+    try std.testing.expectEqual(@as(u32, 8), row3.shallow_size);
+
+    try std.testing.expectEqual(@as(hprof.Id, 0x6000), row4.raw_id);
+    try std.testing.expectEqual(@as(Scanner.CatalogKind, .instance), row4.kind);
+    try std.testing.expectEqual(@as(u32, 8), row4.shallow_size);
 }
 
 test "ordinalForRawId hit and miss" {
@@ -426,7 +529,7 @@ test "fixture catalog count stable after sort and dedupe" {
         defer scan_result.deinit(allocator);
 
         var diagnostics: Manifest.Diagnostics = .{};
-        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, &diagnostics);
+        var result = try sortAndDedupe(allocator, io, &job, scan_result.catalog_path, null, &diagnostics);
         defer result.deinit(allocator);
 
         const expected = analysis_index.total_objects + analysis_index.classes.count();

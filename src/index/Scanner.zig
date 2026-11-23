@@ -13,6 +13,37 @@ const profiling = @import("profiling");
 /// Fixed size of a catalog row on disk: 32 bytes, little-endian.
 pub const catalog_row_size = 32;
 
+/// HotSpot shallow-size model (matches Eclipse MAT and the live JVM):
+/// instances are a 12-byte header plus fields with 4-byte compressed
+/// references rounded up to 8; arrays are a 16-byte header (12-byte object
+/// header plus a 4-byte length) plus payload rounded up to 8. The raw HPROF
+/// value-block lengths used before this model counted 8-byte file ids as
+/// references and omitted headers, which under-reported shallow heap by
+/// ~7% vs MAT.
+pub const ShallowModel = struct {
+    pub const instance_header_bytes: u64 = 12;
+    pub const array_header_bytes: u64 = 16;
+    pub const compressed_ref_bytes: u64 = 4;
+
+    pub fn alignUp8(n: u64) u64 {
+        return (n + 7) & ~@as(u64, 7);
+    }
+
+    pub fn alignUp4(n: u64) u64 {
+        return (n + 3) & ~@as(u64, 3);
+    }
+
+    pub fn primitiveOrRefBytes(ty: hprof.PrimitiveType) u64 {
+        return switch (ty) {
+            .boolean, .byte => 1,
+            .char, .short => 2,
+            .int, .float => 4,
+            .long, .double => 8,
+            .object, .array_object => compressed_ref_bytes,
+        };
+    }
+};
+
 /// Kind of node stored in `catalog.unsorted`.
 /// The numeric values are part of the on-disk format.
 pub const CatalogKind = enum(u8) {
@@ -1114,7 +1145,9 @@ fn scanHeapDump(
             .gc_obj_array_dump => |oa| {
                 if (accs) |a| a.arrays.start(io, "arrays");
                 defer if (accs) |a| a.arrays.stop(io);
-                const size = std.math.cast(u32, @as(u64, oa.element_count) * job.header.id_size) orelse return error.ArrayTooLarge;
+                const size = std.math.cast(u32, ShallowModel.alignUp8(
+                    ShallowModel.array_header_bytes + @as(u64, oa.element_count) * ShallowModel.compressed_ref_bytes,
+                )) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = oa.array_id,
                     .source_offset = item.body_offset,
@@ -1127,7 +1160,9 @@ fn scanHeapDump(
             .gc_prim_array_dump => |pa| {
                 if (accs) |a| a.arrays.start(io, "arrays");
                 defer if (accs) |a| a.arrays.stop(io);
-                const size = std.math.cast(u32, pa.bytes.len) orelse return error.ArrayTooLarge;
+                const size = std.math.cast(u32, ShallowModel.alignUp8(
+                    ShallowModel.array_header_bytes + pa.bytes.len,
+                )) orelse return error.ArrayTooLarge;
                 try writeCatalogRow(catalog_writer, .{
                     .raw_id = pa.array_id,
                     .source_offset = item.body_offset,
