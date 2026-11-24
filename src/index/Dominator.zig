@@ -853,3 +853,78 @@ test "dominator budget gate is phase-aware" {
     defer result.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 4), result.n_reachable);
 }
+
+test "retained totals above the u32 ceiling survive the dominator stage" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // Chain root(3) -> 0 -> 1 -> 2 with shallow sizes of 2.5 GB each.
+    // The mid-chain accumulation crosses the u32 ceiling exactly where a
+    // 32-bit retained accumulator would wrap: retained[1] = 5e9 and
+    // retained[0] = 7.5e9 are both above maxInt(u32). This is the
+    // failure signature reported on a 20 GB production dump
+    // ("integer overflow while calculating dominators"): the sweep's
+    // sums are u64 end to end, and this test locks that in — a build
+    // with a u32 accumulator fails it.
+    const edges = &[_][2]u32{
+        .{ 3, 0 },
+        .{ 0, 1 },
+        .{ 1, 2 },
+    };
+    const shallow = &[_]u32{
+        2_500_000_000,
+        2_500_000_000,
+        2_500_000_000,
+    };
+
+    try writeTestCsr(allocator, io, tmp_path, 4, edges, shallow);
+
+    var job = try createTestJob(allocator, io, tmp_path);
+    defer job.deinit(allocator);
+    var diagnostics: Manifest.Diagnostics = .{};
+
+    var result = try runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        3,
+        edges.len,
+        &diagnostics,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 7_500_000_000), result.total_retained_bytes);
+
+    const retained_data = try Io.Dir.cwd().readFileAlloc(io, result.retained_path, allocator, .unlimited);
+    defer allocator.free(retained_data);
+    try std.testing.expectEqual(@as(usize, 4 * retained_entry_size), retained_data.len);
+    var retained: [4]u64 = undefined;
+    for (0..4) |i| {
+        retained[i] = std.mem.readInt(u64, retained_data[i * 8 ..][0..8], .little);
+    }
+    try std.testing.expectEqual(@as(u64, 7_500_000_000), retained[3]); // root: all reachable shallow
+    try std.testing.expectEqual(@as(u64, 7_500_000_000), retained[0]);
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), retained[1]); // crosses maxInt(u32)
+    try std.testing.expectEqual(@as(u64, 2_500_000_000), retained[2]);
+}
+
+test "dump-scale quantities stay 64-bit" {
+    // A 20 GB dump crosses the u32 boundary in three places at once:
+    // dump byte offsets (~2e10), retained/shallow totals (~1.7e10), and
+    // the budget product (the default 4096 MB is exactly 2^32). Lock the
+    // field types so a refactor cannot silently narrow any of them; the
+    // per-object `shallow_size` stays u32 because the HPROF format
+    // itself writes object sizes as u4, so no representable dump can
+    // overflow it.
+    try std.testing.expect(@TypeOf(@as(Scanner.SegmentRange, undefined).offset) == u64);
+    try std.testing.expect(@TypeOf(@as(Scanner.SegmentRange, undefined).len) == u64);
+    try std.testing.expect(@TypeOf(@as(Preflight.Job, undefined).budget_bytes) == usize);
+    try std.testing.expect(@TypeOf(@as(Preflight.Job, undefined).dominator_budget_bytes) == usize);
+    try std.testing.expect(retained_entry_size == 8);
+}
