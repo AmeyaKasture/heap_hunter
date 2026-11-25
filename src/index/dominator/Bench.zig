@@ -115,6 +115,14 @@ pub fn main(init: std.process.Init) !void {
 
     const manifest = try readManifest(allocator, io, index_dir);
 
+    // A reused manifest is trusted input in practice, but a hand-edited
+    // one with an absurd object count would panic the casts below;
+    // validate against the same ceiling the catalog stage enforces.
+    if (manifest.n_objects > Dominator.max_supported_objects) {
+        std.debug.print("manifest n_objects {d} exceeds the ordinal space (max {d})\n", .{ manifest.n_objects, Dominator.max_supported_objects });
+        return error.InvalidArgument;
+    }
+
     const V = manifest.n_objects + 1;
 
     // Read CSR into memory for the backend-isolated measurement.

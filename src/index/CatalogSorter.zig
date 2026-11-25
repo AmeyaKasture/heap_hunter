@@ -19,7 +19,11 @@ pub const Result = struct {
     }
 };
 
-const max_object_count = @as(u64, std.math.maxInt(u32)) - 1;
+/// The u32 ordinal space's practical ceiling: the catalog rejects at or
+/// above this count so the dominator stage's casts (root ordinal, CSR
+/// node counts) stay in range. Pub so the dominator stage can assert
+/// the two bounds agree.
+pub const max_object_count = @as(u64, std.math.maxInt(u32)) - 1;
 
 fn catalogLessThan(_: void, a: []const u8, b: []const u8) bool {
     const a_id = std.mem.readInt(u64, a[0..8], .little);
