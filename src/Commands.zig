@@ -295,6 +295,9 @@ pub fn runIndexCommand(
                         if (err == error.DominatorBudgetExceeded) {
                             Dominator.formatBudgetError(V, required_conservative, job.dominator_budget_bytes, stderr) catch {};
                             try stderr.flush();
+                        } else if (err == error.DominatorOrdinalLimitExceeded) {
+                            try Cli.printError(stderr, "this dump has more objects than the dominator stage supports (max {d})", .{Dominator.max_supported_objects});
+                            try stderr.flush();
                         }
                         return @as(anyerror!void, err);
                     });

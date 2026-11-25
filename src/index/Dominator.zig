@@ -19,6 +19,24 @@ pub const NONE = std.math.maxInt(u32);
 /// Parses a user-facing algorithm name; see Backend.parseAlgorithm.
 pub const parseAlgorithmName = Backend.parseAlgorithm;
 
+/// The most objects the dominator stage supports: ordinals are u32 and
+/// NONE (u32.max) is the unreached/unassigned sentinel, so valid
+/// ordinals top out at u32.max - 1 and the virtual root (ordinal
+/// n_objects) must fit strictly below that. The catalog stage enforces
+/// the same bound upstream (`CatalogSorter.max_object_count`); this
+/// constant exists so the stage can reject over-limit direct callers
+/// with a typed error instead of panicking in its casts.
+///
+/// Deliberately NOT a wider ordinal type: the ceiling is ~4.29 billion
+/// objects, a heap dump on the order of a terabyte, and at that scale
+/// the stage's own footprint (45 B/node anonymous at the peak phase,
+/// ~25 B/node of mapped CSR input) binds long before the ordinal space
+/// does. Doubling every per-node array to u64 would double the stage's
+/// anonymous need and change the on-disk formats for a limit no
+/// realistic dump approaches; the guard keeps the ceiling honest
+/// instead.
+pub const max_supported_objects: u64 = @as(u64, std.math.maxInt(u32)) - 2;
+
 pub const dom_parent_entry_size = 4;
 pub const dom_order_entry_size = 4;
 pub const retained_entry_size = 8;
@@ -27,6 +45,10 @@ pub const Error = error{
     DominatorBudgetExceeded,
     DominatorIterationLimitExceeded,
     DominatorInternalError,
+    /// The dump has more objects than the u32 ordinal space supports
+    /// (see `max_supported_objects`). The catalog stage rejects real
+    /// dumps upstream; this guards direct callers.
+    DominatorOrdinalLimitExceeded,
     InvalidCatalogFile,
     InvalidCsrFile,
     NoRetainedData,
@@ -64,6 +86,15 @@ pub fn run(
 ) !Result {
     const V = n_objects + 1;
     const root: u32 = @intCast(V - 1);
+
+    // 0. Ordinal-space guard: every cast below (root, both CSR views, the
+    // numbering, the backend context) assumes V fits the u32 ordinal
+    // space with NONE reserved. Real dumps are rejected upstream by the
+    // catalog stage; direct callers (bench, tests) get the typed error
+    // here instead of an integer-overflow panic.
+    if (n_objects > max_supported_objects) {
+        return error.DominatorOrdinalLimitExceeded;
+    }
 
     // 1. Budget pre-check. Only the numbering phase is allocated before the
     // DFS depth is known, so this gate covers the numbering arrays plus a
@@ -852,4 +883,65 @@ test "dominator budget gate is phase-aware" {
     );
     defer result.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 4), result.n_reachable);
+}
+
+test "dominator stage rejects a dump beyond the ordinal space" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // A minimal valid CSR: the guard must reject on the object count
+    // alone, before any mapping or allocation, so the fixture is tiny.
+    const edges = &[_][2]u32{.{ 1, 0 }};
+    const shallow = &[_]u32{1};
+    try writeTestCsr(allocator, io, tmp_path, 2, edges, shallow);
+
+    var job = try createTestJob(allocator, io, tmp_path);
+    defer job.deinit(allocator);
+    var diagnostics: Manifest.Diagnostics = .{};
+
+    // One object past the ceiling: a typed error, not an integer-overflow
+    // panic in the root/CSR/numbering casts.
+    try std.testing.expectError(error.DominatorOrdinalLimitExceeded, runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        max_supported_objects + 1,
+        edges.len,
+        &diagnostics,
+    ));
+
+    // At the ceiling itself the ordinal guard accepts and the *budget*
+    // gate (which runs after it) is what rejects: this test's tiny budget
+    // proves the boundary is exact — one object less and the failure
+    // mode changes.
+    try std.testing.expectError(error.DominatorBudgetExceeded, runDominatorTest(
+        allocator,
+        io,
+        &job,
+        tmp_path,
+        max_supported_objects,
+        edges.len,
+        &diagnostics,
+    ));
+}
+
+test "dominator ordinal ceiling matches the catalog stage's bound" {
+    // The catalog stage is the pipeline's real gate: it rejects at
+    // n_objects >= CatalogSorter.max_object_count, so the most it ever
+    // publishes is max_object_count - 1. The dominator stage's own
+    // ceiling must accept exactly that many, or a legal (if theoretical)
+    // catalog would be rejected downstream.
+    const CatalogSorter = @import("CatalogSorter.zig");
+    try std.testing.expectEqual(CatalogSorter.max_object_count - 1, max_supported_objects);
+
+    // The budget model must stay in u64 range at the ceiling: the
+    // conservative figure is ~57 B/node there, ~2.4e11 bytes in total.
+    const required = try checkedMulAdd(max_supported_objects + 1, 57, 0);
+    try std.testing.expect(required > 0);
 }

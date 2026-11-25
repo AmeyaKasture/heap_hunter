@@ -66,6 +66,7 @@ pub fn isUserError(err: anyerror) bool {
         err == error.CacheVersionMismatch or
         err == error.CacheFingerprintMismatch or
         err == error.DominatorBudgetExceeded or
+        err == error.DominatorOrdinalLimitExceeded or
         err == error.NoRetainedData;
 }
 
