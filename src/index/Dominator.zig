@@ -216,7 +216,7 @@ pub fn run(
 
         var v: u32 = 0;
         while (v < n_objects) : (v += 1) {
-            const row = Scanner.readCatalogRow(catalog_data[v * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
+            const row = Scanner.readCatalogRow(catalog_data[Scanner.catalogRowOffset(v)..][0..Scanner.catalog_row_size]) catch return error.InvalidCatalogFile;
             shallow[v] = row.shallow_size;
             if (numbering.reachable[v]) {
                 total_shallow_reachable += row.shallow_size;

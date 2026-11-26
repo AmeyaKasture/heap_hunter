@@ -544,7 +544,7 @@ pub const Reader = struct {
     }
 
     pub fn catalogRow(self: *const Reader, ordinal: u32) Scanner.CatalogRow {
-        const buf = self.catalog_data[ordinal * Scanner.catalog_row_size ..][0..Scanner.catalog_row_size];
+        const buf = self.catalog_data[Scanner.catalogRowOffset(ordinal)..][0..Scanner.catalog_row_size];
         return Scanner.readCatalogRow(buf) catch unreachable;
     }
 
@@ -617,7 +617,7 @@ pub const Reader = struct {
     pub fn domParent(self: *const Reader, ordinal: u32) ?u32 {
         if (!self.manifest.has_dominators) return null;
         if (ordinal > self.n_objects) return null;
-        const off = ordinal * 4;
+        const off = @as(usize, ordinal) * 4;
         const value = std.mem.readInt(u32, self.dom_parent[off..][0..4], .little);
         const NONE = std.math.maxInt(u32);
         return if (value == NONE) null else value;
@@ -628,7 +628,7 @@ pub const Reader = struct {
     pub fn retainedBytes(self: *const Reader, ordinal: u32) u64 {
         if (!self.manifest.has_dominators) return 0;
         if (ordinal > self.n_objects) return 0;
-        const off = ordinal * 8;
+        const off = @as(usize, ordinal) * 8;
         return std.mem.readInt(u64, self.retained[off..][0..8], .little);
     }
 

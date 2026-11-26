@@ -13,6 +13,19 @@ const profiling = @import("profiling");
 /// Fixed size of a catalog row on disk: 32 bytes, little-endian.
 pub const catalog_row_size = 32;
 
+/// Byte offset of catalog row `ordinal`. The multiply must run in `usize`:
+/// a u32 `ordinal * catalog_row_size` wraps from ordinal 2^27 up, which
+/// dumps beyond ~134M objects reach.
+pub fn catalogRowOffset(ordinal: u32) usize {
+    return @as(usize, ordinal) * catalog_row_size;
+}
+
+test "catalog row offset stays exact where a u32 multiply would wrap" {
+    try std.testing.expectEqual(@as(usize, 0), catalogRowOffset(0));
+    try std.testing.expectEqual(@as(usize, 4_294_967_296), catalogRowOffset(1 << 27));
+    try std.testing.expectEqual(@as(usize, 137_438_953_440), catalogRowOffset(std.math.maxInt(u32)));
+}
+
 /// Kind of node stored in `catalog.unsorted`.
 /// The numeric values are part of the on-disk format.
 pub const CatalogKind = enum(u8) {
